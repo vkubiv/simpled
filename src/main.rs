@@ -1,10 +1,6 @@
 use clap::{Parser, Subcommand};
 use anyhow::{Context, Result, bail, anyhow};
-use std::fs::File;
 use std::path::Path;
-use flate2::read::GzDecoder;
-use semver::Op;
-use tar::Archive;
 
 mod spec;
 mod spec_yaml;
@@ -17,6 +13,8 @@ mod k8s_generator;
 mod docker_generator;
 mod run_local;
 mod local_ingress;
+mod spec_loader;
+mod app_bundle;
 
 #[derive(Parser)]
 #[command(name = "simpled")]
@@ -76,8 +74,6 @@ enum AppBundleCommands {
         push_images: bool,
         #[arg(long)]
         upload: Option<String>,
-        #[arg(short, long)]
-        release: Option<String>,
     },
 }
 
@@ -101,10 +97,10 @@ fn main() -> Result<()> {
                 verify_command()?;
             }
             AppBundleCommands::Version => {
-                println!("not implemented");
+                version_command()?;
             }
-            AppBundleCommands::Create { registry, push_images, upload, release } => {
-                println!("Create app-bundle: registry={:?}, push={:?}, upload={:?}, release={:?}", registry, push_images, upload, release);
+            AppBundleCommands::Create { registry, push_images, upload } => {
+                app_bundle::create_app_bundle(registry, *push_images, upload)?;
             }
         },
         Commands::Secrets { command } => match command {
@@ -122,76 +118,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
-
-fn load_app_spec(app_bundle_path: &Path, env_spec: Option<&spec::DeploymentEnvironmentSpec>) -> Result<spec::AppSpec> {
-    if app_bundle_path.is_dir() {
-        return load_app_spec_from_dir(app_bundle_path, env_spec);
-    } else if let Some(ext) = app_bundle_path.extension() {
-        if ext == "gz" {
-            return load_app_spec_from_tar_gz(app_bundle_path, env_spec);
-        }
-    }
-
-    bail!("Invalid app bundle can be either a directory or a tar.gz file");
-}
-
-fn load_app_spec_from_dir(dir: &Path, env_spec: Option<&spec::DeploymentEnvironmentSpec>) -> Result<spec::AppSpec> {
-    let path_yaml = dir.join("appspec.yaml");
-    let path_yml = dir.join("appspec.yml");
-
-    let path = if path_yaml.exists() {
-        path_yaml
-    } else if path_yml.exists() {
-        path_yml
-    } else {
-        bail!("Could not find appspec.yaml or appspec.yml in {:?}", dir);
-    };
-
-    load_app_spec_from_file(&path, env_spec)
-}
-
-fn load_app_spec_from_file(path: &Path, env_spec: Option<&spec::DeploymentEnvironmentSpec>) -> Result<spec::AppSpec> {
-    let file = File::open(path).context(format!("Failed to open {:?}", path))?;
-    let yaml: spec_yaml::AppSpecYaml = serde_yaml::from_reader(file).context(format!("Failed to parse {:?}", path))?;
-    transform::convert_app_spec(yaml, env_spec).context("Failed to process app spec")
-}
-
-fn load_app_spec_from_tar_gz(path: &Path, env_spec: Option<&spec::DeploymentEnvironmentSpec>) -> Result<spec::AppSpec> {
-    let file = File::open(path).context(format!("Failed to open {:?}", path))?;
-    let tar = GzDecoder::new(file);
-    let mut archive = Archive::new(tar);
-
-    for entry in archive.entries()? {
-        let entry = entry?;
-        let path = entry.path()?;
-        if let Some(name) = path.file_name() {
-             if name == "appspec.yaml" || name == "appspec.yml" {
-                  let yaml: spec_yaml::AppSpecYaml = serde_yaml::from_reader(entry).context("Failed to parse appspec from tar.gz")?;
-                  return transform::convert_app_spec(yaml, env_spec).context("Failed to process app spec");
-             }
-        }
-    }
-    bail!("appspec.yaml not found in archive {:?}", path);
-}
-
-fn load_env_spec(root: &Path) -> Result<spec::DeploymentEnvironmentSpec> {
-    let path = root.join(Path::new("envspec.yaml"));
-
-    let file = if path.exists() {
-        File::open(path)?
-    } else {
-        File::open("envspec.yml").context("Could not find envspec.yaml or envspec.yml")?
-    };
-
-    let yaml: spec_yaml::DeploymentEnvironmentSpecYaml = serde_yaml::from_reader(file).context("Failed to parse envspec.yaml")?;
-    let env_spec = transform::convert_env_spec(yaml, root).context("Failed to process env spec")?;
-    Ok(env_spec)
-}
-
 fn verify_command() -> Result<()> {
-    let app_spec = load_app_spec(Path::new("."), None)?;
+    let app_spec = spec_loader::load_app_spec(Path::new("."), None)?;
     println!("Successfully validated appspec: {} v{}", app_spec.name, app_spec.version);
+    Ok(())
+}
+
+fn version_command() -> Result<()> {
+    let app_spec = spec_loader::load_app_spec(Path::new("."), None)?;
+    println!("{}", app_spec.version);
     Ok(())
 }
 
@@ -204,8 +139,8 @@ fn prepare_deployment_command(deployment_name: &str, bundle: &Option<String>, ve
     let bundle_path = Path::new(bundle_path_str);
 
     // 1. Load specs
-    let env_spec = load_env_spec(Path::new("."))?;
-    let app_spec = load_app_spec(bundle_path, Some(&env_spec))?;
+    let env_spec = spec_loader::load_env_spec(Path::new("."))?;
+    let app_spec = spec_loader::load_app_spec(bundle_path, Some(&env_spec))?;
 
     // 2. Validate
     validator::validate(&env_spec, &app_spec, deployment_name).context("Validation failed")?;
@@ -242,8 +177,8 @@ fn local( command: &LocalCommands) -> Result<()> {
             .unwrap_or(Path::new(".")),
     };
 
-    let env_spec = load_env_spec(root)?;
-    let app_spec = load_app_spec_from_dir(Path::new("."), Some(&env_spec))?;
+    let env_spec = spec_loader::load_env_spec(root)?;
+    let app_spec = spec_loader::load_app_spec_from_dir(Path::new("."), Some(&env_spec))?;
 
     let deployment = env_spec.deployments.first().context("No deployments defined in envspec")?;
 
