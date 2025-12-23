@@ -1,0 +1,32 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Run" type="CargoCommandRunConfiguration" factoryName="Cargo Command" nameIsGenerated="true">
+    <option name="buildProfileId" value="dev" />
+    <option name="command" value="run -- prepare-deployment clinic_prod --bundle ../../deployments/clinic.2.3.52" />
+    <option name="workingDirectory" value="file://$PROJECT_DIR$/example/environments/prod" />
+    <envs>
+      <env name="CLINIC_S3_SECRET_KEY" value="1" />
+      <env name="CLINIC_STRIPE_API_KEY_ALLIMB_SARL" value="1 " />
+      <env name="CLINIC_STRIPE_API_KEY_ALLIMB_SRL" value="1 " />
+      <env name="CLINIC_ACUBE_PASSWORD_ALLIMB_SRL" value="1" />
+      <env name="CLINIC_ADMIN_PASSWORD" value="1 " />
+      <env name="CLINIC_DB_PASSWORD" value="1" />
+      <env name="CLINIC_REDIS_PASSWORD" value="1 " />
+      <env name="CLINIC_S3_ACCESS_KEY" value="1" />
+      <env name="CLINIC_S3_ACCESS_KEY_ID" value="1" />
+      <env name="CLINIC_S3_SECRET_ACCESS_KEY" value="1 " />
+      <env name="CLINIC_SENDGRID_APIKEY" value="1 " />
+    </envs>
+    <option name="emulateTerminal" value="true" />
+    <option name="channel" value="DEFAULT" />
+    <option name="requiredFeatures" value="true" />
+    <option name="allFeatures" value="false" />
+    <option name="withSudo" value="false" />
+    <option name="buildTarget" value="REMOTE" />
+    <option name="backtrace" value="SHORT" />
+    <option name="isRedirectInput" value="false" />
+    <option name="redirectInputPath" value="" />
+    <method v="2">
+      <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+    </method>
+  </configuration>
+</component>
