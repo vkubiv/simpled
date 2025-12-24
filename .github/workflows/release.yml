@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "Cargo.toml"
+      - ".github/workflows/release.yml"
 
 permissions:
   contents: write
@@ -69,7 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}.tar.gz
-          path: ${{ matrix.asset_name }}.tar.gz
+          path: dist/${{ matrix.asset_name }}.tar.gz
 
   release:
     name: Create Release
