@@ -379,6 +379,17 @@ upload it to github releases, or on s3 storage. if you use simpled compatible ar
 
 `simpled app-bundle create --upload https:\\storage-domain.com\simpled`
 
+simpled can create github release for you if you provide github token
+
+``` bash 
+set GITHUB_TOKEN=my-github-token`
+
+simpled app-bundle release \
+  --registry mycompany=my-docker-registry.com \
+  --push-images \  
+  --github-repo mycompany/myapp
+```
+
 ## Create or update secrets
 
 you can upload files from folder as secrets
@@ -401,7 +412,7 @@ download app bundle into some folder. e.g. deployments\myapp.1.0.52.tag.gz
 
 then run:
 
-`simpled prepare-deployment myapp_prod --bundle deployments\myapp.1.0.52.tag.gz`
+`simpled deployment prepare myapp_prod --bundle deployments\myapp.1.0.52.tag.gz`
 
 --bundle can point to a folder with appspec.yaml or tag.gz archive of that folder
 
@@ -411,10 +422,14 @@ and apply generated manifests:
 
 if you use simpled compatible artifact storage, no need to manually download:
 
-`set SIMPLED_REPO_URL=https:\\storage-domain.com\simpled`
 `set SIMPLED_API_KEY=my-api-key`
 
-`simpled prepare-deployment myapp_prod --version 1.0.52`
+`simpled deployment prepare myapp_prod --download-bundle 1.0.52 --simpled-repo 'https:\\storage-domain.com\simpled'`
+
+from github releases
+
+`set GITHUB_TOKEN=my-github-token`
+`simpled deployment prepare myapp_prod --download-bundle 1.0.52 --github-repo mycompany/myapp`
 
 and apply generated manifests:
 
