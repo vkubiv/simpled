@@ -1,6 +1,8 @@
 use crate::spec::*;
 use anyhow::{Result, anyhow};
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 
 pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_name: &str) -> Result<()> {
     let deployment = env_spec.deployments.iter()
@@ -45,12 +47,38 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     }
     
     // Check configs
-    // TODO: check if all required files are present
-    let provided_configs: HashSet<&String> = deployment.configs.iter().map(|c| &c.name).collect();
     for config in &app_spec.configs {
-        if !provided_configs.contains(&config.name) {
-            return Err(anyhow!("Config {} required by application is not provided by deployment {}", 
-                 config.name, env_name));
+        let deployment_config = deployment.configs.iter().find(|c| c.name == config.name)
+             .ok_or_else(|| anyhow!("Config {} required by application is not provided by deployment {}", config.name, env_name))?;
+
+        let mut available_files = HashSet::new();
+        for file_path in &deployment_config.files {
+             let path = Path::new(file_path);
+             if path.is_dir() {
+                 if let Ok(entries) = fs::read_dir(path) {
+                     for entry in entries {
+                         if let Ok(entry) = entry {
+                              let path = entry.path();
+                              if path.is_file() {
+                                  if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                      available_files.insert(name.to_string());
+                                  }
+                              }
+                         }
+                     }
+                 }
+             } else {
+                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                      available_files.insert(name.to_string());
+                 }
+             }
+        }
+        
+        for required_file in &config.files {
+             if !available_files.contains(required_file) {
+                 return Err(anyhow!("Config {} requires file {}, but it is not provided by deployment config (checked paths: {:?})", 
+                      config.name, required_file, deployment_config.files));
+             }
         }
     }
 

@@ -121,11 +121,21 @@ pub fn resolve(
              }
         }
 
+        if env_spec.env_type != DeploymentEnvType::Local && env_spec.registry.is_empty() {
+            return Err(anyhow!("Registry mapping is required for non-local deployments"));
+        }
+
         let image = if let Some((namespace, _rest)) = raw_image.split_once('/') {
             if let Some(registry_host) = env_spec.registry.get(namespace) {
+                let registry_host = registry_host.strip_suffix('/').unwrap_or(registry_host);
                 format!("{}/{}", registry_host, raw_image)
             } else {
-                raw_image
+                if env_spec.env_type == DeploymentEnvType::Local {
+                    raw_image
+                } else {
+                    let available: Vec<_> = env_spec.registry.keys().collect();
+                    return Err(anyhow!("Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}", namespace, available));
+                }
             }
         } else {
             raw_image
