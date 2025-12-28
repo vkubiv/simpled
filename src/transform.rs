@@ -249,7 +249,7 @@ fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSe
 pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Result<DeploymentEnvironmentSpec> {
     let ingress_type_str = yaml.ingress.ingress_type.clone();
     let swarm_mode_opt = yaml.swarm_mode;
-    let ingress = convert_ingress(yaml.ingress)?;
+    let ingress = convert_ingress(yaml.ingress, &yaml.env_type)?;
     let registry = yaml.registry.unwrap_or_default();
 
     let mut deployments = Vec::new();
@@ -322,7 +322,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
     })
 }
 
-fn convert_ingress(yaml: IngressSpecYaml) -> Result<IngressSpec> {
+fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> Result<IngressSpec> {
     let mut hosts = Vec::new();
     for (name, host) in yaml.hosts {
         match host {
@@ -331,21 +331,27 @@ fn convert_ingress(yaml: IngressSpecYaml) -> Result<IngressSpec> {
         }
     }
 
-    let tls = if let Some(t) = yaml.tls {
-        let letsencrypt = if let Some(le) = t.letsencrypt {
-            Some(LetsEncryptSpec {
-                server: le.server,
-                email: le.email,
-            })
-        } else {
-            None
-        };
-        Some(IngressTlsSpec {
-            secret: t.secret,
-            letsencrypt,
-        })
-    } else {
-        None
+    let tls = match (yaml.tls, env_type) {
+        (None, DeploymentEnvTypeYaml::Local) => None,
+        (None, _) => return Err(anyhow!("Ingress TLS configuration is required for non-local environments. If you want to disable TLS explicitly set 'disable: true' in tls section")),
+        (Some(t), _) => {
+            if t.disable == Some(true) {
+                None
+            } else {
+                 let letsencrypt = if let Some(le) = t.letsencrypt {
+                    Some(LetsEncryptSpec {
+                        server: le.server,
+                        email: le.email,
+                    })
+                } else {
+                    None
+                };
+                Some(IngressTlsSpec {
+                    secret: t.secret,
+                    letsencrypt,
+                })
+            }
+        }
     };
 
     Ok(IngressSpec {

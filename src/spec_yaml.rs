@@ -99,6 +99,7 @@ pub struct DeploymentEnvironmentSpecYaml {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngressTlsSpecYaml {
+    pub disable: Option<bool>,
     pub secret: Option<String>,
     pub letsencrypt: Option<LetsEncryptSpecYaml>,
 }

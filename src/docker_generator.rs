@@ -1,9 +1,11 @@
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 pub fn generate(
     resolved_spec: &EnvironmentResolvedSpec,
@@ -60,6 +62,13 @@ fn generate_standalone(
     // 4. Script
     let mut deploy_sh = File::create(output_dir.join("deploy.sh"))?;
     
+    #[cfg(unix)]
+    {
+        let mut perms = deploy_sh.metadata()?.permissions();
+        perms.set_mode(0o755);
+        deploy_sh.set_permissions(perms)?;
+    }
+
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     
@@ -243,6 +252,14 @@ fn generate_swarm(
 
     // 5. Deploy Script
     let mut deploy_sh = File::create(output_dir.join("deploy.sh"))?;
+    
+    #[cfg(unix)]
+    {
+        let mut perms = deploy_sh.metadata()?.permissions();
+        perms.set_mode(0o755);
+        deploy_sh.set_permissions(perms)?;
+    }
+
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
@@ -514,6 +531,8 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
         writeln!(static_conf, "      storage: \"/letsencrypt/acme.json\"")?;
         writeln!(static_conf, "      httpChallenge:")?;
         writeln!(static_conf, "        entryPoint: web")?;
+    } else {
+        return Err(anyhow!("Currently swarm ingress only supports Let's Encrypt, specify a letsencrypt block in ingress.tls"));
     }
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;

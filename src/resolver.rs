@@ -194,9 +194,7 @@ pub fn resolve(
             ports: deployment_service_opt.map(|s|
                 if s.ports.is_empty() && s.host.is_some()
                 {
-                    vec![
-                        ServicePort { external: 80, internal: 80 }
-                    ]
+                    vec![]
                 } else {
                     s.ports.clone()
                 }
