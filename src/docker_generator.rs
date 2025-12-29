@@ -263,7 +263,7 @@ fn generate_swarm(
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
-    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yml ingress")?;
+    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yml ingress --detach=false")?;
     writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yml {} --with-registry-auth --detach=false", deployment.name, deployment.name)?;
 
     Ok(())

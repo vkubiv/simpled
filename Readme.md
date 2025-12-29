@@ -384,9 +384,10 @@ simpled can create github release for you if you provide github token
 ``` bash 
 set GITHUB_TOKEN=my-github-token`
 
-simpled app-bundle release \
+simpled app-bundle create \
   --registry mycompany=my-docker-registry.com \
   --push-images \  
+  --upload-bundle-to github-release \   
   --github-repo mycompany/myapp
 ```
 
@@ -412,9 +413,9 @@ download app bundle into some folder. e.g. deployments\myapp.1.0.52.tag.gz
 
 then run:
 
-`simpled deployment prepare myapp_prod --bundle deployments\myapp.1.0.52.tag.gz`
+`simpled prepare-deployment myapp_prod --app-bundle deployments\myapp.1.0.52.tag.gz`
 
---bundle can point to a folder with appspec.yaml or tag.gz archive of that folder
+--app-bundle can point to a folder with appspec.yaml or tag.gz archive of that folder
 
 and apply generated manifests:
 
@@ -424,12 +425,18 @@ if you use simpled compatible artifact storage, no need to manually download:
 
 `set SIMPLED_API_KEY=my-api-key`
 
-`simpled deployment prepare myapp_prod --download-bundle 1.0.52 --simpled-repo 'https:\\storage-domain.com\simpled'`
+`simpled prepare-deployment myapp_prod 
+    --app-version 1.0.52 --download-bundle-from simpled-repo`
 
 from github releases
 
 `set GITHUB_TOKEN=my-github-token`
-`simpled deployment prepare myapp_prod --download-bundle 1.0.52 --github-repo mycompany/myapp`
+```
+simpled prepare-deployment myapp_prod \
+   --app-version 1.0.52 \ 
+   --download-bundle-from github-release \   
+   --github-repo mycompany/myapp   
+```
 
 and apply generated manifests:
 

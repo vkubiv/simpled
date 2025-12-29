@@ -7,11 +7,15 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::spec_loader;
+use crate::bundle_repo;
 
 pub fn create_app_bundle(
     registry: &Option<String>,
     push_images: bool,
     _upload: &Option<String>,
+    upload_bundle_to: &Option<String>,
+    gh_repo: &Option<String>,
+    gh_tag_prefix: &Option<String>,
 ) -> Result<()> {
     let app_spec = spec_loader::load_app_spec_from_dir(Path::new("."), None)?;
     println!("Creating bundle for {} v{}", app_spec.name, app_spec.version);
@@ -104,5 +108,14 @@ pub fn create_app_bundle(
     
     println!("Created artifact: {}", filename);
     
+    if let Some(target) = upload_bundle_to {
+        if target == "github-release" {
+            let repo = gh_repo.as_ref().context("--github-repo is required when uploading to github-release")?;
+            bundle_repo::gh_release::upload(repo, &app_spec.version.to_string(), &filename, gh_tag_prefix.as_deref())?;
+        } else {
+            bail!("Unknown upload target: {}. Only 'github-release' is supported.", target);
+        }
+    }
+
     Ok(())
 }
