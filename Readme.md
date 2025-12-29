@@ -1,57 +1,44 @@
 # Simple deployment - simpled
 
-The idea is too bridge the gap between simple deployments configuration like docker-compose, and
-super complicated k8s.
+The idea is to bridge the gap between simple deployment configurations like docker-compose and super complicated Kubernetes (k8s) setups.
 
-A lot of project need something more flexible then docker-compose, but they will drown in k8s
-configuration complexity.
+A lot of projects need something more flexible than docker-compose, but they can easily drown in Kubernetes configuration complexity.
 
-K8s didn't give you predefined structure for you deployment, so you need to invent some by your
-self.
-This is tricky and hard to do for the first time.
-To make things flexible enough, but in the same time simple to use, `simpled` borrow approaches from
-programing like modularity, isolation, self verification, consistency checking, comprehensive human
-readable errors.
-Also it borrows app bundle concept from mobile development.
+Kubernetes doesn't give you a predefined structure for your deployment, so you need to invent one yourself. This is tricky and hard to do for the first time.
+To make things flexible enough, but at the same time simple to use, `simpled` borrows approaches from programming like modularity, isolation, self-verification, consistency checking, and comprehensive human-readable errors.
+It also borrows the app bundle concept from mobile development.
 
 ## Core concepts
 
-There two core concept **Environment** and **Application**
+There are two core concepts: **Environment** and **Application**.
 
 ## Environment
 
-Is space where applications live. Then people think environment they often mean dev, stage,
-production.
-But often in the real life you have multiple production environments. For example you are
-multinational business,
-and different countries have different regulations.
+An Environment is a space where applications live. When people think of an environment, they often mean dev, stage, or production.
+But often in real life, you have multiple production environments. For example, if you are a multinational business, different countries might have different regulations, requiring separate environments.
 
 ## Application
 
-Application is set of closely related and interdependent services, containers.
-Plus a description that defines how they interconnect and depends on each other.
-The description plus container images forms **Application Bundle**. Each bundle is versioned.
+An Application is a set of closely related and interdependent services and containers, plus a description that defines how they interconnect and depend on each other.
+The description plus container images form an **Application Bundle**. Each bundle is versioned.
 
-Application description don't contains environment dependant information like domain name of you
-server, database host etc.
-It resemble similarity to Ports and Adapters concept from Hexagonal Architecture.
-The same application bundle can be deployed to any environment that mean their requirements.
-For example you deployed your my-new-app.1.0.1 to dev environment, and tested it.
-Now you can deploy the same bundle to your stage or prod environments. No need to rebuild bundle for
-specific environment.
+The application description doesn't contain environment-dependent information like the domain name of your server, database host, etc.
+It resembles the Ports and Adapters concept from Hexagonal Architecture.
+The same application bundle can be deployed to any environment that meets its requirements.
+For example, you can deploy your `my-new-app.1.0.1` to the dev environment and test it.
+Now you can deploy the same bundle to your stage or prod environments. There is no need to rebuild the bundle for a specific environment.
 
 ## Application Description
 
-appspec.yaml is main description file.
-First it specs a name and a version of the application.
+`appspec.yaml` is the main description file.
+First, it specifies the name and version of the application.
 
 ```yaml
 name: myapp
 version: 1.3.52
 ```
 
-Then specify variables that need to be set depends on a environment. This variables can have default
-value.
+Then, it specifies variables that need to be set depending on the environment. These variables can have default values.
 
 ```yaml
 environment:
@@ -63,10 +50,9 @@ environment:
     - IOS_APP_URL="https://apps.apple.com/..."
 ```
 
-In `relative` section special type of variables are set. They used to set urls relatively to
-application host.  
-This free you from hassle of defining there variables independently for each environment.
-But they still can be override by specific environment if needed.
+In the `relative` section, a special type of variable is set. They are used to set URLs relative to the application host.
+This frees you from the hassle of defining these variables independently for each environment.
+However, they can still be overridden by a specific environment if needed.
 
 ```yaml
 environment:
@@ -81,8 +67,7 @@ environment:
     - STRIPE_CONNECT_REFRESH_URL="/main-svc/Stripe/RefreshConnectUrl"
 ```
 
-`internal` sets private variables that can be used to setup interconnection between services or
-common configuration.
+`internal` sets private variables that can be used to set up interconnections between services or common configuration.
 
 ```yaml
 environment:
@@ -92,10 +77,10 @@ environment:
 
 ## Services
 
-You can define two way services can be defined, app_services and extra_services.
-The difference that app_services images always have same version as version defined in appspec.yaml.
-For extra_services you use regular image version.
-Lets check next definition:
+There are two ways services can be defined: `app_services` and `extra_services`.
+The difference is that `app_services` images always have the same version as the version defined in `appspec.yaml`.
+For `extra_services`, you use a regular image version.
+Let's check the next definition:
 
 ```yaml
 version: 1.0.1
@@ -119,7 +104,7 @@ extra_services:
     image: 3rd-party/auth-gateway:26.4
 ```
 
-During deployment next images will be pulled
+During deployment, the following images will be pulled:
 
 - mycompany/web-app:1.0.1
 - mycompany/backend-svc:1.0.1
@@ -127,19 +112,19 @@ During deployment next images will be pulled
 - mycompany/admin-svc:1.0.1
 - 3rd-party/auth-gateway:26.4
 
-if you will try to explicitly specify version for app_services you will get validation error.
+If you try to explicitly specify a version for `app_services`, you will get a validation error.
 
 ### Service types
-There three service types:
- * public - exposed to external world, accessible by external url. Like `https:\\app.mycompany.com`
- * internal - only accessible to other app services
- * job - runs ones each deployment, used to setup things. not accessible to other services.
+There are three service types:
+ * **public** - exposed to the external world, accessible by an external URL. Like `https://app.mycompany.com`
+ * **internal** - only accessible to other app services.
+ * **job** - runs once per deployment, used to set things up. Not accessible to other services.
 
 ### Service env variables
 
-By default no env variables passed to service.
+By default, no environment variables are passed to the service.
 
-You can pass specif variables from root `environment:`
+You can pass specific variables from the root `environment:` section:
 
 ```yaml
   backend-svc:
@@ -150,7 +135,7 @@ You can pass specif variables from root `environment:`
       - SEND_GRID_API_HOST
 ```    
 
-You can pass all variables from root `environment:`
+You can pass all variables from the root `environment:` section:
 
 ```yaml
   backend-svc:
@@ -159,7 +144,7 @@ You can pass all variables from root `environment:`
       - $all
 ```    
 
-You can pass all variables and override some of them.
+You can pass all variables and override some of them:
 
 ```yaml
   backend-svc:
@@ -171,16 +156,16 @@ You can pass all variables and override some of them.
 
 ## Configuration files
 
-if you need environment dependant configuration files you can define them in next way:
+If you need environment-dependent configuration files, you can define them in the following way:
 
 ```yaml
 configs:
-  # data is a name of config
+  # data is the name of the config
   data:
     - countries_payment_settings.json    
 ```
 
-Usage in service
+Usage in service:
 
 ```yaml
   backend-svc:
@@ -195,7 +180,7 @@ Usage in service
 
 ## Secrets
 
-All secrets avaliable for application is defined on root element `secrets:`.
+All secrets available for the application are defined on the root element `secrets:`.
 
 ```yaml
 secrets:
@@ -205,9 +190,9 @@ secrets:
   sendgrid_apikey:
 ```
 
-By default secrets mount as files into "/etc/secrets/" directory.
+By default, secrets are mounted as files into the `/etc/secrets/` directory.
 
-Usage in service
+Usage in service:
 
 ```yaml
   backend-svc:
@@ -227,14 +212,13 @@ Usage in service
 
 ## Defining environments
 
-Environment is defined in envspec.yaml
-Consists of two parts ingress, and deployments.
-Ingress defines root ingress ingress, and deployments defines applicators that deployed in this
-environment.
+The Environment is defined in `envspec.yaml`.
+It consists of two parts: ingress and deployments.
+Ingress defines the root ingress, and deployments define applications that are deployed in this environment.
 
 ### Ingress
 
-Ingress defines hosts domain names
+Ingress defines host domain names.
 
 ```yaml
 ingress:
@@ -251,7 +235,7 @@ ingress:
 
 ### Deployments
 
-Lets define deployment config for myapp web app.
+Let's define a deployment config for `myapp` web app.
 
 ```yaml
 deployments:
@@ -259,8 +243,8 @@ deployments:
     application:
       # application name, in this case `myapp` 
       name: myapp
-      # extra: allow to define additional services that specific for given environment.   
-      # for example on dev we can host database inside your cluster. But on prod we can use cloud managed database. 
+      # extra: allows defining additional services that are specific for a given environment.   
+      # for example on dev we can host a database inside your cluster. But on prod we can use a cloud managed database. 
       extra:
         - clinic.ext.yaml
 
@@ -270,7 +254,7 @@ deployments:
     configs:
       data: ./data
 
-    # defines secrets avaliable for given application.
+    # defines secrets available for the given application.
     secrets:
       redis_password:
       db_password:
@@ -300,8 +284,8 @@ deployments:
 
 ```
 
-You can deploy multiple application in same environment. 
-Lets deploy website, that contains frontend and healers cms services
+You can deploy multiple applications in the same environment. 
+Let's deploy a website that contains frontend and headless CMS services.
 
 ```yaml
   website_prod:
@@ -312,7 +296,7 @@ Lets deploy website, that contains frontend and healers cms services
     secrets:
       redis_password:
       db_password:
-    # define default rehouse configuration for all services. Can be overridden for individual services. 
+    # define default resource configuration for all services. Can be overridden for individual services. 
     defaults:
       replicas: 2
       resources:
@@ -339,10 +323,10 @@ Lets deploy website, that contains frontend and healers cms services
 
 ## Exposed services
 
-Each public service should have `host` and `prefix` defined
+Each public service should have `host` and `prefix` defined.
 
-* `host` is abstract host name, if will be subtitled by real domain name from deploying environment.
-* `prefix` is path prefix.
+* `host` is an abstract host name; it will be substituted by the real domain name from the deploying environment.
+* `prefix` is the path prefix.
 
 ```yaml
 services:
@@ -354,11 +338,11 @@ services:
     prefix: /admin-panel
 ```
 
-In given example `admin-panel` will be serve on dev environment at
-`https:\\myapp-dev.com\admin-panel`
+In the given example, `admin-panel` will be served on the dev environment at
+`https://myapp-dev.com/admin-panel`
 
 # Prepare deployment artifacts
-Build all docker images for given application
+Build all docker images for the given application:
 
 `cd web-app && docker build -f ./Dockerfile -t mycompany/web-app:latest .`
 
@@ -366,38 +350,38 @@ Build all docker images for given application
 
 ...
 
-run `simpled verify`
+Run `simpled verify`
 
-It will check if all services from appspec.yaml have docker image built for them.
+It will check if all services from `appspec.yaml` have a docker image built for them.
 
 `simpled app-bundle create --registry mycompany=my-docker-registry.com --push-images`
 
-Will tag all images with proper version from  appspec.yaml, and path them to your docker registry.
-Then will create appname.$version.tar.gz artifact. Eg. myapp.1.0.52.tag.gz
+This will tag all images with the proper version from `appspec.yaml` and push them to your docker registry.
+Then it will create an `appname.$version.tar.gz` artifact. E.g. `myapp.1.0.52.tag.gz`
 
-upload it to github releases, or on s3 storage. if you use simpled compatible artifact storage, you can add `-- upload` parameter
+Upload it to GitHub releases, or on S3 storage. If you use a `simpled` compatible artifact storage, you can add the `--upload` parameter:
 
-`simpled app-bundle create --upload https:\\storage-domain.com\simpled`
+`simpled app-bundle create --upload https://storage-domain.com/simpled`
 
-simpled can create github release for you if you provide github token
+`simpled` can create a GitHub release for you if you provide a GitHub token:
 
-``` bash 
-set GITHUB_TOKEN=my-github-token`
+```bash 
+set GITHUB_TOKEN=my-github-token
 
 simpled app-bundle create \
   --registry mycompany=my-docker-registry.com \
-  --push-images \  
-  --upload-bundle-to github-release \   
+  --push-images \
+  --upload-bundle-to github-release \
   --github-repo mycompany/myapp
 ```
 
 ## Create or update secrets
 
-you can upload files from folder as secrets
+You can upload files from a folder as secrets:
 
 `simpled secrets set myapp_prod ./myapp_prod_sercrets`
 
-you can set secrets through command line
+You can set secrets through the command line:
 
 `simpled secrets set myapp_prod -f redis_password="${{ secrets.REDIS_PASSWORD }}" -f db_password="${{ secrets.DB_PASSWORD }}"`
 
@@ -407,39 +391,39 @@ Then apply generated manifests:
 
 # Deploy application
 
-Navigate into the folder with envspec.yaml. eg deployments\prod
+Navigate into the folder with `envspec.yaml`. e.g. `deployments/prod`
 
-download app bundle into some folder. e.g. deployments\myapp.1.0.52.tag.gz
+Download the app bundle into some folder. e.g. `deployments/myapp.1.0.52.tag.gz`
 
-then run:
+Then run:
 
-`simpled prepare-deployment myapp_prod --app-bundle deployments\myapp.1.0.52.tag.gz`
+`simpled prepare-deployment myapp_prod --app-bundle deployments/myapp.1.0.52.tag.gz`
 
---app-bundle can point to a folder with appspec.yaml or tag.gz archive of that folder
+`--app-bundle` can point to a folder with `appspec.yaml` or a `tar.gz` archive of that folder.
 
-and apply generated manifests:
+And apply generated manifests:
 
 `kubectl apply -f k8s/`
 
-if you use simpled compatible artifact storage, no need to manually download:
+If you use a `simpled` compatible artifact storage, there is no need to manually download:
 
 `set SIMPLED_API_KEY=my-api-key`
 
-`simpled prepare-deployment myapp_prod 
-    --app-version 1.0.52 --download-bundle-from simpled-repo`
+`simpled prepare-deployment myapp_prod --app-version 1.0.52 --download-bundle-from simpled-repo`
 
-from github releases
+From GitHub releases:
 
 `set GITHUB_TOKEN=my-github-token`
-```
+
+```bash
 simpled prepare-deployment myapp_prod \
-   --app-version 1.0.52 \ 
-   --download-bundle-from github-release \   
+   --app-version 1.0.52 \
+   --download-bundle-from github-release \
    --github-repo mycompany/myapp   
 ```
 
-and apply generated manifests:
+And apply generated manifests:
 
 `kubectl apply -f k8s/`
 
-if all application requirements are meat in a given environment, the app will be deployed.
+If all application requirements are met in a given environment, the app will be deployed.
