@@ -1,6 +1,6 @@
 [package]
 name = "simpled"
-version = "1.1.8"
+version = "1.1.9"
 edition = "2021"
 
 [dependencies]
@@ -16,7 +16,7 @@ base64 = "0.22"
 axum-reverse-proxy = { version = "1.0", features = [] }
 tokio = "1.48.0"
 axum = "0.8.8"
-reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3.8"
