@@ -104,7 +104,9 @@ pub fn create_app_bundle(
     }
 
 
-    tar.finish()?;
+    let archive = tar.into_inner().context("Failed to write bundle file")?;
+
+    archive.finish().context("Failed to finish bundle file")?;
     
     println!("Created artifact: {}", filename);
     
