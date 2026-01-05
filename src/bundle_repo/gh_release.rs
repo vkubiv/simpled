@@ -6,10 +6,18 @@ use serde::Deserialize;
 use std::io::Read;
 
 #[derive(Deserialize)]
+struct Asset {
+    name: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
 struct Release {
     #[allow(dead_code)]
     id: u64,
     upload_url: String,
+    #[serde(default)]
+    assets: Vec<Asset>,
 }
 
 pub fn download(repo: &str, ver: &str, app_name: &str, tag_prefix: Option<&str>) -> Result<String> {
@@ -19,19 +27,43 @@ pub fn download(repo: &str, ver: &str, app_name: &str, tag_prefix: Option<&str>)
     // Check GITHUB_TOKEN
     let token = env::var("GITHUB_TOKEN").context("GITHUB_TOKEN is not set. It is required for downloading releases.")?;
 
-    let url = format!("https://github.com/{}/releases/download/{}/{}", repo, tag, filename);
-    println!("Downloading bundle from {}", url);
-
     let client = reqwest::blocking::Client::new();
-    let mut response = client
+
+    // 1. Get release info
+    let url = format!("https://api.github.com/repos/{}/releases/tags/{}", repo, tag);
+    println!("Fetching release info from {}", url);
+
+    let response = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header("User-Agent", "simpled")
         .send()
-        .context("Failed to send request")?;
+        .context("Failed to get release info")?;
 
     if !response.status().is_success() {
-        bail!("Failed to download bundle from {}: status code {}", url, response.status());
+        bail!("Failed to get release info from {}: status code {}", url, response.status());
+    }
+
+    let release: Release = response.json().context("Failed to parse release info")?;
+
+    // 2. Find asset
+    let asset = release.assets.into_iter()
+        .find(|a| a.name == filename)
+        .context(format!("Asset {} not found in release {}", filename, tag))?;
+
+    // 3. Download asset
+    println!("Downloading asset from {}", asset.url);
+    
+    let mut response = client
+        .get(&asset.url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "simpled")
+        .header("Accept", "application/octet-stream")
+        .send()
+        .context("Failed to download asset")?;
+
+    if !response.status().is_success() {
+        bail!("Failed to download asset from {}: status code {}", asset.url, response.status());
     }
 
     let mut dest = File::create(Path::new(&filename)).context("Failed to create file")?;
@@ -47,7 +79,7 @@ pub fn upload(repo: &str, ver: &str, filename: &str, tag_prefix: Option<&str>) -
 
     // 1. Get release by tag
     let url = format!("https://api.github.com/repos/{}/releases/tags/{}", repo, tag);
-    let mut response = client.get(&url)
+    let response = client.get(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header("User-Agent", "simpled")
         .send()

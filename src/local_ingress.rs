@@ -1,7 +1,7 @@
 use crate::resolved_spec::*;
-use anyhow::{Result, Context};
+use anyhow::{Result};
 use std::thread;
-use axum::{Router, body::Body, extract::State, response::IntoResponse, routing::get, serve};
+use axum::{Router};
 use axum_reverse_proxy::ReverseProxy;
 
 pub fn run(spec: IngressResolvedSpec) -> Result<()> {
@@ -48,10 +48,7 @@ pub fn run(spec: IngressResolvedSpec) -> Result<()> {
                                 }
                             }
 
-                            let mut path = svc.prefix.clone();
-                            /*if !path.ends_with('/') {
-                                path.push('/');
-                            }*/
+                            let path = svc.prefix.clone();
 
                             let proxy = ReverseProxy::new(&path, &target);
 
