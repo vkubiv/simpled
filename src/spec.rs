@@ -69,6 +69,7 @@ pub struct ServicePort {
 pub struct ServiceSpec {
     pub name: String,
     pub service_type: ServiceType,
+    pub is_app_service: bool,
     // TODO: redo this logic to have either image or variants
     // create enum ImageSpec { Exact(String), Variants(Vec<ImageVariant>) }
     // change image_variants to image: ImageSpec
@@ -77,6 +78,7 @@ pub struct ServiceSpec {
     pub environment: Vec<ServiceEnvOption>,
     pub configs: Vec<ServiceConfigOption>,
     pub secrets: Vec<ServiceSecret>,
+    pub ports: Vec<ServicePort>,
 }
 #[derive(Debug, Clone)]
 pub enum ServiceEnvOption {
@@ -179,6 +181,7 @@ pub struct EnvVariable {
 #[derive(Debug, Clone)]
 pub struct DeploymentSpec {
     pub name: String,
+    pub primary_host: String,
     pub application: DeploymentAppSpec,
     pub environment: Vec<EnvVariable>,
     pub undockerized_environment: Vec<EnvVariable>,

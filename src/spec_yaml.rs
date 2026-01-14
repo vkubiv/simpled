@@ -43,6 +43,7 @@ pub struct ServiceSpecYaml {
     pub environment: Option<Vec<String>>,
     pub configs: Option<Vec<HashMap<String, String>>>,
     pub secrets: Option<Vec<ServiceSecretYaml>>,
+    pub ports: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,6 +131,7 @@ pub enum HostSpecYaml {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentSpecYaml {
+    pub primary_host: String,
     pub application: DeploymentAppSpecYaml,
     pub environment: Option<DeploymentEnvVariablesYaml>,
     pub undockerized_environment: Option<DeploymentEnvVariablesYaml>,

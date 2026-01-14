@@ -190,7 +190,7 @@ secrets:
   sendgrid_apikey:
 ```
 
-By default, secrets are mounted as files into the `/etc/secrets/` directory.
+By default, secrets are mounted as files into the `/secrets/` directory.
 
 Usage in service:
 
@@ -198,7 +198,7 @@ Usage in service:
   backend-svc:
     image: mycompany/backend-svc
   secrets:
-    # mounted to `/etc/secrets/redis_password`
+    # mounted to `/secrets/redis_password`
     - redis_password:
 
     # mounted to `/custom_path/db_password`
@@ -295,7 +295,9 @@ Let's deploy a website that contains frontend and headless CMS services.
       version: ^1.1.5
     secrets:
       redis_password:
+        env: REDIS_PASSWORD # read secret from environment variable REDIS_PASSWORD during deployment time.
       db_password:
+        file: ./secrets/website_db_password.txt # read secret from a file during deployment time.
     # define default resource configuration for all services. Can be overridden for individual services. 
     defaults:
       replicas: 2
@@ -374,20 +376,6 @@ simpled app-bundle create \
   --upload-bundle-to github-release \
   --github-repo mycompany/myapp
 ```
-
-## Create or update secrets
-
-You can upload files from a folder as secrets:
-
-`simpled secrets set myapp_prod ./myapp_prod_sercrets`
-
-You can set secrets through the command line:
-
-`simpled secrets set myapp_prod -f redis_password="${{ secrets.REDIS_PASSWORD }}" -f db_password="${{ secrets.DB_PASSWORD }}"`
-
-Then apply generated manifests:
-
-`kubectl apply -f k8s/`
 
 # Deploy application
 

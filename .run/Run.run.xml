@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Run" type="CargoCommandRunConfiguration" factoryName="Cargo Command" nameIsGenerated="true">
+  <configuration default="false" name="Run" type="CargoCommandRunConfiguration" factoryName="Cargo Command" folderName="Run">
     <option name="buildProfileId" value="dev" />
     <option name="command" value="run -- prepare-deployment clinic_prod --bundle ../../deployments/clinic.2.3.52" />
     <option name="workingDirectory" value="file://$PROJECT_DIR$/example/environments/prod" />

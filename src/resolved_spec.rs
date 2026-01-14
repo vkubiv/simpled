@@ -1,8 +1,8 @@
-use crate::spec::{EnvVariable, ResourcesSpec, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType};
+use crate::spec::{DeploymentEnvType, EnvVariable, ResourcesSpec, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType};
 
 #[derive(Debug)]
 pub struct EnvironmentResolvedSpec {
-    pub name: String,
+    pub env_type: DeploymentEnvType,
     pub ingress: IngressResolvedSpec,
     pub current_deployment: DeploymentResolvedSpec,
 }
@@ -51,7 +51,7 @@ pub struct ServiceResolvedSpec {
     // resolved image with a full name, including registry and version
     pub image: String,
 
-    pub service_host: Option<String>,
+    pub service_host: String,
     // Resolution rules for environment_variables:
     // * AppEnvironment::external are substituted with values from DeploymentSpec::environment
     // * AppEnvironment::relative are transformed into this form https://{service_host}/${variable_value}

@@ -16,6 +16,7 @@ mod local_ingress;
 mod spec_loader;
 mod app_bundle;
 mod bundle_repo;
+mod docker_compose;
 
 #[derive(Parser)]
 #[command(name = "simpled")]

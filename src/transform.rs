@@ -38,7 +38,7 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
     };
 
     let app_services = if let Some(services) = yaml.app_services {
-        convert_services(services)?
+        convert_services(services, true)?
     } else {
         vec![]
     };
@@ -64,7 +64,7 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
         combined_extra_services.extend(services);
     }
 
-    let extra_services = convert_services(combined_extra_services)?;
+    let extra_services = convert_services(combined_extra_services, false)?;
 
     Ok(AppSpec {
         name: yaml.name,
@@ -146,15 +146,15 @@ fn convert_secrets(yaml: AppSecretsYaml) -> Result<Vec<AppSecretOption>> {
     }
 }
 
-fn convert_services(yaml: HashMap<String, ServiceSpecYaml>) -> Result<Vec<ServiceSpec>> {
+fn convert_services(yaml: HashMap<String, ServiceSpecYaml>, is_app_service: bool) -> Result<Vec<ServiceSpec>> {
     let mut services = Vec::new();
     for (name, svc) in yaml {
-        services.push(convert_service(name, svc)?);
+        services.push(convert_service(name, svc, is_app_service)?);
     }
     Ok(services)
 }
 
-fn convert_service(name: String, yaml: ServiceSpecYaml) -> Result<ServiceSpec> {
+fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) -> Result<ServiceSpec> {
     let service_type = match yaml.service_type {
         Some(ServiceTypeYaml::Public) => ServiceType::Public,
         Some(ServiceTypeYaml::Internal) => ServiceType::Internal,
@@ -201,6 +201,8 @@ fn convert_service(name: String, yaml: ServiceSpecYaml) -> Result<ServiceSpec> {
         vec![]
     };
 
+    let ports = parsePorts(&yaml.ports)?;
+
     Ok(ServiceSpec {
         name,
         service_type,
@@ -208,6 +210,8 @@ fn convert_service(name: String, yaml: ServiceSpecYaml) -> Result<ServiceSpec> {
         environment,
         configs,
         secrets,
+        ports,
+        is_app_service,
     })
 }
 
@@ -459,6 +463,7 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path) -> R
     };
 
     Ok(DeploymentSpec {
+        primary_host: yaml.primary_host.clone(),
         name,
         application,
         environment,
@@ -552,7 +557,19 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
          }
     };
 
-    let ports = if let Some(ports_yaml) = &yaml.ports {
+    let ports = parsePorts(&yaml.ports)?;
+
+    Ok(DeploymentServiceSpec {
+        variant: yaml.variant.clone(),
+        host: yaml.host.clone(),
+        prefixes,
+        resources,
+        ports,
+    })
+}
+
+fn parsePorts(ports: &Option<Vec<String>>) -> Result<Vec<ServicePort>> {
+    Ok(if let Some(ports_yaml) = ports {
         ports_yaml.into_iter().map(|s| {
             let (ext_str, int_str) = s.split_once(':')
                 .ok_or_else(|| anyhow!("Invalid port format '{}'. Expected format 'external:internal'", s))?;
@@ -569,13 +586,5 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
         }).collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
-    };
-
-    Ok(DeploymentServiceSpec {
-        variant: yaml.variant.clone(),
-        host: yaml.host.clone(),
-        prefixes,
-        resources,
-        ports,
     })
 }

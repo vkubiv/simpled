@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount};
 use anyhow::{anyhow, Result};
@@ -6,6 +7,7 @@ use std::io::Write;
 use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, ServiceNetwork};
 
 pub fn generate(
     resolved_spec: &EnvironmentResolvedSpec,
@@ -72,7 +74,7 @@ fn generate_standalone(
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     
-    let network_name = format!("{}-net", resolved_spec.name);
+    let network_name = "common_network".to_string();
     writeln!(deploy_sh, "docker network create {} || true", network_name)?;
     
     for service in &deployment.services {
@@ -144,102 +146,40 @@ fn generate_swarm(
     let app_dir = output_dir.join(&deployment.name);
     fs::create_dir_all(&app_dir)?;
 
-    // 1. Configs
-    let configs_dir = app_dir.join("configs");
-    fs::create_dir_all(&configs_dir)?;
-    
-    for config in &deployment.configs {
-         let dir_name = format!("{}-{}", app_name, config.name);
-         let cfg_dir = configs_dir.join(&dir_name);
-         fs::create_dir_all(&cfg_dir)?;
-         for cfg_file in &config.files {
-             let path = cfg_dir.join(&cfg_file.name);
-             fs::write(&path, &cfg_file.content)?;
-         }
-    }
-    
-    // 2. Secrets
-    let secrets_dir = app_dir.join("secrets");
-    fs::create_dir_all(&secrets_dir)?;
-    for secret in &deployment.secrets {
-        let secret_name = format!("{}-{}", app_name, secret.name);
-        let path = secrets_dir.join(&secret_name);
-        fs::write(&path, &secret.value)?;
-    }
+    let network_name = "common_network".to_string();
 
-    // 3. Application Stack
-    let mut app_stack = File::create(app_dir.join("docker-compose.yml"))?;
-    writeln!(app_stack, "version: '3.8'")?;
-    writeln!(app_stack, "services:")?;
-    
-    let network_name = format!("{}-net", resolved_spec.name);
+    let mut services_map = HashMap::new();
 
     for service in &deployment.services {
-        writeln!(app_stack, "  {}:", service.full_name)?;
-        writeln!(app_stack, "    image: {}", service.image)?;
-        writeln!(app_stack, "    networks:")?;
-        writeln!(app_stack, "      default:")?;
-        writeln!(app_stack, "        aliases:")?;
-        writeln!(app_stack, "          - {}", service.full_name)?;
-        
-        if !service.ports.is_empty() {
-            writeln!(app_stack, "    ports:")?;
-            for port in &service.ports {
-                writeln!(app_stack, "      - \"{}:{}\"", port.external, port.internal)?;
-            }
-        }
+        let mut docker_service = prepare_service(service, resolved_spec, output_dir)?;
 
-        let mut has_env = !service.environment_variables.is_empty();
-        // Check if we have env secrets
-        for secret in &service.secrets {
-            if let SecretMount::EnvVariable(_) = &secret.mount {
-                has_env = true;
-                break;
-            }
-        }
+        let mut networks = HashMap::new();
+        networks.insert("default".to_string(), ServiceNetwork {
+            aliases: vec![service.full_name.clone()],
+        });
 
-        if has_env {
-            writeln!(app_stack, "    environment:")?;
-            for env in &service.environment_variables {
-                writeln!(app_stack, "      - {}={}", env.name, env.value)?;
-            }
-            // Inject secrets as env vars
-            for secret in &service.secrets {
-                 if let SecretMount::EnvVariable(var_name) = &secret.mount {
-                      if let Some(s_spec) = deployment.secrets.iter().find(|s| s.name == secret.name) {
-                          // Note: secret.name in ServiceSecret is "app-name-secretname"
-                          // deployment.secrets has "app-name-secretname"? 
-                          // In resolved_spec: "secret name transformed to app name + original name"
-                          // So yes, they should match.
-                          writeln!(app_stack, "      - {}={}", var_name, s_spec.value)?;
-                      }
-                 }
-            }
-        }
+        docker_service.networks = networks;
 
-        let mut volumes = Vec::new();
-        for config in &service.configs {
-             // Mount directory
-             volumes.push(format!("./configs/{}:{}", config.config_name, config.mount_path));
-        }
-        for secret in &service.secrets {
-             if let SecretMount::FilePath(path) = &secret.mount {
-                  volumes.push(format!("./secrets/{}:{}", secret.name, path));
-             }
-        }
-
-        if !volumes.is_empty() {
-            writeln!(app_stack, "    volumes:")?;
-            for vol in volumes {
-                writeln!(app_stack, "      - \"{}\"", vol)?;
-            }
-        }
+        services_map.insert(service.full_name.clone(), docker_service);
     }
 
-    writeln!(app_stack, "networks:")?;
-    writeln!(app_stack, "  default:")?;
-    writeln!(app_stack, "    external: true")?;
-    writeln!(app_stack, "    name: {}", network_name)?;
+    let mut networks = HashMap::new();
+
+    networks.insert("default".to_string(), DockerComposeNetwork {
+        external: true,
+        name: network_name.clone(),
+    });
+
+    let compose = DockerCompose {
+        services: services_map,
+        networks,
+    };
+
+    let compose_path = output_dir.join("docker-compose.yaml");
+    let yaml = serde_yaml::to_string(&compose)?;
+    fs::write(&compose_path, yaml)?;
+
+
 
     // 4. Ingress Stack
     let ingress_dir = output_dir.join("ingress");

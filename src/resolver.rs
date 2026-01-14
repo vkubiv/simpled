@@ -73,6 +73,8 @@ pub fn resolve(
     let mut resolved_services = Vec::new();
     let mut public_host_prefix_combinations = HashSet::new();
 
+    let primary_host = &deployment.primary_host;
+
     for app_service in app_spec.all_services() {
         let deployment_service_opt = deployment.services.as_ref().and_then(|s| s.get(&app_service.name));
 
@@ -90,22 +92,27 @@ pub fn resolve(
              ("default",  &empty_prefixes, defaults)
         };
 
-        let mut host_domain_name = None;
-        let mut host_name = None;
-        if let Some(ds_host_name) = deployment_service_opt.and_then(|s| s.host.clone()) {
-            let host = env_spec.ingress.hosts.iter()
-                .find(|host_spec| host_spec.name == ds_host_name);
 
-            match host {
-                Some(host) => {
-                    host_name = Some(ds_host_name);
-                    host_domain_name = host.domain_names.first().cloned();
-                },
-                None =>return Err(anyhow!("Host {} not found in ingress spec", ds_host_name)),
-            }
+
+
+        let mut host_name = primary_host.clone();
+        if let Some(deployment_service) = deployment_service_opt {
+            host_name = deployment_service.host.clone().unwrap_or(primary_host.clone());
         }
 
-        let is_app_service = app_spec.app_services.iter().any(|s| s.name == app_service.name);
+        let mut host_domain_name: &String;
+
+        let host = env_spec.ingress.hosts.iter()
+            .find(|host_spec| &(host_spec.name) == &host_name);
+
+        match host.and_then(|h| h.domain_names.first()) {
+            Some(host) => {
+                host_domain_name = host;
+            },
+            None =>return Err(anyhow!("Host {} not found in ingress spec", host_name)),
+        }
+
+        let is_app_service = app_service.is_app_service;
 
         // Resolve Image
         let mut raw_image = app_service.image_variants.iter()
@@ -125,37 +132,25 @@ pub fn resolve(
             return Err(anyhow!("Registry mapping is required for non-local deployments"));
         }
 
-        let image = if let Some((namespace, _rest)) = raw_image.split_once('/') {
-            if let Some(registry_host) = env_spec.registry.get(namespace) {
-                let registry_host = registry_host.strip_suffix('/').unwrap_or(registry_host);
-                format!("{}/{}", registry_host, raw_image)
-            } else {
-                if env_spec.env_type == DeploymentEnvType::Local {
-                    raw_image
-                } else {
-                    let available: Vec<_> = env_spec.registry.keys().collect();
-                    return Err(anyhow!("Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}", namespace, available));
-                }
-            }
+        let image = if (is_app_service) {
+            resolve_app_service_image(env_spec, raw_image)?
         } else {
             raw_image
         };
 
         // Check Public Service uniqueness
         if let ServiceType::Public = app_service.service_type {
-            if let Some(h) = host_name {
-                for prefix in prefixes {
-                     let key = (h.to_string(), prefix.prefix.clone());
-                     if !public_host_prefix_combinations.insert(key) {
-                         return Err(anyhow!("Duplicate host+prefix combination for public service {}: {}{}",
-                             app_service.name, h, prefix.prefix));
-                     }
-                }
+            for prefix in prefixes {
+                 let key = (host_name.to_string(), prefix.prefix.clone());
+                 if !public_host_prefix_combinations.insert(key) {
+                     return Err(anyhow!("Duplicate host+prefix combination for public service {}: {}{}",
+                         app_service.name, host_name, prefix.prefix));
+                 }
             }
         }
 
         // Resolve Environment Variables
-        let environment_variables = resolve_app_env_vars(app_spec, &deployment.environment, host_domain_name.as_ref())?;
+        let environment_variables = resolve_app_env_vars(app_spec, &deployment.environment, Some(host_domain_name))?;
         let final_service_env_vars = filter_service_env_vars(app_service, &environment_variables)?;
 
         // Resolve Undockerized Environment Variables
@@ -163,7 +158,7 @@ pub fn resolve(
         for override_var in &deployment.undockerized_environment {
             add_unique_var(&mut undockerized_values, override_var.clone());
         }
-        let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, host_domain_name.as_ref())?;
+        let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name))?;
         let final_undockerized_service_env_vars = filter_service_env_vars(app_service, &undockerized_variables)?;
 
         // Resolve Configs
@@ -196,19 +191,14 @@ pub fn resolve(
             full_name: format!("{}-{}", app_spec.name, app_service.name),
             service_type: app_service.service_type.clone(),
             image,
-            service_host: host_domain_name.map(|s| s.to_string()),
+            service_host: host_domain_name.clone(),
             environment_variables: final_service_env_vars,
             undockerized_environment_variables: final_undockerized_service_env_vars,
             configs: service_configs,
             secrets: service_secrets,
             ports: deployment_service_opt.map(|s|
-                if s.ports.is_empty() && s.host.is_some()
-                {
-                    vec![]
-                } else {
-                    s.ports.clone()
-                }
-            ).unwrap_or_default(),
+                s.ports.clone()
+            ).unwrap_or(app_service.ports.clone()),
         });
     }
 
@@ -228,10 +218,10 @@ pub fn resolve(
 
             for app_service in app_spec.all_services() {
                 let deployment_service_opt = deployment.services.as_ref().and_then(|s| s.get(&app_service.name));
-
                 if let Some(ds) = deployment_service_opt {
-                    if let Some(h) = &ds.host {
-                        if h == &host_spec.name {
+                    if  let ServiceType::Public = app_service.service_type {
+                        let h = ds.host.clone().unwrap_or(primary_host.clone());
+                        if &h == &host_spec.name {
                             let full_name = format!("{}-{}", app_spec.name, app_service.name);
                             // Determine port
                             let port = if let Some(_) = ds.ports.iter().find(|p| p.external == 80) {
@@ -289,10 +279,29 @@ pub fn resolve(
     };
 
     Ok(EnvironmentResolvedSpec {
-        name: "environment".to_string(),
         ingress: ingress_resolved,
         current_deployment,
+        env_type: env_spec.env_type.clone(),
     })
+}
+
+fn resolve_app_service_image(env_spec: &DeploymentEnvironmentSpec, raw_image: String) -> Result<String> {
+    let image = if let Some((namespace, _rest)) = raw_image.split_once('/') {
+        if let Some(registry_host) = env_spec.registry.get(namespace) {
+            let registry_host = registry_host.strip_suffix('/').unwrap_or(registry_host);
+            format!("{}/{}", registry_host, raw_image)
+        } else {
+            if env_spec.env_type == DeploymentEnvType::Local {
+                raw_image
+            } else {
+                let available: Vec<_> = env_spec.registry.keys().collect();
+                return Err(anyhow!("Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}", namespace, available));
+            }
+        }
+    } else {
+        raw_image
+    };
+    Ok(image)
 }
 
 fn add_unique_var(vars: &mut Vec<EnvVariable>, var: EnvVariable) {
@@ -337,7 +346,7 @@ fn resolve_app_env_vars(
     host_domain_name: Option<&String>
 ) -> Result<Vec<EnvVariable>> {
     let mut environment_variables = Vec::new();
-    
+
     // External
     for external in &app_spec.environment.external {
          let val = deployment_values.iter()
@@ -362,7 +371,7 @@ fn resolve_app_env_vars(
             add_unique_var(&mut environment_variables, EnvVariable{ name: optional.name.clone(), value:v });
         }
     }
-    
+
     // Relative
     for relative in &app_spec.environment.relative {
          if let Some(h) = host_domain_name {
@@ -385,12 +394,12 @@ fn resolve_app_env_vars(
             value,
         });
     }
-    
+
     Ok(environment_variables)
 }
 
 fn filter_service_env_vars(
-    app_service: &ServiceSpec, 
+    app_service: &ServiceSpec,
     all_env_vars: &[EnvVariable]
 ) -> Result<Vec<EnvVariable>> {
     let mut final_service_env_vars = Vec::new();
