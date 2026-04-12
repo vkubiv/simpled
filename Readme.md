@@ -207,7 +207,7 @@ Usage in service:
 
     # set as SENDGRID_API_KEY environment variable
     - sendgrid_apikey:
-      environment: SENDGRID_API_KEY
+      variable: SENDGRID_API_KEY
 ```
 
 ## Defining environments
