@@ -581,7 +581,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
              writeln!(file, "    service-{}-{}:", router_name_base, j)?;
              writeln!(file, "      loadBalancer:")?;
              writeln!(file, "        servers:")?;
-             writeln!(file, "          - url: \"http://{}:{}/\"", svc.service_name, svc.port)?;
+             writeln!(file, "          - url: \"http://{}_{}:{}/\"", svc.deployment_name,  svc.service_name, svc.port)?;
         }
     }
     

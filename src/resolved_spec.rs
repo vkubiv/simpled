@@ -36,6 +36,7 @@ pub struct IngressRule {
 #[derive(Debug, Clone)]
 pub struct IngressToServiceRule {
     pub service_name: String,
+    pub deployment_name: String,
     pub port: u16,
     pub prefix: String,
     pub strip_prefix: bool,
@@ -45,7 +46,7 @@ pub struct IngressToServiceRule {
 pub struct ServiceResolvedSpec {
     pub service_type: ServiceType,
 
-    // name consists of app name + service name
+    // name consists of service name
     pub full_name: String,
 
     // resolved image with a full name, including registry and version
@@ -69,7 +70,7 @@ pub struct ServiceResolvedSpec {
     pub secrets: Vec<ServiceSecret>,
 
     pub ports: Vec<ServicePort>,
-    
+
     pub volumes: Vec<ServiceVolume>,
 }
 

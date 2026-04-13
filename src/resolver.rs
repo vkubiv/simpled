@@ -188,7 +188,7 @@ pub fn resolve(
         }
 
         resolved_services.push(ServiceResolvedSpec {
-            full_name: format!("{}-{}", app_spec.name, app_service.name),
+            full_name: format!("{}", app_service.name),
             service_type: app_service.service_type.clone(),
             image,
             service_host: host_domain_name.clone(),
@@ -224,7 +224,7 @@ pub fn resolve(
                     if  let ServiceType::Public = app_service.service_type {
                         let h = ds.host.clone().unwrap_or(primary_host.clone());
                         if &h == &host_spec.name {
-                            let full_name = format!("{}-{}", app_spec.name, app_service.name);
+                            let full_name = format!("{}", app_service.name);
                             // Determine port
                             let port = if let Some(_) = ds.ports.iter().find(|p| p.external == 80) {
                                 80
@@ -237,6 +237,7 @@ pub fn resolve(
                             for prefix in &ds.prefixes {
                                 service_rules.push(IngressToServiceRule {
                                     service_name: full_name.clone(),
+                                    deployment_name: deployment.name.clone(),
                                     port,
                                     prefix: prefix.prefix.clone(),
                                     strip_prefix: prefix.strip,
