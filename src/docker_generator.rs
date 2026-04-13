@@ -151,7 +151,7 @@ fn generate_swarm(
     let mut services_map = HashMap::new();
 
     for service in &deployment.services {
-        let mut docker_service = prepare_service(service, resolved_spec, output_dir)?;
+        let mut docker_service = prepare_service(service, resolved_spec, &app_dir)?;
 
         let mut networks = HashMap::new();
         networks.insert("default".to_string(), ServiceNetwork {
@@ -175,7 +175,7 @@ fn generate_swarm(
         networks,
     };
 
-    let compose_path = output_dir.join("docker-compose.yaml");
+    let compose_path = &app_dir.join("docker-compose.yaml");
     let yaml = serde_yaml::to_string(&compose)?;
     fs::write(&compose_path, yaml)?;
 
