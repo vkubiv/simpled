@@ -203,8 +203,8 @@ fn generate_swarm(
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
-    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yml ingress --detach=false")?;
-    writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yml {} --with-registry-auth --detach=false", deployment.name, deployment.name)?;
+    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --detach=false")?;
+    writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --detach=false", deployment.name, deployment.name)?;
 
     Ok(())
 }
@@ -268,7 +268,7 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
     fs::create_dir_all(&nginx_conf_dir)?;
     generate_nginx_config(&resolved_spec.ingress, &nginx_conf_dir.join("default.conf"))?;
     
-    let mut stack = File::create(ingress_dir.join("docker-compose.yml"))?;
+    let mut stack = File::create(ingress_dir.join("docker-compose.yaml"))?;
     writeln!(stack, "version: '3.8'")?;
     writeln!(stack, "services:")?;
     writeln!(stack, "  nginx:")?;
@@ -282,8 +282,8 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
     writeln!(stack, "      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf")?;
     
     if resolved_spec.ingress.tls.is_some() {
-         // We assume certs are placed in output_dir/certs -> so from ingress/docker-compose.yml, it is ../certs
-         // Wait, the structure is output_dir/ingress/docker-compose.yml
+         // We assume certs are placed in output_dir/certs -> so from ingress/docker-compose.yaml, it is ../certs
+         // Wait, the structure is output_dir/ingress/docker-compose.yaml
          // So ../certs is output_dir/certs
          writeln!(stack, "      - ../certs:/etc/nginx/certs")?;
          
@@ -477,7 +477,7 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
 
-    let mut stack = File::create(ingress_dir.join("docker-compose.yml"))?;
+    let mut stack = File::create(ingress_dir.join("docker-compose.yaml"))?;
     writeln!(stack, "version: '3.8'")?;
     writeln!(stack, "services:")?;
     writeln!(stack, "  traefik:")?;
