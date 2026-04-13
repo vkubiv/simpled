@@ -5,7 +5,7 @@ use anyhow::Context;
 use serde::Serialize;
 use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
 use crate::spec;
-use crate::spec::{EnvVariable, SecretMount};
+use crate::spec::{EnvVariable, SecretMount, ServiceVolumeType};
 
 #[derive(Serialize)]
 pub struct DockerCompose {
@@ -56,6 +56,17 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
 
     let mut volumes = Vec::new();
     let mut environment = HashMap::new();
+
+    for volume in &service.volumes {
+        match &volume.name {
+            ServiceVolumeType::Named(name) => {
+                volumes.push(format!("./volumes/{}:{}",  name, volume.mount_path));
+            }
+            ServiceVolumeType::Path(from_path) => {
+                volumes.push(format!("{}:{}",  from_path, volume.mount_path));
+            }
+        }
+    }
 
     // Configs
     for config_option in &service.configs {

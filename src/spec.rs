@@ -9,6 +9,7 @@ pub struct AppSpec {
     pub extra_services: Vec<ServiceSpec>,
     pub configs: Vec<ConfigSpec>,
     pub secrets: Vec<AppSecretOption>,
+    pub volumes: Vec<String>,
 }
 
 impl AppSpec {
@@ -66,6 +67,18 @@ pub struct ServicePort {
 }
 
 #[derive(Debug, Clone)]
+pub enum ServiceVolumeType {
+    Named(String),
+    Path(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceVolume {
+    pub name: ServiceVolumeType,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ServiceSpec {
     pub name: String,
     pub service_type: ServiceType,
@@ -79,6 +92,7 @@ pub struct ServiceSpec {
     pub configs: Vec<ServiceConfigOption>,
     pub secrets: Vec<ServiceSecret>,
     pub ports: Vec<ServicePort>,
+    pub volumes: Vec<ServiceVolume>,
 }
 #[derive(Debug, Clone)]
 pub enum ServiceEnvOption {

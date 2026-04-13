@@ -146,6 +146,12 @@ fn generate_swarm(
     let app_dir = output_dir.join(&deployment.name);
     fs::create_dir_all(&app_dir)?;
 
+    for volume in &deployment.volumes {
+        let volume_sub_dir = app_dir.clone().join("volumes").join(&volume);
+        fs::create_dir_all(volume_sub_dir)?;
+    }
+
+
     let network_name = "common_network".to_string();
 
     let mut services_map = HashMap::new();

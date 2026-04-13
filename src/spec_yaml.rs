@@ -10,6 +10,7 @@ pub struct AppSpecYaml {
     pub extra_services: Option<HashMap<String, ServiceSpecYaml>>,
     pub configs: Option<HashMap<String, Vec<String>>>,
     pub secrets: Option<AppSecretsYaml>,
+    pub volumes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +45,7 @@ pub struct ServiceSpecYaml {
     pub configs: Option<Vec<HashMap<String, String>>>,
     pub secrets: Option<Vec<ServiceSecretYaml>>,
     pub ports: Option<Vec<String>>,
+    pub volumes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

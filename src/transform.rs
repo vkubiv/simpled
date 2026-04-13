@@ -66,6 +66,22 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
 
     let extra_services = convert_services(combined_extra_services, false)?;
 
+    let volumes: Vec<String> = yaml.volumes.unwrap_or_default();
+
+    // Validate that every named volume referenced by a service is declared in app volumes
+    for svc in app_services.iter().chain(extra_services.iter()) {
+        for vol in &svc.volumes {
+            if let ServiceVolumeType::Named(vol_name) = &vol.name {
+                if !volumes.contains(vol_name) {
+                    return Err(anyhow!(
+                        "Service '{}' references named volume '{}' which is not declared in app volumes",
+                        svc.name, vol_name
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(AppSpec {
         name: yaml.name,
         version,
@@ -74,6 +90,7 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
         extra_services,
         configs,
         secrets,
+        volumes,
     })
 }
 
@@ -203,6 +220,10 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
 
     let ports = parsePorts(&yaml.ports)?;
 
+    let volumes = yaml.volumes.unwrap_or_default().into_iter()
+        .map(|s| parse_service_volume(&s))
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(ServiceSpec {
         name,
         service_type,
@@ -211,6 +232,7 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         configs,
         secrets,
         ports,
+        volumes,
         is_app_service,
     })
 }
@@ -565,6 +587,22 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
         prefixes,
         resources,
         ports,
+    })
+}
+
+fn parse_service_volume(s: &str) -> Result<ServiceVolume> {
+    let (vol_str, mount_path) = s.split_once(':')
+        .ok_or_else(|| anyhow!("Invalid volume format '{}'. Expected 'name:mount_path' or './path:mount_path'", s))?;
+
+    let name = if vol_str.starts_with('.') || vol_str.starts_with('/') {
+        ServiceVolumeType::Path(vol_str.to_string())
+    } else {
+        ServiceVolumeType::Named(vol_str.to_string())
+    };
+
+    Ok(ServiceVolume {
+        name,
+        mount_path: mount_path.to_string(),
     })
 }
 

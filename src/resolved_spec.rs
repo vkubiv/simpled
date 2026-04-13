@@ -1,4 +1,4 @@
-use crate::spec::{DeploymentEnvType, EnvVariable, ResourcesSpec, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType};
+use crate::spec::{DeploymentEnvType, EnvVariable, ResourcesSpec, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume};
 
 #[derive(Debug)]
 pub struct EnvironmentResolvedSpec {
@@ -69,6 +69,8 @@ pub struct ServiceResolvedSpec {
     pub secrets: Vec<ServiceSecret>,
 
     pub ports: Vec<ServicePort>,
+    
+    pub volumes: Vec<ServiceVolume>,
 }
 
 #[derive(Debug)]
@@ -85,6 +87,7 @@ pub struct DeploymentResolvedSpec {
     pub secrets: Vec<SecretResolvedSpec>,
     pub defaults: ResourcesSpec,
     pub services: Vec<ServiceResolvedSpec>,
+    pub volumes: Vec<String>,
 }
 
 #[derive(Debug)]

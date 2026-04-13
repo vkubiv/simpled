@@ -249,6 +249,48 @@ Usage in service:
       variable: SENDGRID_API_KEY
 ```
 
+## Volumes
+
+Named volumes that services need to persist data across restarts are declared at the application level and then referenced from individual services.
+
+### Declaring named volumes
+
+List volume names under the top-level `volumes:` key in `appspec.yaml`:
+
+```yaml
+volumes:
+  - postgres-data
+  - redis-data
+  - uploads
+```
+
+### Using volumes in a service
+
+The `volumes:` field on a service accepts entries in the standard `source:target` format.
+
+**Named volume** — the name must be declared in the app-level `volumes:` list:
+
+```yaml
+extra_services:
+  postgres:
+    image: postgres:16
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+```
+
+**Host path** — use a relative (`./`) or absolute (`/`) path as the source; no app-level declaration is required:
+
+```yaml
+app_services:
+  backend-svc:
+    image: mycompany/backend-svc
+    volumes:
+      - ./local-data:/app/data
+      - /mnt/shared:/app/shared
+```
+
+`simpled` returns an error at parse time if a service references a named volume that is not declared in `volumes:`.
+
 ## Defining environments
 
 The Environment is defined in `envspec.yaml`.

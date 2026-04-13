@@ -196,6 +196,7 @@ pub fn resolve(
             undockerized_environment_variables: final_undockerized_service_env_vars,
             configs: service_configs,
             secrets: service_secrets,
+            volumes: app_service.volumes.clone(),
             ports: deployment_service_opt.map(|s|
                 s.ports.clone()
             ).unwrap_or(app_service.ports.clone()),
@@ -209,6 +210,7 @@ pub fn resolve(
         secrets: resolved_secrets,
         defaults: deployment.defaults.clone(),
         services: resolved_services,
+        volumes: app_spec.volumes.clone(),
     };
 
     let mut ingress_rules = Vec::new();
