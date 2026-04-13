@@ -50,6 +50,15 @@ environment:
     - IOS_APP_URL="https://apps.apple.com/..."
 ```
 
+`optional` works like `external` but the deployment will not fail if these variables are missing from the environment.
+
+```yaml
+environment:
+  optional:
+    - FEATURE_FLAG_DARK_MODE
+    - DEBUG_LOGGING=false
+```
+
 In the `relative` section, a special type of variable is set. They are used to set URLs relative to the application host.
 This frees you from the hassle of defining these variables independently for each environment.
 However, they can still be overridden by a specific environment if needed.
@@ -119,6 +128,36 @@ There are three service types:
  * **public** - exposed to the external world, accessible by an external URL. Like `https://app.mycompany.com`
  * **internal** - only accessible to other app services.
  * **job** - runs once per deployment, used to set things up. Not accessible to other services.
+
+### Service variants
+
+A service can define multiple image variants. This is useful when you need to deploy the same service with different base images (e.g. different architectures or flavors) and let each environment pick the appropriate one.
+
+```yaml
+app_services:
+  backend-svc:
+    type: internal
+    image: mycompany/backend-svc
+    variants:
+      arm:
+        image: mycompany/backend-svc-arm
+```
+
+The deployment can then select a variant with the `variant` field (see [Deployments](#deployments)).
+
+### Service export
+
+`export` pins a default host and prefix for a service. This is useful when the service is always expected at a fixed path regardless of environment overrides.
+
+```yaml
+app_services:
+  web-app:
+    type: public
+    image: mycompany/web-app
+    export:
+      host: myapp
+      prefix: /
+```
 
 ### Service env variables
 
@@ -213,8 +252,33 @@ Usage in service:
 ## Defining environments
 
 The Environment is defined in `envspec.yaml`.
-It consists of two parts: ingress and deployments.
-Ingress defines the root ingress, and deployments define applications that are deployed in this environment.
+It consists of three parts: environment type, ingress, and deployments.
+
+### Environment type
+
+The top-level `type` field specifies the target platform:
+
+```yaml
+type: k8s      # Kubernetes (default)
+# type: docker # Docker / Docker Swarm
+# type: local  # Local development
+```
+
+When `type` is `docker`, you can enable Swarm mode:
+
+```yaml
+type: docker
+swarm_mode: true
+```
+
+### Registry
+
+You can define a registry mapping at the environment level so that image names are automatically rewritten during deployment:
+
+```yaml
+registry:
+  mycompany: my-docker-registry.com
+```
 
 ### Ingress
 
@@ -229,8 +293,38 @@ ingress:
     website: 
      - www.myapp.com
      - myapp.com
-  secret: myapp-tls
+  tls:
+    secret: myapp-tls
+```
 
+#### TLS options
+
+```yaml
+ingress:
+  name: myapp-ingress
+  hosts:
+    myapp: app.myapp.com
+  tls:
+    # disable TLS entirely
+    disable: true
+
+    # use an existing TLS secret
+    secret: myapp-tls
+
+    # or provision a certificate automatically via Let's Encrypt
+    letsencrypt:
+      email: ops@mycompany.com
+      # server: https://acme-staging-v02.api.letsencrypt.org/directory  # optional, defaults to production
+```
+
+When `type` is `docker`, you can also select the ingress controller:
+
+```yaml
+ingress:
+  name: myapp-ingress
+  type: nginx   # nginx or traefik (default)
+  hosts:
+    myapp: app.myapp.com
 ```
 
 ### Deployments
@@ -240,6 +334,10 @@ Let's define a deployment config for `myapp` web app.
 ```yaml
 deployments:
   myapp_prod:
+    # primary_host is required: the main host name (key from ingress.hosts) used to
+    # build relative environment variable URLs.
+    primary_host: myapp
+
     application:
       # application name, in this case `myapp` 
       name: myapp
@@ -289,6 +387,8 @@ Let's deploy a website that contains frontend and headless CMS services.
 
 ```yaml
   website_prod:
+    primary_host: website
+
     application:
       name: website
       # sets restriction on app version supported. In this case you can deploy any app version from 1.1.5 to 2.0.0
@@ -314,13 +414,26 @@ Let's deploy a website that contains frontend and headless CMS services.
         prefix: /
       headless-cms:
         host: website
-        prefixes: 
-          - "/upload":
+        prefixes:
+          "/upload":
             strip: false
-          - "/content-manager":
+          "/content-manager":
             strip: false
-          - "/admin":
+          "/admin":
             strip: false
+```
+
+#### `undockerized_environment`
+
+Some environments run a mix of containerized and non-containerized services. Use `undockerized_environment` to pass variables to services that run outside Docker/Kubernetes:
+
+```yaml
+  myapp_prod:
+    primary_host: myapp
+    application:
+      name: myapp
+    environment: clinic.env
+    undockerized_environment: clinic-native.env
 ```
 
 ## Exposed services
@@ -342,6 +455,24 @@ services:
 
 In the given example, `admin-panel` will be served on the dev environment at
 `https://myapp-dev.com/admin-panel`
+
+Use `strip_prefix: false` to forward the prefix path to the upstream service without stripping it:
+
+```yaml
+services:
+  admin-panel:
+    host: myapp
+    prefix: /admin-panel
+    strip_prefix: false
+```
+
+Use `variant` to deploy a specific image variant defined in `appspec.yaml`:
+
+```yaml
+services:
+  backend-svc:
+    variant: arm
+```
 
 # Prepare deployment artifacts
 Build all docker images for the given application:
