@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, ServiceNetwork};
@@ -246,6 +247,7 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
         }
     }
 
+    write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
     writeln!(deploy_sh, " nginx:alpine")?;
 
     if let Some(tls) = &resolved_spec.ingress.tls {
@@ -300,13 +302,19 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
          }
     }
     
+    let deploy_date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    writeln!(stack, "    environment:")?;
+    writeln!(stack, "      - DEPLOY_DATE={}", deploy_date)?;
     writeln!(stack, "    networks:")?;
     writeln!(stack, "      default:")?;
     writeln!(stack, "networks:")?;
     writeln!(stack, "  default:")?;
     writeln!(stack, "    external: true")?;
     writeln!(stack, "    name: {}", network_name)?;
-    
+
     Ok(())
 }
 
@@ -436,6 +444,7 @@ fn generate_traefik_standalone(resolved_spec: &EnvironmentResolvedSpec, output_d
         write!(deploy_sh, " -v $(pwd)/letsencrypt:/letsencrypt")?;
     }
 
+    write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
     writeln!(deploy_sh, " traefik:v2.10")?;
 
     Ok(())
@@ -503,7 +512,13 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
         // Make sure dir exists
         fs::create_dir_all(ingress_dir.parent().unwrap().join("letsencrypt"))?;
     }
-    
+
+    let deploy_date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    writeln!(stack, "    environment:")?;
+    writeln!(stack, "      - DEPLOY_DATE={}", deploy_date)?;
     writeln!(stack, "    networks:")?;
     writeln!(stack, "      default:")?;
     writeln!(stack, "networks:")?;

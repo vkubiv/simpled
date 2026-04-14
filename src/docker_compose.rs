@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde::Serialize;
 use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
@@ -137,6 +138,12 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
     let ports = service.ports.iter()
         .map(|port| format!("{}:{}", port.external, port.internal))
         .collect();
+
+    let deploy_date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    environment.insert("DEPLOY_DATE".to_string(), deploy_date.to_string());
 
     Ok(DockerService {
         image: service.image.clone(),

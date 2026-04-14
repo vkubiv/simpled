@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose};
 
 pub fn generate(
@@ -69,7 +70,13 @@ pub fn generate(
         writeln!(file, "      - name: {}", service.full_name)?;
         writeln!(file, "        image: {}", service.image)?;
         
+        let deploy_date = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         writeln!(file, "        env:")?;
+        writeln!(file, "        - name: DEPLOY_DATE")?;
+        writeln!(file, "          value: \"{}\"", deploy_date)?;
         for env in &service.environment_variables {
             writeln!(file, "        - name: {}", env.name)?;
             writeln!(file, "          value: \"{}\"", env.value)?;
