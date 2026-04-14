@@ -213,18 +213,35 @@ pub fn resolve(
         volumes: app_spec.volumes.clone(),
     };
 
+    // Validate that every Public service configured in the current deployment has at least one ingress rule.
+    // A Public service with no prefixes is likely a configuration mistake.
+    if let Some(dep_services) = &deployment.services {
+        for app_service in app_spec.all_services() {
+            if let ServiceType::Public = app_service.service_type {
+                if let Some(ds) = dep_services.get(&app_service.name) {
+                    if ds.prefixes.is_empty() {
+                        return Err(anyhow!(
+                            "Public service '{}' in deployment '{}' has no prefixes configured and will not be reachable via ingress.",
+                            app_service.name,
+                            deployment.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     let mut ingress_rules = Vec::new();
     for host_spec in &env_spec.ingress.hosts {
         for domain in &host_spec.domain_names {
             let mut service_rules = Vec::new();
 
-            for app_service in app_spec.all_services() {
-                let deployment_service_opt = deployment.services.as_ref().and_then(|s| s.get(&app_service.name));
-                if let Some(ds) = deployment_service_opt {
-                    if  let ServiceType::Public = app_service.service_type {
-                        let h = ds.host.clone().unwrap_or(primary_host.clone());
+            for dep in &env_spec.deployments {
+                let dep_primary_host = &dep.primary_host;
+                for (service_name, ds) in dep.services.clone().unwrap_or_default() {
+                        let h = ds.host.clone().unwrap_or(dep_primary_host.clone());
                         if &h == &host_spec.name {
-                            let full_name = format!("{}", app_service.name);
+                            let full_name = format!("{}", service_name);
                             // Determine port
                             let port = if let Some(_) = ds.ports.iter().find(|p| p.external == 80) {
                                 80
@@ -237,14 +254,14 @@ pub fn resolve(
                             for prefix in &ds.prefixes {
                                 service_rules.push(IngressToServiceRule {
                                     service_name: full_name.clone(),
-                                    deployment_name: deployment.name.clone(),
+                                    deployment_name: dep.name.clone(),
                                     port,
                                     prefix: prefix.prefix.clone(),
                                     strip_prefix: prefix.strip,
                                 });
                             }
-                        }
                     }
+
                 }
             }
 

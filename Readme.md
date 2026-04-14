@@ -467,7 +467,8 @@ Let's deploy a website that contains frontend and headless CMS services.
 
 #### `undockerized_environment`
 
-Some environments run a mix of containerized and non-containerized services. Use `undockerized_environment` to pass variables to services that run outside Docker/Kubernetes:
+Some local environments run a mix of containerized and non-containerized services. Use `undockerized_environment` to pass variables to services that run outside Docker/Kubernetes:
+This feature is 
 
 ```yaml
   myapp_prod:
