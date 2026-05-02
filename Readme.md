@@ -8,6 +8,13 @@ Kubernetes doesn't give you a predefined structure for your deployment, so you n
 To make things flexible enough, but at the same time simple to use, `simpled` borrows approaches from programming like modularity, isolation, self-verification, consistency checking, and comprehensive human-readable errors.
 It also borrows the app bundle concept from mobile development.
 
+## Documentation
+
+- [Tutorial](docs/tutorial.md) — step-by-step guide from a blank directory to a running Kubernetes deployment
+- [Examples](docs/examples.md) — annotated real-world configurations covering common patterns
+- [Reference](docs/reference.md) — every field in `appspec.yaml` and `envspec.yaml`, plus CLI flags and generated output
+- [CI/CD Integration](docs/cicd.md) — automating builds and deployments with GitHub Actions
+
 ## Core concepts
 
 There are two core concepts: **Environment** and **Application**.
