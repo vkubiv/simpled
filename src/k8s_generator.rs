@@ -71,7 +71,14 @@ pub fn generate(
         writeln!(file, "      containers:")?;
         writeln!(file, "      - name: {}", service.full_name)?;
         writeln!(file, "        image: {}", service.image)?;
-        
+        writeln!(file, "        resources:")?;
+        writeln!(file, "          requests:")?;
+        writeln!(file, "            memory: {}", deployment.defaults.requests.memory)?;
+        writeln!(file, "            cpu: {}", deployment.defaults.requests.cpu)?;
+        writeln!(file, "          limits:")?;
+        writeln!(file, "            memory: {}", deployment.defaults.limits.memory)?;
+        writeln!(file, "            cpu: {}", deployment.defaults.limits.cpu)?;
+
         let deploy_date = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -147,7 +154,7 @@ pub fn generate(
     }
 
     // 4. Ingress
-    generate_ingress(&resolved_spec, output_dir)?;
+    generate_ingress(resolved_spec, output_dir)?;
 
     // 5. ClusterIssuer (if needed)
     if let Some(tls) = &resolved_spec.ingress.tls {
@@ -184,6 +191,7 @@ fn generate_ingress(
     }
 
     writeln!(file, "spec:")?;
+    writeln!(file, "  ingressClassName: nginx")?;
     if let Some(tls) = &resolved_spec.ingress.tls {
         writeln!(file, "  tls:")?;
         writeln!(file, "  - hosts:")?;
@@ -212,8 +220,9 @@ fn generate_ingress(
                  svc_rule.prefix.clone()
              };
              
+             let path_type = if svc_rule.strip_prefix { "ImplementationSpecific" } else { "Prefix" };
              writeln!(file, "      - path: {}", path)?;
-             writeln!(file, "        pathType: ImplementationSpecific")?; // Changed for regex support
+             writeln!(file, "        pathType: {}", path_type)?;
              writeln!(file, "        backend:")?;
              writeln!(file, "          service:")?;
              writeln!(file, "            name: {}", svc_rule.service_name)?;
