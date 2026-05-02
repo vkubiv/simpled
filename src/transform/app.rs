@@ -171,21 +171,17 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         None => ServiceType::Internal,
     };
 
-    let mut image_variants = Vec::new();
-    if let Some(img) = yaml.image {
-        image_variants.push(ImageVariant {
-            variant_name: "default".to_string(),
-            image: img,
-        });
-    }
-    if let Some(variants) = yaml.variants {
-        for (v_name, v_img) in variants {
-            image_variants.push(ImageVariant {
-                variant_name: v_name,
-                image: v_img.image,
-            });
-        }
-    }
+    let image = match (yaml.image, yaml.variants) {
+        (Some(img), None) => ImageSpec::Exact(img),
+        (None, Some(variants)) => ImageSpec::Variants(
+            variants.into_iter().map(|(variant_name, v)| ImageVariant {
+                variant_name,
+                image: v.image,
+            }).collect()
+        ),
+        (Some(_), Some(_)) => return Err(anyhow!("Service '{}' cannot have both 'image' and 'variants'", name)),
+        (None, None) => return Err(anyhow!("Service '{}' must specify either 'image' or 'variants'", name)),
+    };
 
     let environment = yaml.environment.unwrap_or_default().into_iter().map(|s| {
         if s == "$all" {
@@ -219,7 +215,7 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
     Ok(ServiceSpec {
         name,
         service_type,
-        image_variants,
+        image,
         environment,
         configs,
         secrets,
