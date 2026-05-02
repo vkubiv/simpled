@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(Get-ChildItem -Path \"C:\\\\apps\\\\simpled\" -Force)",
+      "Bash(Select-Object Name, FullName, PSIsContainer)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\apps\\\\simpled\" -Force | Select-Object Name, @{Name='IsDir';Expression={$_.PSIsContainer}})",
+      "Bash(Remove-Item *)",
+      "Bash(Get-ChildItem -Recurse -Path \"C:\\\\apps\\\\simpled\\\\example\")",
+      "Bash(Select-Object FullName, PSIsContainer)",
+      "Bash(Format-Table -AutoSize)",
+      "Bash(Get-ChildItem *)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\apps\\\\simpled\\\\example\\\\environments\\\\prod\\\\manifests\" -File | ForEach-Object { $_.FullName })"
+    ]
+  }
+}
