@@ -10,6 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, ServiceNetwork};
 
+const DOCKER_NETWORK: &str = "common_network";
+const NGINX_IMAGE: &str = "nginx:alpine";
+const TRAEFIK_IMAGE: &str = "traefik:v2.10";
+const TRAEFIK_RESOLVER: &str = "myresolver";
+
 pub fn generate(
     resolved_spec: &EnvironmentResolvedSpec,
     docker_spec: &DockerSpecificSpec,
@@ -75,7 +80,7 @@ fn generate_standalone(
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     
-    let network_name = "common_network".to_string();
+    let network_name = DOCKER_NETWORK.to_string();
     writeln!(deploy_sh, "docker network create {} || true", network_name)?;
     
     for service in &deployment.services {
@@ -153,7 +158,7 @@ fn generate_swarm(
     }
 
 
-    let network_name = "common_network".to_string();
+    let network_name = DOCKER_NETWORK.to_string();
 
     let mut services_map = HashMap::new();
 
@@ -248,7 +253,7 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
     }
 
     write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
-    writeln!(deploy_sh, " nginx:alpine")?;
+    writeln!(deploy_sh, " {}", NGINX_IMAGE)?;
 
     if let Some(tls) = &resolved_spec.ingress.tls {
         if let Some(le) = &tls.letsencrypt {
@@ -280,7 +285,7 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
     writeln!(stack, "version: '3.8'")?;
     writeln!(stack, "services:")?;
     writeln!(stack, "  nginx:")?;
-    writeln!(stack, "    image: nginx:alpine")?;
+    writeln!(stack, "    image: {}", NGINX_IMAGE)?;
     writeln!(stack, "    ports:")?;
     writeln!(stack, "      - \"80:80\"")?;
     if resolved_spec.ingress.tls.is_some() {
@@ -407,7 +412,7 @@ fn generate_traefik_standalone(resolved_spec: &EnvironmentResolvedSpec, output_d
     }
 
     write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
-    writeln!(deploy_sh, " traefik:v2.10")?;
+    writeln!(deploy_sh, " {}", TRAEFIK_IMAGE)?;
 
     Ok(())
 }
@@ -433,7 +438,7 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
     writeln!(stack, "version: '3.8'")?;
     writeln!(stack, "services:")?;
     writeln!(stack, "  traefik:")?;
-    writeln!(stack, "    image: traefik:v2.10")?;
+    writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
     writeln!(stack, "    ports:")?;
     writeln!(stack, "      - \"80:80\"")?;
     if has_tls {
@@ -474,7 +479,7 @@ fn write_traefik_static_config(file: &mut File, has_tls: bool, letsencrypt: Opti
     writeln!(file, "    watch: true")?;
     if let Some(le) = letsencrypt {
         writeln!(file, "certificatesResolvers:")?;
-        writeln!(file, "  myresolver:")?;
+        writeln!(file, "  {}:", TRAEFIK_RESOLVER)?;
         writeln!(file, "    acme:")?;
         writeln!(file, "      email: \"{}\"", le.email)?;
         writeln!(file, "      storage: \"/letsencrypt/acme.json\"")?;
@@ -546,7 +551,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
                  writeln!(file, "        - websecure")?;
                  writeln!(file, "      tls:")?;
                  if use_le {
-                     writeln!(file, "        certResolver: myresolver")?;
+                     writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
                  }
              } else {
                  writeln!(file, "      entryPoints:")?;

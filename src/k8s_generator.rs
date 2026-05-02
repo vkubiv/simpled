@@ -7,6 +7,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose};
 
+const LETSENCRYPT_ISSUER: &str = "letsencrypt-prod";
+
 pub fn generate(
     resolved_spec: &EnvironmentResolvedSpec,
     output_dir: &Path,
@@ -172,7 +174,7 @@ fn generate_ingress(
     // Annotations for strip-prefix and cert-manager
     if let Some(tls) = &resolved_spec.ingress.tls {
         if tls.letsencrypt.is_some() {
-            writeln!(file, "    cert-manager.io/cluster-issuer: letsencrypt-prod")?;
+            writeln!(file, "    cert-manager.io/cluster-issuer: {}", LETSENCRYPT_ISSUER)?;
         }
     }
     // Check if any rule needs strip-prefix
@@ -230,13 +232,13 @@ fn generate_cluster_issuer(output_dir: &Path, le_spec: &LetsEncryptResolvedSpec)
     writeln!(file, "apiVersion: cert-manager.io/v1")?;
     writeln!(file, "kind: ClusterIssuer")?;
     writeln!(file, "metadata:")?;
-    writeln!(file, "  name: letsencrypt-prod")?;
+    writeln!(file, "  name: {}", LETSENCRYPT_ISSUER)?;
     writeln!(file, "spec:")?;
     writeln!(file, "  acme:")?;
     writeln!(file, "    server: {}", le_spec.server)?;
     writeln!(file, "    email: {}", le_spec.email)?;
     writeln!(file, "    privateKeySecretRef:")?;
-    writeln!(file, "      name: letsencrypt-prod")?;
+    writeln!(file, "      name: {}", LETSENCRYPT_ISSUER)?;
     writeln!(file, "    solvers:")?;
     writeln!(file, "    - http01:")?;
     writeln!(file, "        ingress:")?;

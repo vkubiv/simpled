@@ -6,6 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+const DEFAULT_MEMORY: &str = "128Mi";
+const DEFAULT_CPU: &str = "100m";
+
 pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Result<DeploymentEnvironmentSpec> {
     let ingress_type_str = yaml.ingress.ingress_type.clone();
     let swarm_mode_opt = yaml.swarm_mode;
@@ -195,8 +198,8 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path) -> R
     } else {
         ResourcesSpec {
             replicas: 1,
-            requests: ResourceLimits { memory: "128Mi".into(), cpu: "100m".into() },
-            limits: ResourceLimits { memory: "128Mi".into(), cpu: "100m".into() },
+            requests: ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
+            limits: ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
         }
     };
 
@@ -246,8 +249,8 @@ fn convert_defaults(yaml: &DefaultsSpecYaml) -> Result<ResourcesSpec> {
         )
     } else {
         (
-            ResourceLimits { memory: "128Mi".into(), cpu: "100m".into() },
-            ResourceLimits { memory: "128Mi".into(), cpu: "100m".into() },
+            ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
+            ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
         )
     };
 
@@ -257,11 +260,11 @@ fn convert_defaults(yaml: &DefaultsSpecYaml) -> Result<ResourcesSpec> {
 fn convert_limits(yaml: Option<&ResourceLimitsYaml>) -> ResourceLimits {
     if let Some(l) = yaml {
         ResourceLimits {
-            memory: l.memory.clone().unwrap_or_else(|| "128Mi".into()),
-            cpu: l.cpu.clone().unwrap_or_else(|| "100m".into()),
+            memory: l.memory.clone().unwrap_or_else(|| DEFAULT_MEMORY.into()),
+            cpu: l.cpu.clone().unwrap_or_else(|| DEFAULT_CPU.into()),
         }
     } else {
-        ResourceLimits { memory: "128Mi".into(), cpu: "100m".into() }
+        ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() }
     }
 }
 
