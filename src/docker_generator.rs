@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec};
+use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount};
 use anyhow::{anyhow, Result};
 use std::fs::{self, File};
@@ -302,18 +302,7 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
          }
     }
     
-    let deploy_date = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    writeln!(stack, "    environment:")?;
-    writeln!(stack, "      - DEPLOY_DATE={}", deploy_date)?;
-    writeln!(stack, "    networks:")?;
-    writeln!(stack, "      default:")?;
-    writeln!(stack, "networks:")?;
-    writeln!(stack, "  default:")?;
-    writeln!(stack, "    external: true")?;
-    writeln!(stack, "    name: {}", network_name)?;
+    write_swarm_compose_network(&mut stack, &network_name)?;
 
     Ok(())
 }
@@ -395,34 +384,7 @@ fn generate_traefik_standalone(resolved_spec: &EnvironmentResolvedSpec, output_d
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
-    writeln!(static_conf, "entryPoints:")?;
-    writeln!(static_conf, "  web:")?;
-    writeln!(static_conf, "    address: \":80\"")?;
-    if has_tls {
-        writeln!(static_conf, "    http:")?;
-        writeln!(static_conf, "      redirections:")?;
-        writeln!(static_conf, "        entryPoint:")?;
-        writeln!(static_conf, "          to: websecure")?;
-        writeln!(static_conf, "          scheme: https")?;
-        
-        writeln!(static_conf, "  websecure:")?;
-        writeln!(static_conf, "    address: \":443\"")?;
-    }
-
-    writeln!(static_conf, "providers:")?;
-    writeln!(static_conf, "  file:")?;
-    writeln!(static_conf, "    filename: \"/etc/traefik/dynamic_conf.yml\"")?;
-    writeln!(static_conf, "    watch: true")?;
-
-    if let Some(le) = letsencrypt {
-        writeln!(static_conf, "certificatesResolvers:")?;
-        writeln!(static_conf, "  myresolver:")?;
-        writeln!(static_conf, "    acme:")?;
-        writeln!(static_conf, "      email: \"{}\"", le.email)?;
-        writeln!(static_conf, "      storage: \"/letsencrypt/acme.json\"")?;
-        writeln!(static_conf, "      httpChallenge:")?;
-        writeln!(static_conf, "        entryPoint: web")?;
-    }
+    write_traefik_static_config(&mut static_conf, has_tls, letsencrypt)?;
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
 
@@ -458,37 +420,12 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
     let has_tls = resolved_spec.ingress.tls.is_some();
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
-    let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
-    writeln!(static_conf, "entryPoints:")?;
-    writeln!(static_conf, "  web:")?;
-    writeln!(static_conf, "    address: \":80\"")?;
-    if has_tls {
-        writeln!(static_conf, "    http:")?;
-        writeln!(static_conf, "      redirections:")?;
-        writeln!(static_conf, "        entryPoint:")?;
-        writeln!(static_conf, "          to: websecure")?;
-        writeln!(static_conf, "          scheme: https")?;
-        
-        writeln!(static_conf, "  websecure:")?;
-        writeln!(static_conf, "    address: \":443\"")?;
-    }
-
-    writeln!(static_conf, "providers:")?;
-    writeln!(static_conf, "  file:")?;
-    writeln!(static_conf, "    filename: \"/etc/traefik/dynamic_conf.yml\"")?;
-    writeln!(static_conf, "    watch: true")?;
-
-    if let Some(le) = letsencrypt {
-        writeln!(static_conf, "certificatesResolvers:")?;
-        writeln!(static_conf, "  myresolver:")?;
-        writeln!(static_conf, "    acme:")?;
-        writeln!(static_conf, "      email: \"{}\"", le.email)?;
-        writeln!(static_conf, "      storage: \"/letsencrypt/acme.json\"")?;
-        writeln!(static_conf, "      httpChallenge:")?;
-        writeln!(static_conf, "        entryPoint: web")?;
-    } else {
+    if letsencrypt.is_none() {
         return Err(anyhow!("Currently swarm ingress only supports Let's Encrypt, specify a letsencrypt block in ingress.tls"));
     }
+
+    let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
+    write_traefik_static_config(&mut static_conf, has_tls, letsencrypt)?;
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
 
@@ -513,6 +450,41 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
         fs::create_dir_all(ingress_dir.parent().unwrap().join("letsencrypt"))?;
     }
 
+    write_swarm_compose_network(&mut stack, &network_name)?;
+
+    Ok(())
+}
+
+fn write_traefik_static_config(file: &mut File, has_tls: bool, letsencrypt: Option<&LetsEncryptResolvedSpec>) -> Result<()> {
+    writeln!(file, "entryPoints:")?;
+    writeln!(file, "  web:")?;
+    writeln!(file, "    address: \":80\"")?;
+    if has_tls {
+        writeln!(file, "    http:")?;
+        writeln!(file, "      redirections:")?;
+        writeln!(file, "        entryPoint:")?;
+        writeln!(file, "          to: websecure")?;
+        writeln!(file, "          scheme: https")?;
+        writeln!(file, "  websecure:")?;
+        writeln!(file, "    address: \":443\"")?;
+    }
+    writeln!(file, "providers:")?;
+    writeln!(file, "  file:")?;
+    writeln!(file, "    filename: \"/etc/traefik/dynamic_conf.yml\"")?;
+    writeln!(file, "    watch: true")?;
+    if let Some(le) = letsencrypt {
+        writeln!(file, "certificatesResolvers:")?;
+        writeln!(file, "  myresolver:")?;
+        writeln!(file, "    acme:")?;
+        writeln!(file, "      email: \"{}\"", le.email)?;
+        writeln!(file, "      storage: \"/letsencrypt/acme.json\"")?;
+        writeln!(file, "      httpChallenge:")?;
+        writeln!(file, "        entryPoint: web")?;
+    }
+    Ok(())
+}
+
+fn write_swarm_compose_network(stack: &mut File, network_name: &str) -> Result<()> {
     let deploy_date = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -525,7 +497,6 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
     writeln!(stack, "  default:")?;
     writeln!(stack, "    external: true")?;
     writeln!(stack, "    name: {}", network_name)?;
-    
     Ok(())
 }
 
