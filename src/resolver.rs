@@ -115,10 +115,13 @@ pub fn resolve(
         let is_app_service = app_service.is_app_service;
 
         // Resolve Image
-        let mut raw_image = app_service.image_variants.iter()
-            .find(|v| v.variant_name == variant_name)
-            .map(|v| v.image.clone())
-            .ok_or_else(|| anyhow!("Image variant {} not found for service {}", variant_name, app_service.name))?;
+        let mut raw_image = match &app_service.image {
+            ImageSpec::Exact(img) => img.clone(),
+            ImageSpec::Variants(variants) => variants.iter()
+                .find(|v| v.variant_name == variant_name)
+                .map(|v| v.image.clone())
+                .ok_or_else(|| anyhow!("Image variant '{}' not found for service '{}'", variant_name, app_service.name))?,
+        };
 
         if is_app_service {
              if let DeploymentEnvType::Local = env_spec.env_type {

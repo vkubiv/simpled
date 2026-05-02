@@ -6,6 +6,7 @@ use std::fs::File;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use crate::spec::ImageSpec;
 use crate::spec_loader;
 use crate::bundle_repo;
 
@@ -30,8 +31,11 @@ pub fn create_app_bundle(
     }
 
     for service in app_spec.app_services {
-        for variant in &service.image_variants {
-             let source_image = &variant.image;
+        let images: Vec<String> = match service.image {
+            ImageSpec::Exact(img) => vec![img],
+            ImageSpec::Variants(variants) => variants.into_iter().map(|v| v.image).collect(),
+        };
+        for source_image in &images {
              let (base_name, _) = source_image.split_once(':').unwrap_or((source_image, ""));
              
              let mut target_image = format!("{}:{}", base_name, app_spec.version);

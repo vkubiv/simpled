@@ -83,11 +83,7 @@ pub struct ServiceSpec {
     pub name: String,
     pub service_type: ServiceType,
     pub is_app_service: bool,
-    // TODO: redo this logic to have either image or variants
-    // create enum ImageSpec { Exact(String), Variants(Vec<ImageVariant>) }
-    // change image_variants to image: ImageSpec
-    // and return rest of the logic that uses it
-    pub image_variants: Vec<ImageVariant>,
+    pub image: ImageSpec,
     pub environment: Vec<ServiceEnvOption>,
     pub configs: Vec<ServiceConfigOption>,
     pub secrets: Vec<ServiceSecret>,
@@ -112,6 +108,12 @@ pub struct ServiceConfigOption {
 pub struct ImageVariant {
     pub variant_name: String,
     pub image: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ImageSpec {
+    Exact(String),
+    Variants(Vec<ImageVariant>),
 }
 
 #[derive(Debug, Clone)]
