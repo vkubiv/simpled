@@ -60,15 +60,33 @@ fn load_app_spec_from_tar_gz(path: &Path, env_spec: Option<&spec::DeploymentEnvi
 }
 
 pub fn load_env_spec(root: &Path) -> Result<spec::DeploymentEnvironmentSpec> {
-    let path = root.join(Path::new("envspec.yaml"));
+    let candidates: &[(&str, bool)] = &[
+        ("envspec.yaml", false),
+        ("envspec.yml", false),
+        ("localenv.yaml", true),
+        ("localenv.yml", true),
+    ];
 
-    let file = if path.exists() {
-        File::open(path)?
-    } else {
-        File::open("envspec.yml").context("Could not find envspec.yaml or envspec.yml")?
-    };
+    let (file_name, is_local_env) = candidates
+        .iter()
+        .find(|(name, _)| root.join(name).exists())
+        .ok_or_else(|| anyhow::anyhow!(
+            "Could not find envspec.yaml, envspec.yml, localenv.yaml, or localenv.yml in {:?}", root
+        ))?;
 
-    let yaml: spec_yaml::DeploymentEnvironmentSpecYaml = serde_yaml::from_reader(file).context("Failed to parse envspec.yaml")?;
+    let path = root.join(file_name);
+    let file = File::open(&path).context(format!("Failed to open {:?}", path))?;
+    let mut yaml: spec_yaml::DeploymentEnvironmentSpecYaml = serde_yaml::from_reader(file)
+        .context(format!("Failed to parse {:?}", path))?;
+
+    if yaml.env_type.is_none() {
+        if *is_local_env {
+            yaml.env_type = Some(spec_yaml::DeploymentEnvTypeYaml::Local);
+        } else {
+            anyhow::bail!("'type' field is required in {:?}", path);
+        }
+    }
+
     let env_spec = transform::convert_env_spec(yaml, root).context("Failed to process env spec")?;
     Ok(env_spec)
 }

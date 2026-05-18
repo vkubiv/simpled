@@ -300,7 +300,7 @@ app_services:
 
 ## Defining environments
 
-The Environment is defined in `envspec.yaml`.
+The Environment is defined in `envspec.yaml` (for Kubernetes and Docker environments) or `localenv.yaml` (for local development).
 It consists of three parts: environment type, ingress, and deployments.
 
 ### Environment type
@@ -311,6 +311,18 @@ The top-level `type` field specifies the target platform:
 type: k8s      # Kubernetes (default)
 # type: docker # Docker / Docker Swarm
 # type: local  # Local development
+```
+
+For local development you can use `localenv.yaml` instead of `envspec.yaml`. When using `localenv.yaml` the `type` field defaults to `local` and can be omitted:
+
+```yaml
+# localenv.yaml — type: local is implied
+ingress:
+  name: myapp-ingress
+  hosts:
+    myapp: localhost:8080
+deployments:
+  ...
 ```
 
 When `type` is `docker`, you can enable Swarm mode:
@@ -402,11 +414,12 @@ deployments:
       data: ./data
 
     # defines secrets available for the given application.
+    # inline string value — for local development only
     secrets:
-      redis_password:
-      db_password:
-      admin_password:
-      sendgrid_apikey:
+      redis_password: localpass
+      db_password: localpass
+      admin_password: localadminpass
+      sendgrid_apikey: fake-key
     
     services:
       # each public service should have `host` and `prefix` defined
@@ -472,10 +485,27 @@ Let's deploy a website that contains frontend and headless CMS services.
             strip: false
 ```
 
+#### `secrets_folder` (local only)
+
+Instead of writing each secret value inline, set `secrets_folder` at the top level of `localenv.yaml` and leave the secret values empty (`''`). simpled will read a file named after each secret from that folder:
+
+```yaml
+# localenv.yaml
+secrets_folder: ./secrets
+
+deployments:
+  myapp_local:
+    secrets:
+      db_password:             # loaded from ./secrets/db_password
+      redis_password:          # loaded from ./secrets/redis_password
+      sendgrid_apikey:         # loaded from ./secrets/sendgrid_apikey
+```
+
+Secrets with a non-empty inline value are used as-is; only empty values trigger the folder lookup.
+
 #### `undockerized_environment`
 
 Some local environments run a mix of containerized and non-containerized services. Use `undockerized_environment` to pass variables to services that run outside Docker/Kubernetes:
-This feature is 
 
 ```yaml
   myapp_prod:

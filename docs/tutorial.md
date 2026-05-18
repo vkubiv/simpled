@@ -114,11 +114,10 @@ By default secrets are mounted as files at `/secrets/<name>`. Use `variable:` to
 
 ## Step 4 — Create a local environment
 
-Create a `local/` directory and add `envspec.yaml`:
+Create a `local/` directory and add `localenv.yaml` (the `type: local` default is implied, so the field can be omitted):
 
 ```yaml
-type: local
-
+# local/localenv.yaml
 ingress:
   name: backend-ingress
   hosts:
@@ -134,10 +133,8 @@ deployments:
     environment: backend.env
 
     secrets:
-      db_password:
-        value: localdevpassword
-      redis_password:
-        value: localdevpassword
+      db_password: localdevpassword
+      redis_password: localdevpassword
     
     services:
       web:
@@ -146,6 +143,20 @@ deployments:
       api:
         host: backend
         prefix: /api
+```
+
+If you prefer to keep secret values out of the spec file, use `secrets_folder` and store each secret in a separate file:
+
+```yaml
+# local/localenv.yaml
+secrets_folder: ./secrets
+
+deployments:
+  backend_local:
+    ...
+    secrets:
+      db_password:          # reads local/secrets/db_password
+      redis_password:       # reads local/secrets/redis_password
 ```
 
 Now create `local/backend.env`:
@@ -178,6 +189,8 @@ simpled local run
 ```
 
 This generates `local/local_env/docker-compose.yaml` and starts all services. A reverse proxy listens on `localhost:8080` and routes requests based on your ingress rules.
+
+simpled looks for `localenv.yaml` (or `envspec.yaml`) automatically — no extra flags needed.
 
 - `http://localhost:8080/` → `web` service
 - `http://localhost:8080/api` → `api` service

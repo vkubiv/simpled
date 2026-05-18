@@ -92,11 +92,13 @@ pub enum DeploymentEnvTypeYaml {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentEnvironmentSpecYaml {
     #[serde(alias = "type")]
-    pub env_type: DeploymentEnvTypeYaml,
+    pub env_type: Option<DeploymentEnvTypeYaml>,
     // if env_type is Docker, swarm_mode can be set. In other cases it will cause an error
     pub swarm_mode: Option<bool>,
     pub ingress: IngressSpecYaml,
     pub registry: Option<HashMap<String, String>>,
+    // local-only: folder to load secret values from when a secret value is empty
+    pub secrets_folder: Option<String>,
     pub deployments: HashMap<String, DeploymentSpecYaml>,
 }
 
@@ -152,7 +154,7 @@ pub struct DeploymentSecretSpecYaml {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DeploymentSecretSpecExYaml {
-    Local(String), // for local configurations we can put secrets directly into the deployment spec
+    Local(Option<String>), // for local configurations we can put secrets directly into the deployment spec
     Detailed(DeploymentSecretSpecYaml),
 }
 

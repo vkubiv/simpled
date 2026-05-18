@@ -10,23 +10,30 @@ const DEFAULT_MEMORY: &str = "128Mi";
 const DEFAULT_CPU: &str = "100m";
 
 pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Result<DeploymentEnvironmentSpec> {
+    let env_type_yaml = yaml.env_type
+        .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
     let ingress_type_str = yaml.ingress.ingress_type.clone();
     let swarm_mode_opt = yaml.swarm_mode;
-    let ingress = convert_ingress(yaml.ingress, &yaml.env_type)?;
+    let ingress = convert_ingress(yaml.ingress, &env_type_yaml)?;
     let registry = yaml.registry.unwrap_or_default();
+
+    let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
 
     let mut deployments = Vec::new();
     for (name, dep) in &yaml.deployments {
-        deployments.push(convert_deployment(name.clone(), dep, root)?);
+        deployments.push(convert_deployment(name.clone(), dep, root, secrets_folder.as_deref())?);
     }
 
-    let env_type = match yaml.env_type {
+    let env_type = match env_type_yaml {
         DeploymentEnvTypeYaml::K8S => {
             if swarm_mode_opt.is_some() {
                 return Err(anyhow!("swarm_mode cannot be set for K8S environment"));
             }
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for K8S environment"));
+            }
+            if secrets_folder.is_some() {
+                return Err(anyhow!("secrets_folder cannot be set for K8S environment"));
             }
             DeploymentEnvType::K8S
         },
@@ -37,6 +44,9 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
                 Some("traefik") | None => DockerIngressType::Traefik,
                 Some(other) => return Err(anyhow!("Unknown ingress type: {}", other)),
             };
+            if secrets_folder.is_some() {
+                return Err(anyhow!("secrets_folder cannot be set for Docker environment"));
+            }
             DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode,
                 ingress_type,
@@ -131,7 +141,7 @@ fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>) -> Result<Ve
     }
 }
 
-fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path) -> Result<DeploymentSpec> {
+fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, secrets_folder: Option<&Path>) -> Result<DeploymentSpec> {
     let application = convert_deployment_app(&yaml.application)?;
     let environment = convert_env_variables(&yaml.environment)?;
     let undockerized_environment = convert_env_variables(&yaml.undockerized_environment)?;
@@ -180,10 +190,21 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path) -> R
                         source,
                     });
                 }
-                DeploymentSecretSpecExYaml::Local(value) => {
+                DeploymentSecretSpecExYaml::Local(opt_value) => {
+                    let resolved = match opt_value.as_deref() {
+                        Some(v) if !v.is_empty() => v.to_string(),
+                        _ => {
+                            let folder = secrets_folder.ok_or_else(|| {
+                                anyhow!("Secret '{}' has no value but secrets_folder is not configured", k)
+                            })?;
+                            let secret_path = folder.join(k);
+                            fs::read_to_string(&secret_path)
+                                .context(format!("Failed to read secret '{}' from {:?}", k, secret_path))?
+                        }
+                    };
                     list.push(DeploymentSecretSpec {
                         secret_name: k.clone(),
-                        source: DeploymentSecretSource::Embedded(value.clone()),
+                        source: DeploymentSecretSource::Embedded(resolved),
                     });
                 }
             }
