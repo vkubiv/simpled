@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn default_gateway_name() -> String {
+    "gateway".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppSpecYaml {
     pub name: String,
@@ -111,6 +115,7 @@ pub struct IngressTlsSpecYaml {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IngressSpecYaml {
+    #[serde(default = "default_gateway_name")]
     pub name: String,
     pub hosts: HashMap<String, HostSpecYaml>,
     pub tls: Option<IngressTlsSpecYaml>,
