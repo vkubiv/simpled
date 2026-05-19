@@ -17,6 +17,7 @@ mod spec_loader;
 mod app_bundle;
 mod bundle_repo;
 mod docker_compose;
+mod updater;
 
 #[derive(Parser)]
 #[command(name = "simpled")]
@@ -62,7 +63,14 @@ enum Commands {
     Local {
         #[command(subcommand)]
         command: LocalCommands,
-    }
+    },
+
+    /// Check for a new release and update the binary
+    Update {
+        /// Only check for updates without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +140,9 @@ fn main() -> Result<()> {
         },
         Commands::Local { command } => {
             local(&command)?;
+        }
+        Commands::Update { check } => {
+            updater::check_and_update(*check)?;
         }
     }
     Ok(())

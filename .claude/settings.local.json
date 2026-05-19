@@ -11,7 +11,10 @@
       "Bash(Select-Object FullName, PSIsContainer)",
       "Bash(Format-Table -AutoSize)",
       "Bash(Get-ChildItem *)",
-      "PowerShell(Get-ChildItem -Path \"C:\\\\apps\\\\simpled\\\\example\\\\environments\\\\prod\\\\manifests\" -File | ForEach-Object { $_.FullName })"
+      "PowerShell(Get-ChildItem -Path \"C:\\\\apps\\\\simpled\\\\example\\\\environments\\\\prod\\\\manifests\" -File | ForEach-Object { $_.FullName })",
+      "Bash(.\\\\target\\\\debug\\\\simpled.exe *)",
+      "PowerShell(.\\\\target\\\\debug\\\\simpled.exe --help)",
+      "PowerShell(.\\\\target\\\\debug\\\\simpled.exe update --help)"
     ]
   }
 }
