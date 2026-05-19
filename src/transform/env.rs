@@ -12,16 +12,22 @@ const DEFAULT_CPU: &str = "100m";
 pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Result<DeploymentEnvironmentSpec> {
     let env_type_yaml = yaml.env_type
         .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
-    let ingress_type_str = yaml.ingress.ingress_type.clone();
     let swarm_mode_opt = yaml.swarm_mode;
-    let ingress = convert_ingress(yaml.ingress, &env_type_yaml)?;
+    let gateway_yaml = match (yaml.gateway, yaml.ingress) {
+        (Some(g), _) => g,
+        (None, Some(i)) => {
+            eprintln!("Warning: 'ingress' in env spec is deprecated; rename it to 'gateway'");
+            i
+        }
+        (None, None) => return Err(anyhow!("'gateway' field is required in env spec")),
+    };
+    let ingress_type_str = gateway_yaml.ingress_type.clone();
+    let ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
     let registry = yaml.registry.unwrap_or_default();
-
-    let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
 
     let mut deployments = Vec::new();
     for (name, dep) in &yaml.deployments {
-        deployments.push(convert_deployment(name.clone(), dep, root, secrets_folder.as_deref())?);
+        deployments.push(convert_deployment(name.clone(), dep, root)?);
     }
 
     let env_type = match env_type_yaml {
@@ -32,7 +38,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for K8S environment"));
             }
-            if secrets_folder.is_some() {
+            if yaml.deployments.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for K8S environment"));
             }
             DeploymentEnvType::K8S
@@ -44,7 +50,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
                 Some("traefik") | None => DockerIngressType::Traefik,
                 Some(other) => return Err(anyhow!("Unknown ingress type: {}", other)),
             };
-            if secrets_folder.is_some() {
+            if yaml.deployments.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for Docker environment"));
             }
             DeploymentEnvType::Docker(DockerSpecificSpec {
@@ -107,6 +113,7 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         (None, DeploymentEnvTypeYaml::Local) => None,
         (None, _) => return Err(anyhow!("Ingress TLS configuration is required for non-local environments. If you want to disable TLS explicitly set 'disable: true' in tls section")),
         (Some(t), _) => {
+            // TODO: if this local env and tls is enabled rise error.
             if t.disable == Some(true) {
                 None
             } else {
@@ -141,7 +148,8 @@ fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>) -> Result<Ve
     }
 }
 
-fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, secrets_folder: Option<&Path>) -> Result<DeploymentSpec> {
+fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path) -> Result<DeploymentSpec> {
+    let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
     let application = convert_deployment_app(&yaml.application)?;
     let environment = convert_env_variables(&yaml.environment)?;
     let undockerized_environment = convert_env_variables(&yaml.undockerized_environment)?;
@@ -194,7 +202,7 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, secr
                     let resolved = match opt_value.as_deref() {
                         Some(v) if !v.is_empty() => v.to_string(),
                         _ => {
-                            let folder = secrets_folder.ok_or_else(|| {
+                            let folder = secrets_folder.as_ref().ok_or_else(|| {
                                 anyhow!("Secret '{}' has no value but secrets_folder is not configured", k)
                             })?;
                             let secret_path = folder.join(k);
