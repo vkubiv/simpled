@@ -27,10 +27,8 @@ app_services:
       - UPLOAD_TEST_MAX_SIZE_BYTES
 ```
 
-**`envspec.yaml`**
+**`localenv.yaml`**
 ```yaml
-type: local
-
 ingress:
   name: backend-ingress
   hosts:
@@ -127,11 +125,9 @@ app_services:
         path: /secrets/firebase/admin.json
 ```
 
-**Local `envspec.yaml`** with infrastructure services:
+**`localenv.yaml`** with infrastructure services:
 
 ```yaml
-type: local
-
 ingress:
   name: backend-ingress
   hosts:
@@ -147,14 +143,10 @@ deployments:
     environment: backend.env
 
     secrets:
-      db_password:
-        value: localpass
-      redis_password:
-        value: localpass
-      admin_password:
-        value: localadminpass
-      sendgrid_apikey:
-        value: fake-key
+      db_password: localpass
+      redis_password: localpass
+      admin_password: localadminpass
+      sendgrid_apikey: fake-key
       firebase_admin_json:
         file: ./firebase_admin.json
 
@@ -165,6 +157,24 @@ deployments:
       customer-svc:
         host: backend
         prefix: /api
+```
+
+Alternatively, use `secrets_folder` to keep all values out of the spec file. Create a `secrets/` directory (git-ignored), put one file per secret inside it, and leave the secret values empty:
+
+```yaml
+# localenv.yaml
+secrets_folder: ./secrets
+
+deployments:
+  local:
+    ...
+    secrets:
+      db_password:            # reads ./secrets/db_password
+      redis_password:         # reads ./secrets/redis_password
+      admin_password:         # reads ./secrets/admin_password
+      sendgrid_apikey:        # reads ./secrets/sendgrid_apikey
+      firebase_admin_json:
+        file: ./firebase_admin.json   # file source still works alongside secrets_folder
 ```
 
 **`infra-services.yaml`** — extra services (database, cache, mail) for local development:

@@ -182,17 +182,22 @@ Host paths (`./relative` or `/absolute`) do not need to be declared.
 
 ---
 
-## envspec.yaml
+## envspec.yaml / localenv.yaml
 
 Describes an environment — where and how to deploy applications. Lives in your deployment repository or environment-specific directory.
+
+`simpled` looks for the env spec file in this order: `envspec.yaml`, `envspec.yml`, `localenv.yaml`, `localenv.yml`. The first file found is used.
+
+Use `envspec.yaml` for Kubernetes and Docker environments. Use `localenv.yaml` for local development — in that file the `type` field defaults to `local` and can be omitted.
 
 ### Top-level fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | no | `k8s` (default), `docker`, or `local`. |
+| `type` | string | no | `k8s`, `docker`, or `local`. Required in `envspec.yaml`; defaults to `local` in `localenv.yaml`. |
 | `swarm_mode` | bool | no | Enable Docker Swarm mode. Only valid when `type: docker`. |
-| `registry` | map | no | Image registry prefix mappings. |
+| `registry` | map | no | Image registry prefix mappings. Not valid for `local`. |
+| `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
 | `ingress` | object | yes | Ingress (load balancer) configuration. |
 | `deployments` | map | yes | Named deployment configurations. |
 
@@ -204,6 +209,18 @@ Describes an environment — where and how to deploy applications. Lives in your
 type: k8s      # Kubernetes — generates manifests/ directory
 type: docker   # Docker standalone or Swarm — generates docker-deploy/ directory
 type: local    # Local development — generates local_env/docker-compose.yaml
+```
+
+When using `localenv.yaml`, `type` can be omitted:
+
+```yaml
+# localenv.yaml — type: local is the default
+ingress:
+  name: myapp-ingress
+  hosts:
+    myapp: localhost:8080
+deployments:
+  ...
 ```
 
 ---
@@ -219,6 +236,28 @@ registry:
 ```
 
 An image `mycompany/api` becomes `registry.mycompany.com/mycompany/api` at deploy time.
+
+---
+
+### secrets_folder
+
+Local-only. Path to a directory (relative to the env spec file) that contains one file per secret. When a secret value is set to an empty string (`''`), simpled reads the file named after that secret from this folder.
+
+```yaml
+# localenv.yaml
+secrets_folder: ./secrets
+
+deployments:
+  myapp_local:
+    secrets:
+      db_password:           # reads ./secrets/db_password
+      redis_password:        # reads ./secrets/redis_password
+      api_key: real-key      # used as-is, folder not consulted
+```
+
+This keeps sensitive values out of the spec file while still having a simple, declarative local config. The `secrets/` directory can be git-ignored.
+
+`secrets_folder` is not valid for `k8s` or `docker` environments.
 
 ---
 
@@ -328,11 +367,22 @@ deployments:
 
 Each secret must match a name declared in `appspec.yaml`. Exactly one source must be provided:
 
-| Source | Description |
-|--------|-------------|
-| `value: literal` | Inline value. Use only for local development. |
-| `env: VAR_NAME` | Read from the named shell environment variable at deploy time. |
-| `file: ./path` | Read from a file at deploy time. |
+| Form | Description |
+|------|-------------|
+| `secret_name: "literal"` | Inline string value. Local development only. |
+| `secret_name:` or `secret_name: ''` | No value — load from `secrets_folder` file. Requires `secrets_folder` to be set. |
+| `secret_name:` + `env: VAR_NAME` | Read from the named shell environment variable at deploy time. |
+| `secret_name:` + `file: ./path` | Read from a file at deploy time. |
+
+```yaml
+secrets:
+  db_password: localpass         # inline value (local only)
+  api_key:                       # load from secrets_folder/api_key
+  redis_password:
+    env: REDIS_PASSWORD          # read from env var
+  admin_cert:
+    file: ./secrets/admin.pem    # read from file
+```
 
 #### service overrides
 
