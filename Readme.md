@@ -301,7 +301,7 @@ app_services:
 ## Defining environments
 
 The Environment is defined in `envspec.yaml` (for Kubernetes and Docker environments) or `localenv.yaml` (for local development).
-It consists of three parts: environment type, ingress, and deployments.
+It consists of three parts: environment type, gateway, and deployments.
 
 ### Environment type
 
@@ -317,8 +317,7 @@ For local development you can use `localenv.yaml` instead of `envspec.yaml`. Whe
 
 ```yaml
 # localenv.yaml — type: local is implied
-ingress:
-  name: myapp-ingress
+gateway:
   hosts:
     myapp: localhost:8080
 deployments:
@@ -341,13 +340,12 @@ registry:
   mycompany: my-docker-registry.com
 ```
 
-### Ingress
+### Gateway
 
-Ingress defines host domain names.
+Gateway defines host domain names.
 
 ```yaml
-ingress:
-  name: myapp-ingress
+gateway:
   hosts:    
     myapp: app.myapp.com
     myapp-sales: sales.myapp.com
@@ -358,11 +356,12 @@ ingress:
     secret: myapp-tls
 ```
 
+The `name` field is optional and defaults to `"gateway"`.
+
 #### TLS options
 
 ```yaml
-ingress:
-  name: myapp-ingress
+gateway:
   hosts:
     myapp: app.myapp.com
   tls:
@@ -381,8 +380,7 @@ ingress:
 When `type` is `docker`, you can also select the ingress controller:
 
 ```yaml
-ingress:
-  name: myapp-ingress
+gateway:
   type: nginx   # nginx or traefik (default)
   hosts:
     myapp: app.myapp.com
@@ -487,14 +485,13 @@ Let's deploy a website that contains frontend and headless CMS services.
 
 #### `secrets_folder` (local only)
 
-Instead of writing each secret value inline, set `secrets_folder` at the top level of `localenv.yaml` and leave the secret values empty (`''`). simpled will read a file named after each secret from that folder:
+Instead of writing each secret value inline, set `secrets_folder` on a deployment and leave the secret values empty (`''`). simpled will read a file named after each secret from that folder:
 
 ```yaml
 # localenv.yaml
-secrets_folder: ./secrets
-
 deployments:
   myapp_local:
+    secrets_folder: ./secrets
     secrets:
       db_password:             # loaded from ./secrets/db_password
       redis_password:          # loaded from ./secrets/redis_password

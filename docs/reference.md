@@ -197,8 +197,7 @@ Use `envspec.yaml` for Kubernetes and Docker environments. Use `localenv.yaml` f
 | `type` | string | no | `k8s`, `docker`, or `local`. Required in `envspec.yaml`; defaults to `local` in `localenv.yaml`. |
 | `swarm_mode` | bool | no | Enable Docker Swarm mode. Only valid when `type: docker`. |
 | `registry` | map | no | Image registry prefix mappings. Not valid for `local`. |
-| `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
-| `ingress` | object | yes | Ingress (load balancer) configuration. |
+| `gateway` | object | yes | Gateway (load balancer) configuration. The deprecated alias `ingress` is still accepted with a warning. |
 | `deployments` | map | yes | Named deployment configurations. |
 
 ---
@@ -215,8 +214,7 @@ When using `localenv.yaml`, `type` can be omitted:
 
 ```yaml
 # localenv.yaml — type: local is the default
-ingress:
-  name: myapp-ingress
+gateway:
   hosts:
     myapp: localhost:8080
 deployments:
@@ -241,14 +239,13 @@ An image `mycompany/api` becomes `registry.mycompany.com/mycompany/api` at deplo
 
 ### secrets_folder
 
-Local-only. Path to a directory (relative to the env spec file) that contains one file per secret. When a secret value is set to an empty string (`''`), simpled reads the file named after that secret from this folder.
+Local-only. Set `secrets_folder` on a deployment and simpled will load each empty secret value from a file in that folder named after the secret.
 
 ```yaml
 # localenv.yaml
-secrets_folder: ./secrets
-
 deployments:
   myapp_local:
+    secrets_folder: ./secrets
     secrets:
       db_password:           # reads ./secrets/db_password
       redis_password:        # reads ./secrets/redis_password
@@ -261,23 +258,23 @@ This keeps sensitive values out of the spec file while still having a simple, de
 
 ---
 
-### ingress
+### gateway
 
 ```yaml
-ingress:
-  name: my-ingress
-  type: nginx | traefik    # docker only; defaults to traefik
+gateway:
+  name: my-gateway          # optional; defaults to "gateway"
+  type: nginx | traefik     # docker only; defaults to traefik
   hosts:
     hostname-alias: domain.com
     multi-domain-alias:
       - www.domain.com
       - domain.com
   tls:
-    disable: true          # no TLS
-    secret: tls-secret     # existing TLS secret (k8s)
+    disable: true           # no TLS
+    secret: tls-secret      # existing TLS secret (k8s)
     letsencrypt:
       email: ops@co.com
-      server: https://...  # optional; defaults to Let's Encrypt production
+      server: https://...   # optional; defaults to Let's Encrypt production
 ```
 
 `hosts` maps abstract names (used in `services[].host`) to real domain names. For local environments, use `localhost:port`.
@@ -309,6 +306,7 @@ deployments:
     undockerized_environment: path/to/native.env
     configs:
       config-name: ./path/to/files
+    secrets_folder: ./secrets   # local only; omit on k8s/docker
     secrets:
       secret_name:
         value: literal        # local dev only
@@ -346,12 +344,13 @@ deployments:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `primary_host` | string | yes | Ingress host alias used as the base URL for `relative` environment variables. |
+| `primary_host` | string | yes | Gateway host alias used as the base URL for `relative` environment variables. |
 | `application` | object | yes | App name, version constraint, and optional extra service files. |
 | `environment` | string | no | Path to a `.env` file with variable values. |
 | `undockerized_environment` | string | no | Path to a `.env` file for services running outside Docker. |
 | `configs` | map | no | Maps config names to directories containing the config files. |
 | `secrets` | map | no | Provides values for the secrets declared in `appspec.yaml`. |
+| `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
 | `defaults` | object | no | Default replica count and resource limits applied to all services. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
 

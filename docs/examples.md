@@ -29,8 +29,7 @@ app_services:
 
 **`localenv.yaml`**
 ```yaml
-ingress:
-  name: backend-ingress
+gateway:
   hosts:
     backend: localhost:9080
 
@@ -128,8 +127,7 @@ app_services:
 **`localenv.yaml`** with infrastructure services:
 
 ```yaml
-ingress:
-  name: backend-ingress
+gateway:
   hosts:
     backend: localhost:9080
 
@@ -163,10 +161,9 @@ Alternatively, use `secrets_folder` to keep all values out of the spec file. Cre
 
 ```yaml
 # localenv.yaml
-secrets_folder: ./secrets
-
 deployments:
   local:
+    secrets_folder: ./secrets
     ...
     secrets:
       db_password:            # reads ./secrets/db_password
@@ -255,8 +252,7 @@ swarm_mode: true
 registry:
   allimb: allimbacr.azurecr.io
 
-ingress:
-  name: allimb-ingress
+gateway:
   hosts:
     clinic: clinic.mycompany.com
     scrg: compliance.mycompany.com

@@ -118,8 +118,7 @@ Create a `local/` directory and add `localenv.yaml` (the `type: local` default i
 
 ```yaml
 # local/localenv.yaml
-ingress:
-  name: backend-ingress
+gateway:
   hosts:
     backend: localhost:8080
 
@@ -149,10 +148,9 @@ If you prefer to keep secret values out of the spec file, use `secrets_folder` a
 
 ```yaml
 # local/localenv.yaml
-secrets_folder: ./secrets
-
 deployments:
   backend_local:
+    secrets_folder: ./secrets
     ...
     secrets:
       db_password:          # reads local/secrets/db_password
