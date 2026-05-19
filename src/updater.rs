@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
+use flate2::read::GzDecoder;
 use semver::Version;
 use serde::Deserialize;
 use std::env;
 use std::io::Write;
+use tar::Archive;
 
 const GITHUB_REPO: &str = "vkubiv/simpled";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,13 +38,7 @@ fn platform_asset_name() -> Result<String> {
         other => bail!("Unsupported architecture: {}", other),
     };
 
-    let name = if os == "windows" {
-        format!("simpled-{}-{}.exe", os_str, arch_str)
-    } else {
-        format!("simpled-{}-{}", os_str, arch_str)
-    };
-
-    Ok(name)
+    Ok(format!("simpled_{}_{}.tar.gz", os_str, arch_str))
 }
 
 fn parse_version(tag: &str) -> Result<Version> {
@@ -120,7 +116,7 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
         builder = builder.header("Authorization", format!("Bearer {}", token));
     }
 
-    let mut response = builder.send().context("Failed to download update")?;
+    let response = builder.send().context("Failed to download update")?;
 
     if !response.status().is_success() {
         bail!("Download failed with status {}", response.status());
@@ -128,24 +124,39 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
 
     let current_exe = env::current_exe().context("Failed to determine current executable path")?;
 
-    // Write to a temp file next to the current exe
     let tmp_path = current_exe.with_extension("update_tmp");
-    {
-        let mut tmp_file =
-            std::fs::File::create(&tmp_path).context("Failed to create temp file for update")?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tmp_file
-                .set_permissions(std::fs::Permissions::from_mode(0o755))
-                .context("Failed to set permissions on temp file")?;
+    let gz = GzDecoder::new(response);
+    let mut archive = Archive::new(gz);
+
+    let binary_name = if cfg!(windows) { "simpled.exe" } else { "simpled" };
+    let mut found = false;
+    for entry in archive.entries().context("Failed to read archive entries")? {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to read entry path")?;
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name == binary_name {
+            let mut tmp_file = std::fs::File::create(&tmp_path)
+                .context("Failed to create temp file for update")?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tmp_file
+                    .set_permissions(std::fs::Permissions::from_mode(0o755))
+                    .context("Failed to set permissions on temp file")?;
+            }
+
+            std::io::copy(&mut entry, &mut tmp_file)
+                .context("Failed to extract binary from archive")?;
+            tmp_file.flush().context("Failed to flush update file")?;
+            found = true;
+            break;
         }
+    }
 
-        response
-            .copy_to(&mut tmp_file)
-            .context("Failed to write update to disk")?;
-        tmp_file.flush().context("Failed to flush update file")?;
+    if !found {
+        bail!("Binary '{}' not found inside archive", binary_name);
     }
 
     replace_exe(&current_exe, &tmp_path)?;
