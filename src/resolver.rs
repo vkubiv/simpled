@@ -153,7 +153,8 @@ pub fn resolve(
         }
 
         // Resolve Environment Variables
-        let environment_variables = resolve_app_env_vars(app_spec, &deployment.environment, Some(host_domain_name))?;
+        let use_tls = env_spec.ingress.tls.is_some();
+        let environment_variables = resolve_app_env_vars(app_spec, &deployment.environment, Some(host_domain_name), use_tls)?;
         let final_service_env_vars = filter_service_env_vars(app_service, &environment_variables)?;
 
         // Resolve Undockerized Environment Variables
@@ -161,7 +162,7 @@ pub fn resolve(
         for override_var in &deployment.undockerized_environment {
             add_unique_var(&mut undockerized_values, override_var.clone());
         }
-        let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name))?;
+        let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
         let final_undockerized_service_env_vars = filter_service_env_vars(app_service, &undockerized_variables)?;
 
         // Resolve Configs
@@ -366,7 +367,8 @@ pub fn resolve_variable_in_string(input: &String, vars: &[EnvVariable]) -> Resul
 fn resolve_app_env_vars(
     app_spec: &AppSpec,
     deployment_values: &[EnvVariable],
-    host_domain_name: Option<&String>
+    host_domain_name: Option<&String>,
+    use_tls: bool,
 ) -> Result<Vec<EnvVariable>> {
     let mut environment_variables = Vec::new();
 
@@ -398,7 +400,8 @@ fn resolve_app_env_vars(
     // Relative
     for relative in &app_spec.environment.relative {
          if let Some(h) = host_domain_name {
-              let url = format!("https://{}{}", h, relative.relative_value);
+              let scheme = if use_tls { "https" } else { "http" };
+              let url = format!("{}://{}{}", scheme, h, relative.relative_value);
               let value = resolve_variable_in_string(&url, &environment_variables)
                   .context(format!("Failed to resolve relative env variable {}", relative.name))?;
               add_unique_var(&mut environment_variables, EnvVariable{
