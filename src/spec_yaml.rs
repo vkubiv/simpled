@@ -95,10 +95,10 @@ pub struct DeploymentEnvironmentSpecYaml {
     pub env_type: Option<DeploymentEnvTypeYaml>,
     // if env_type is Docker, swarm_mode can be set. In other cases it will cause an error
     pub swarm_mode: Option<bool>,
-    pub ingress: IngressSpecYaml,
+    pub gateway: Option<IngressSpecYaml>,
+    // deprecated: use gateway instead
+    pub ingress: Option<IngressSpecYaml>,
     pub registry: Option<HashMap<String, String>>,
-    // local-only: folder to load secret values from when a secret value is empty
-    pub secrets_folder: Option<String>,
     pub deployments: HashMap<String, DeploymentSpecYaml>,
 }
 
@@ -143,6 +143,8 @@ pub struct DeploymentSpecYaml {
     pub secrets: Option<HashMap<String, DeploymentSecretSpecExYaml>>,
     pub defaults: Option<DefaultsSpecYaml>,
     pub services: Option<HashMap<String, DeploymentServiceSpecYaml>>,
+    // local-only: folder to load secret values from when a secret value is empty
+    pub secrets_folder: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
