@@ -58,7 +58,7 @@ pub fn run(spec: IngressResolvedSpec) -> Result<()> {
                 }
 
                 if rules_found {
-                    let bind_addr = format!("127.0.0.1:{}", port);
+                    let bind_addr = format!("0.0.0.0:{}", port);
                     match tokio::net::TcpListener::bind(&bind_addr).await {
                         Ok(listener) => {
                             println!("Local ingress listening on {}", bind_addr);
