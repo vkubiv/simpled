@@ -17,6 +17,8 @@ These stages often live in separate repositories: one for the application source
 
 ## Build pipeline
 
+> **Pin the simpled version.** Use `jaxxstorm/action-install-gh-release` with an explicit `tag` set to `v<major>.<minor>` (e.g. `v1.2`). Pinning to a major.minor lets you receive patch fixes automatically while protecting against breaking changes in a future minor release. Avoid `latest` in production pipelines — a surprise upgrade can break a deployment at the worst possible time.
+
 ### Build images and create an app bundle
 
 ```yaml
@@ -61,10 +63,10 @@ jobs:
             ./web
 
       - name: Install simpled
-        run: |
-          curl -sSL https://github.com/yourorg/simpled/releases/latest/download/simpled-linux-amd64 \
-            -o /usr/local/bin/simpled
-          chmod +x /usr/local/bin/simpled
+        uses: jaxxstorm/action-install-gh-release@v1.10.0
+        with:
+          repo: vkubiv/simpled
+          tag: "v1.2"   # pin to major.minor — bump when you need new features
 
       - name: Create and upload app bundle
         env:
@@ -139,10 +141,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install simpled
-        run: |
-          curl -sSL https://github.com/yourorg/simpled/releases/latest/download/simpled-linux-amd64 \
-            -o /usr/local/bin/simpled
-          chmod +x /usr/local/bin/simpled
+        uses: jaxxstorm/action-install-gh-release@v1.10.0
+        with:
+          repo: vkubiv/simpled
+          tag: "v1.2"   # pin to major.minor — bump when you need new features
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
@@ -203,9 +205,7 @@ jobs:
           username: deploy
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            docker stack deploy \
-              -c /opt/deployments/docker-deploy/myapp_prod/docker-compose.yaml \
-              myapp
+            cd /opt/deployments/docker-deploy && sudo ./deploy.sh
 ```
 
 ---
@@ -332,6 +332,12 @@ jobs:
           registry: allimbacr.azurecr.io
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Install simpled
+        uses: jaxxstorm/action-install-gh-release@v1.10.0
+        with:
+          repo: vkubiv/simpled
+          tag: "v1.2"   # pin to major.minor — bump when you need new features
 
       - name: Build images
         working-directory: clinic
