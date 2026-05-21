@@ -461,6 +461,28 @@ Options:
   --path <PATH>        Path to the project directory (default: current dir)
 ```
 
+### `simpled local only-extra`
+
+Runs the gateway and only extra services, skipping all app services. Useful when you want to run app services outside Docker (e.g. for debugging) while still having the gateway and supporting infrastructure available.
+
+```
+simpled local only-extra [OPTIONS]
+
+Options:
+  --path <PATH>  Path to the project directory (default: current dir)
+```
+
+### `simpled local generate-config`
+
+Writes `local_env/docker-compose.yaml` and per-service `.env` files without starting the gateway or running Docker Compose.
+
+```
+simpled local generate-config [OPTIONS]
+
+Options:
+  --path <PATH>  Path to the project directory (default: current dir)
+```
+
 ### `simpled secrets set`
 
 Manages secrets for a named environment.

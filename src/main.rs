@@ -81,7 +81,17 @@ enum LocalCommands {
 
         #[arg(long)]
         path: Option<String>,
-    }
+    },
+    /// Run the gateway and only extra services (no app services)
+    OnlyExtra {
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Regenerate local_env configuration without running the gateway or docker compose
+    GenerateConfig {
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,9 +236,11 @@ fn prepare_deployment_command(
     Ok(())
 }
 
-fn local( command: &LocalCommands) -> Result<()> {
+fn local(command: &LocalCommands) -> Result<()> {
     let root = match command {
-        LocalCommands::Run { path, .. } => path.as_ref()
+        LocalCommands::Run { path, .. }
+        | LocalCommands::OnlyExtra { path }
+        | LocalCommands::GenerateConfig { path } => path.as_ref()
             .map(|p| Path::new(p))
             .unwrap_or(Path::new(".")),
     };
@@ -254,9 +266,26 @@ fn local( command: &LocalCommands) -> Result<()> {
             return Err(anyhow!("Environment type should be local"))
         },
         spec::DeploymentEnvType::Local => {
-            println!("Running local deployment");
-            local_ingress::run(resolved_spec.ingress.clone())?;            
-            run_local::run(&resolved_spec)?;
+            match command {
+                LocalCommands::GenerateConfig { .. } => {
+                    println!("Regenerating local configuration");
+                    run_local::generate_config(&resolved_spec)?;
+                },
+                _ => {
+                    local_ingress::run(resolved_spec.ingress.clone())?;
+                    match command {
+                        LocalCommands::Run { .. } => {
+                            println!("Running local deployment");
+                            run_local::run(&resolved_spec)?;
+                        },
+                        LocalCommands::OnlyExtra { .. } => {
+                            println!("Running gateway and extra services only");
+                            run_local::run_only_extra(&resolved_spec)?;
+                        },
+                        LocalCommands::GenerateConfig { .. } => unreachable!(),
+                    }
+                },
+            }
         },
     }
 

@@ -45,6 +45,7 @@ pub struct IngressToServiceRule {
 #[derive(Debug)]
 pub struct ServiceResolvedSpec {
     pub service_type: ServiceType,
+    pub is_app_service: bool,
 
     // name consists of service name
     pub full_name: String,

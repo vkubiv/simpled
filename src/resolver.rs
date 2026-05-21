@@ -194,6 +194,7 @@ pub fn resolve(
         resolved_services.push(ServiceResolvedSpec {
             full_name: format!("{}", app_service.name),
             service_type: app_service.service_type.clone(),
+            is_app_service,
             image,
             service_host: host_domain_name.clone(),
             environment_variables: final_service_env_vars,

@@ -199,6 +199,18 @@ To exclude a service (e.g. run the API outside Docker for debugging):
 simpled local run --exclude api
 ```
 
+To run only the gateway and extra services (e.g. databases, caches) while running all app services outside Docker:
+
+```bash
+simpled local only-extra
+```
+
+To regenerate the `local_env/` configuration files without starting anything:
+
+```bash
+simpled local generate-config
+```
+
 Check `local/local_env/backend-api/.env` for the environment variables simpled calculated for that service — you can source them before starting your process directly.
 
 ---
