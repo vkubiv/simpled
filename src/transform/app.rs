@@ -10,7 +10,7 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
     let version = semver::Version::parse(&yaml.version)
         .context("Failed to parse app version")?;
 
-    let environment = if let Some(env) = yaml.environment {
+    let mut environment = if let Some(env) = yaml.environment {
         convert_environment(env)?
     } else {
         AppEnvironment {
@@ -21,13 +21,13 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
         }
     };
 
-    let secrets = if let Some(sec) = yaml.secrets {
+    let mut secrets = if let Some(sec) = yaml.secrets {
         convert_secrets(sec)?
     } else {
         vec![]
     };
 
-    let configs = if let Some(conf) = yaml.configs {
+    let mut configs: Vec<ConfigSpec> = if let Some(conf) = yaml.configs {
         conf.into_iter().map(|(k, v)| ConfigSpec {
             name: k,
             files: v,
@@ -43,6 +43,7 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
     };
 
     let mut combined_extra_services = HashMap::new();
+    let mut volumes: Vec<String> = yaml.volumes.unwrap_or_default();
 
     if let Some(env) = env_spec {
         if let Some(deployment) = env.deployments.iter().find(|d| d.application.name == yaml.name) {
@@ -55,6 +56,22 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
                 if let Some(services) = extra_yaml.extra_services {
                     combined_extra_services.extend(services);
                 }
+                if let Some(extra_env) = extra_yaml.environment {
+                    let converted = convert_environment(extra_env)?;
+                    environment.external.extend(converted.external);
+                    environment.optional.extend(converted.optional);
+                    environment.relative.extend(converted.relative);
+                    environment.internal.extend(converted.internal);
+                }
+                if let Some(extra_configs) = extra_yaml.configs {
+                    configs.extend(extra_configs.into_iter().map(|(k, v)| ConfigSpec { name: k, files: v }));
+                }
+                if let Some(extra_secrets) = extra_yaml.secrets {
+                    secrets.extend(convert_secrets(extra_secrets)?);
+                }
+                if let Some(extra_volumes) = extra_yaml.volumes {
+                    volumes.extend(extra_volumes);
+                }
             }
         }
     }
@@ -64,8 +81,6 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
     }
 
     let extra_services = convert_services(combined_extra_services, false)?;
-
-    let volumes: Vec<String> = yaml.volumes.unwrap_or_default();
 
     for svc in app_services.iter().chain(extra_services.iter()) {
         for vol in &svc.volumes {

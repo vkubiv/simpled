@@ -135,7 +135,7 @@ pub fn resolve(
             return Err(anyhow!("Registry mapping is required for non-local deployments"));
         }
 
-        let image = if (is_app_service) {
+        let image = if is_app_service {
             resolve_app_service_image(env_spec, raw_image)?
         } else {
             raw_image

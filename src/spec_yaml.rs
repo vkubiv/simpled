@@ -20,8 +20,6 @@ pub struct AppSpecYaml {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExtraAppSpecYaml {
     pub extra_services: Option<HashMap<String, ServiceSpecYaml>>,
-    
-    // TODO: this fields below shuuld be merged into AppSpecYaml the same way as  extra_services is merged 
     pub environment: Option<AppEnvironmentYaml>,
     pub configs: Option<HashMap<String, Vec<String>>>,
     pub secrets: Option<AppSecretsYaml>,
