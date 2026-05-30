@@ -60,6 +60,64 @@ jobs:
       - name: Build binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          # Decode the base64-encoded Developer ID Application cert.
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+
+          # Create a temporary keychain and import the cert into it.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      - name: Notarize binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          ZIP_PATH="$RUNNER_TEMP/notarize.zip"
+
+          # Decode the App Store Connect API key (.p8).
+          echo -n "$APPLE_API_KEY" | base64 --decode -o "$KEY_PATH"
+
+          # notarytool only accepts zip/pkg/dmg, so wrap the binary in a zip.
+          ditto -c -k --keepParent "$BIN" "$ZIP_PATH"
+
+          # Submit and block until Apple finishes. Fails the job if not "Accepted".
+          xcrun notarytool submit "$ZIP_PATH" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+
+          # A bare CLI binary cannot be stapled (stapling needs a bundle/pkg/dmg),
+          # so Gatekeeper verifies the notarization online on first run.
+
       - name: Prepare binary for release
         shell: bash
         run: |
