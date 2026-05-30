@@ -60,24 +60,31 @@ jobs:
       - name: Build binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Import signing certificate (macOS)
+      - name: Import signing certificates (macOS)
         if: runner.os == 'macOS'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_INSTALLER_CERTIFICATE }}
+          MACOS_INSTALLER_CERTIFICATE_PWD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PWD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          APP_CERT_PATH="$RUNNER_TEMP/app_certificate.p12"
+          INSTALLER_CERT_PATH="$RUNNER_TEMP/installer_certificate.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
 
-          # Decode the base64-encoded Developer ID Application cert.
-          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+          # Decode the base64-encoded certs:
+          #   - Developer ID Application -> signs the binary
+          #   - Developer ID Installer   -> signs the .pkg
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$APP_CERT_PATH"
+          echo -n "$MACOS_INSTALLER_CERTIFICATE" | base64 --decode -o "$INSTALLER_CERT_PATH"
 
-          # Create a temporary keychain and import the cert into it.
+          # Create a temporary keychain and import both certs into it.
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security import "$APP_CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security import "$INSTALLER_CERT_PATH" -P "$MACOS_INSTALLER_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
@@ -91,40 +98,71 @@ jobs:
             --sign "$MACOS_SIGNING_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
 
-      - name: Notarize binary (macOS)
+      - name: Package, notarize, and staple (macOS)
         if: runner.os == 'macOS'
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          MACOS_INSTALLER_SIGNING_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
+          VERSION: ${{ needs.get-version.outputs.version }}
         run: |
           BIN="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
           KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
-          ZIP_PATH="$RUNNER_TEMP/notarize.zip"
+          STAGING="$RUNNER_TEMP/pkgroot"
+          PKG_PATH="$RUNNER_TEMP/${{ matrix.asset_name }}.pkg"
 
           # Decode the App Store Connect API key (.p8).
           echo -n "$APPLE_API_KEY" | base64 --decode -o "$KEY_PATH"
 
-          # notarytool only accepts zip/pkg/dmg, so wrap the binary in a zip.
-          ditto -c -k --keepParent "$BIN" "$ZIP_PATH"
+          # Stage the already-signed binary at its install location.
+          mkdir -p "$STAGING"
+          cp "$BIN" "$STAGING/${{ matrix.binary_name }}"
+          chmod +x "$STAGING/${{ matrix.binary_name }}"
 
-          # Submit and block until Apple finishes. Fails the job if not "Accepted".
-          xcrun notarytool submit "$ZIP_PATH" \
+          # Build a signed installer package that drops the binary in /usr/local/bin.
+          # pkgbuild --version dislikes the leading "v", so strip it.
+          PKG_VERSION="${VERSION#v}"
+          pkgbuild \
+            --root "$STAGING" \
+            --identifier com.simpled.cli \
+            --version "$PKG_VERSION" \
+            --install-location /usr/local/bin \
+            --sign "$MACOS_INSTALLER_SIGNING_IDENTITY" \
+            "$PKG_PATH"
+
+          # Notarize the signed package and block until Apple finishes.
+          # Fails the job if the result is not "Accepted".
+          xcrun notarytool submit "$PKG_PATH" \
             --key "$KEY_PATH" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
             --wait
 
-          # A bare CLI binary cannot be stapled (stapling needs a bundle/pkg/dmg),
-          # so Gatekeeper verifies the notarization online on first run.
+          # A .pkg can be stapled, so Gatekeeper verifies the notarization
+          # offline — no "could not verify ... free of malware" dialog.
+          xcrun stapler staple "$PKG_PATH"
 
-      - name: Prepare binary for release
+          # Hand the finished package off to the upload step.
+          mkdir -p dist
+          cp "$PKG_PATH" "dist/${{ matrix.asset_name }}.pkg"
+
+      - name: Upload package (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}.pkg
+          path: dist/${{ matrix.asset_name }}.pkg
+
+      - name: Prepare binary for release (Linux/Windows)
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           mkdir -p dist
           tar -czf dist/${{ matrix.asset_name }}.tar.gz -C target/${{ matrix.target }}/release ${{ matrix.binary_name }}
 
-      - name: Upload binary
+      - name: Upload binary (Linux/Windows)
+        if: runner.os != 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}.tar.gz
