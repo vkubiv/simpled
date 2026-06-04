@@ -6,7 +6,7 @@ use anyhow::Context;
 use serde::Serialize;
 use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
 use crate::spec;
-use crate::spec::{EnvVariable, SecretMount, ServiceVolumeType};
+use crate::spec::{EnvVariable, SecretMount, ServiceType, ServiceVolumeType};
 
 #[derive(Serialize)]
 pub struct DockerCompose {
@@ -29,6 +29,19 @@ pub struct DockerService {
     pub environment: HashMap<String, String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub networks: HashMap<String, ServiceNetwork>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<DeployConfig>,
+}
+
+#[derive(Serialize)]
+pub struct DeployConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_policy: Option<RestartPolicy>,
+}
+
+#[derive(Serialize)]
+pub struct RestartPolicy {
+    pub condition: String,
 }
 
 #[derive(Serialize)]
@@ -145,6 +158,18 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
         .as_secs();
     environment.insert("DEPLOY_DATE".to_string(), deploy_date.to_string());
 
+    // Job services run to completion and must not be restarted by Swarm.
+    // Swarm's default restart policy is `condition: any`, which would keep
+    // re-running a job after it exits, so disable restarts explicitly.
+    let deploy = match service.service_type {
+        ServiceType::Job => Some(DeployConfig {
+            restart_policy: Some(RestartPolicy {
+                condition: "none".to_string(),
+            }),
+        }),
+        _ => None,
+    };
+
     Ok(DockerService {
         image: service.image.clone(),
         container_name: service.full_name.clone(),
@@ -153,6 +178,7 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
         env_file: vec![format!("./{}/.env", service.full_name)],
         environment,
         networks: HashMap::new(),
+        deploy,
     })
 }
 
