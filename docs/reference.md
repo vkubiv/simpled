@@ -347,7 +347,7 @@ deployments:
 | `primary_host` | string | yes | Gateway host alias used as the base URL for `relative` environment variables. |
 | `application` | object | yes | App name, version constraint, and optional extra service files. |
 | `environment` | string | no | Path to a `.env` file with variable values. |
-| `undockerized_environment` | string | no | Path to a `.env` file for services running outside Docker. |
+| `undockerized_environment` | string | no | Path to a `.env` file for services running outside Docker. See [undockerized_environment](#undockerized_environment). |
 | `configs` | map | no | Maps config names to directories containing the config files. |
 | `secrets` | map | no | Provides values for the secrets declared in `appspec.yaml`. |
 | `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
@@ -381,6 +381,17 @@ secrets:
     env: REDIS_PASSWORD          # read from env var
   admin_cert:
     file: ./secrets/admin.pem    # read from file
+```
+
+#### undockerized_environment
+
+Path to a `.env` file whose variables are exposed to services you run outside Docker (e.g. a process started from your IDE). The values layer on top of `environment` and are written to `<service>/undockerized.env` for `local` environments only.
+
+For `local` environments, a `.env.local` file located next to `localenv.yaml` overrides these variables: any name present in both wins from `.env.local`, and names not in `undockerized_environment` are appended. This file is intended for per-developer, machine-specific overrides — keep it out of version control (e.g. add it to `.gitignore`). It has no effect on `k8s` or `docker` environments.
+
+```bash
+# .env.local — gitignored
+DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=myapp
 ```
 
 #### service overrides

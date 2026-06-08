@@ -513,6 +513,18 @@ Some local environments run a mix of containerized and non-containerized service
     undockerized_environment: clinic-native.env
 ```
 
+##### `.env.local` overrides (local only)
+
+For `local` environments, if a `.env.local` file is present in the same directory as `localenv.yaml`, its variables override the values from the `undockerized_environment:` section. Variables not already present are appended.
+
+This lets each developer keep machine-specific overrides for host-run (non-dockerized) services outside the committed env files — add `.env.local` to `.gitignore`:
+
+```bash
+# .env.local — not committed
+DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=myapp
+REDIS_CONNECTION_STRING=localhost:6379
+```
+
 ## Exposed services
 
 Each public service should have `host` and `prefix` defined.

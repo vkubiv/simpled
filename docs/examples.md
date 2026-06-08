@@ -446,6 +446,13 @@ deployments:
 
 **`backend-native.env`** replaces service hostnames with `localhost` equivalents so the process running on the host machine can reach the dockerized infrastructure. The file is generated at `local_env/undockerized.env`.
 
+For `local` environments, a `.env.local` file placed next to `localenv.yaml` overrides any of these `undockerized_environment` variables (and adds new ones). Keep it out of version control so each developer can point host-run services at their own local infrastructure:
+
+```bash
+# .env.local — gitignored, per-developer overrides
+DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=backend
+```
+
 ---
 
 ## Example 9 — Registry mapping

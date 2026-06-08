@@ -27,7 +27,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
 
     let mut deployments = Vec::new();
     for (name, dep) in &yaml.deployments {
-        deployments.push(convert_deployment(name.clone(), dep, root)?);
+        deployments.push(convert_deployment(name.clone(), dep, root, &env_type_yaml)?);
     }
 
     let env_type = match env_type_yaml {
@@ -148,11 +148,29 @@ fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>) -> Result<Ve
     }
 }
 
-fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path) -> Result<DeploymentSpec> {
+fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_type: &DeploymentEnvTypeYaml) -> Result<DeploymentSpec> {
     let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
     let application = convert_deployment_app(&yaml.application)?;
     let environment = convert_env_variables(&yaml.environment)?;
-    let undockerized_environment = convert_env_variables(&yaml.undockerized_environment)?;
+    let mut undockerized_environment = convert_env_variables(&yaml.undockerized_environment)?;
+
+    // For local runs, a `.env.local` file in the project root overrides
+    // `undockerized_environment` variables, letting each developer tweak the
+    // values used by host-run (non-dockerized) services without editing the
+    // committed env files.
+    if matches!(env_type, DeploymentEnvTypeYaml::Local) {
+        let env_local_path = root.join(".env.local");
+        if env_local_path.exists() {
+            let overrides = env_loader::load_env_file(&env_local_path)?;
+            for var in overrides {
+                if let Some(existing) = undockerized_environment.iter_mut().find(|v| v.name == var.name) {
+                    existing.value = var.value;
+                } else {
+                    undockerized_environment.push(var);
+                }
+            }
+        }
+    }
 
     let configs = if let Some(conf) = &yaml.configs {
         let mut specs = Vec::new();
@@ -340,4 +358,65 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
         resources,
         ports,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn local_env_yaml() -> DeploymentEnvironmentSpecYaml {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    undockerized_environment:
+      - DB_HOST=docker-db
+      - REDIS_HOST=docker-redis
+    services:
+      web:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+"#;
+        serde_yaml::from_str(raw).unwrap()
+    }
+
+    fn undockerized(spec: &DeploymentEnvironmentSpec) -> &[EnvVariable] {
+        &spec.deployments[0].undockerized_environment
+    }
+
+    #[test]
+    fn env_local_overrides_and_appends_undockerized_vars() {
+        let root = tempfile::tempdir().unwrap();
+        let mut f = fs::File::create(root.path().join(".env.local")).unwrap();
+        // DB_HOST overrides an existing var; EXTRA is appended.
+        writeln!(f, "DB_HOST=localhost").unwrap();
+        writeln!(f, "EXTRA=value").unwrap();
+
+        let spec = convert_env_spec(local_env_yaml(), root.path()).unwrap();
+        let vars = undockerized(&spec);
+
+        let db = vars.iter().find(|v| v.name == "DB_HOST").unwrap();
+        assert_eq!(db.value, "localhost");
+        // unchanged var stays as defined in the spec
+        assert_eq!(vars.iter().find(|v| v.name == "REDIS_HOST").unwrap().value, "docker-redis");
+        assert_eq!(vars.iter().find(|v| v.name == "EXTRA").unwrap().value, "value");
+    }
+
+    #[test]
+    fn missing_env_local_leaves_undockerized_vars_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(local_env_yaml(), root.path()).unwrap();
+        let vars = undockerized(&spec);
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars.iter().find(|v| v.name == "DB_HOST").unwrap().value, "docker-db");
+    }
 }
