@@ -215,6 +215,17 @@ fn generate_swarm(
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
+
+    // Bind-mounted volume directories are not created automatically on the node
+    // during the first deployment, which makes `docker stack deploy` fail. Make
+    // sure they exist (mkdir -p is a no-op when the directory already exists).
+    if !deployment.volumes.is_empty() {
+        writeln!(deploy_sh, "echo 'Ensuring volume directories exist...'")?;
+        for volume in &deployment.volumes {
+            writeln!(deploy_sh, "mkdir -p \"{}/volumes/{}\"", deployment.name, volume)?;
+        }
+    }
+
     writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --detach=false")?;
     writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --detach=false", deployment.name, deployment.name)?;
 

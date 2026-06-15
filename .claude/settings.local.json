@@ -15,7 +15,8 @@
       "Bash(.\\\\target\\\\debug\\\\simpled.exe *)",
       "PowerShell(.\\\\target\\\\debug\\\\simpled.exe --help)",
       "PowerShell(.\\\\target\\\\debug\\\\simpled.exe update --help)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "PowerShell(cargo build *)"
     ]
   }
 }
