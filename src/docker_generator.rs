@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec};
-use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount};
+use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
 use anyhow::{anyhow, Result};
 use std::fs::{self, File};
 use std::io::Write;
@@ -217,12 +217,35 @@ fn generate_swarm(
     writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
 
     // Bind-mounted volume directories are not created automatically on the node
-    // during the first deployment, which makes `docker stack deploy` fail. Make
-    // sure they exist (mkdir -p is a no-op when the directory already exists).
-    if !deployment.volumes.is_empty() {
+    // during the first deployment, which makes `docker stack deploy` fail. Collect
+    // every host directory the stack binds and ensure it exists (mkdir -p is a
+    // no-op when the directory already exists). Paths are relative to the compose
+    // file location, i.e. the deployment directory.
+    let mut volume_dirs: Vec<String> = Vec::new();
+
+    // Named volumes are bound as `./volumes/<name>` inside the deployment dir.
+    for volume in &deployment.volumes {
+        volume_dirs.push(format!("{}/volumes/{}", deployment.name, volume));
+    }
+
+    // Service-level relative path mounts (e.g. `./data:/var/lib/...`).
+    for service in &deployment.services {
+        for volume in &service.volumes {
+            if let ServiceVolumeType::Path(from_path) = &volume.name {
+                if let Some(rel) = from_path.strip_prefix("./") {
+                    volume_dirs.push(format!("{}/{}", deployment.name, rel));
+                }
+            }
+        }
+    }
+
+    volume_dirs.sort();
+    volume_dirs.dedup();
+
+    if !volume_dirs.is_empty() {
         writeln!(deploy_sh, "echo 'Ensuring volume directories exist...'")?;
-        for volume in &deployment.volumes {
-            writeln!(deploy_sh, "mkdir -p \"{}/volumes/{}\"", deployment.name, volume)?;
+        for dir in &volume_dirs {
+            writeln!(deploy_sh, "mkdir -p \"{}\"", dir)?;
         }
     }
 
