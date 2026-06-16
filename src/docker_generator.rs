@@ -250,7 +250,7 @@ fn generate_swarm(
     }
 
     writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --detach=false")?;
-    writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --detach=false", deployment.name, deployment.name)?;
+    writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
 
     Ok(())
 }
