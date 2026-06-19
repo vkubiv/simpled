@@ -205,6 +205,7 @@ pub fn resolve(
             ports: deployment_service_opt.map(|s|
                 s.ports.clone()
             ).unwrap_or(app_service.ports.clone()),
+            working_dir: deployment_service_opt.and_then(|s| s.working_dir.clone()),
         });
     }
 

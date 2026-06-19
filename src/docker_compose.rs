@@ -63,7 +63,9 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
     let env_path = svc_dir.join(".env".to_string());
     write_env_file(&env_path, &service.environment_variables)?;
 
-    if spec.env_type == spec::DeploymentEnvType::Local {
+    // A host-run service with a `working_dir` gets its `.env` written into that
+    // directory by `write_working_dir`, so skip the in-tree `undockerized.env`.
+    if spec.env_type == spec::DeploymentEnvType::Local && service.working_dir.is_none() {
         let undoc_env_path = svc_dir.join("undockerized.env".to_string());
         write_env_file(&undoc_env_path, &service.undockerized_environment_variables)?;
     }
@@ -180,6 +182,46 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
         networks: HashMap::new(),
         deploy,
     })
+}
+
+/// For a host-run (non-dockerized) local service that declares a `working_dir`,
+/// write the undockerized environment as a `.env` file into that directory and
+/// copy the service's secrets alongside it, so the service can be started by
+/// hand from its own working directory. No-op when `working_dir` is unset.
+pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolvedSpec) -> anyhow::Result<()> {
+    let Some(working_dir) = service.working_dir.as_deref() else {
+        return Ok(());
+    };
+
+    let dir = Path::new(working_dir);
+    fs::create_dir_all(dir).context(format!("Failed to create working_dir {:?}", dir))?;
+
+    let mut env_vars = service.undockerized_environment_variables.clone();
+
+    // Env-variable secrets are merged into `.env`; file secrets are written as
+    // files relative to the working directory.
+    for secret_option in &service.secrets {
+        let Some(secret_spec) = spec.current_deployment.secrets.iter().find(|s| s.name == secret_option.name) else {
+            eprintln!("Warning: Secret {} not found for service {}", secret_option.name, service.full_name);
+            continue;
+        };
+        match &secret_option.mount {
+            SecretMount::EnvVariable(var_name) => {
+                env_vars.push(EnvVariable { name: var_name.clone(), value: secret_spec.value.clone() });
+            }
+            SecretMount::FilePath(mount_path) => {
+                let rel_path = mount_path.trim_start_matches('/');
+                let host_path = dir.join(rel_path);
+                if let Some(parent) = host_path.parent() {
+                    fs::create_dir_all(parent).context("Failed to create secret parent directory")?;
+                }
+                fs::write(&host_path, &secret_spec.value).context("Failed to write secret file")?;
+            }
+        }
+    }
+
+    let env_path = dir.join(".env");
+    write_env_file(&env_path, &env_vars)
 }
 
 fn write_env_file(path: &Path, vars: &[EnvVariable]) -> anyhow::Result<()> {

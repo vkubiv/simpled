@@ -73,6 +73,10 @@ pub struct ServiceResolvedSpec {
     pub ports: Vec<ServicePort>,
 
     pub volumes: Vec<ServiceVolume>,
+
+    // local-only: working directory of a host-run (non-dockerized) service.
+    // When set, undockerized env is written there as `.env` and secrets copied alongside.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug)]

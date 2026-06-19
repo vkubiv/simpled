@@ -41,6 +41,9 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
             if yaml.deployments.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for K8S environment"));
             }
+            if any_service_has_working_dir(&yaml.deployments) {
+                return Err(anyhow!("working_dir cannot be set for K8S environment"));
+            }
             DeploymentEnvType::K8S
         },
         DeploymentEnvTypeYaml::Docker => {
@@ -52,6 +55,9 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
             };
             if yaml.deployments.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for Docker environment"));
+            }
+            if any_service_has_working_dir(&yaml.deployments) {
+                return Err(anyhow!("working_dir cannot be set for Docker environment"));
             }
             DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode,
@@ -97,6 +103,14 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
         ingress,
         registry,
         deployments,
+    })
+}
+
+fn any_service_has_working_dir(deployments: &HashMap<String, DeploymentSpecYaml>) -> bool {
+    deployments.values().any(|d| {
+        d.services
+            .as_ref()
+            .map_or(false, |svcs| svcs.values().any(|s| s.working_dir.is_some()))
     })
 }
 
@@ -357,6 +371,7 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
         prefixes,
         resources,
         ports,
+        working_dir: yaml.working_dir.clone(),
     })
 }
 

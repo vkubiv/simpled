@@ -212,6 +212,11 @@ pub struct DeploymentServiceSpecYaml {
     pub resources: Option<ResourcesSpecYaml>,
     // ports are a vector of strings in the form "external:internal"
     pub ports: Option<Vec<String>>,
+
+    // local-only: directory of a host-run (non-dockerized) service. When set,
+    // the undockerized environment is written there as `.env` and the service's
+    // secrets are copied alongside it. Setting it for K8S/Docker is an error.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

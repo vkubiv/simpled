@@ -247,6 +247,8 @@ pub struct DeploymentServiceSpec {
     pub prefixes: Vec<Prefix>,
     pub resources: ResourcesSpec,
     pub ports: Vec<ServicePort>,
+    // local-only: working directory of a host-run (non-dockerized) service.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -54,9 +54,15 @@ where
 
     let mut services_map = HashMap::new();
 
-    for service in spec.current_deployment.services.iter().filter(|s| filter(s)) {
-        let docker_service = prepare_service(service, spec, output_dir)?;
-        services_map.insert(service.full_name.clone(), docker_service);
+    for service in spec.current_deployment.services.iter() {
+        // Host-run services (working_dir set) get their `.env` and secrets even
+        // when they are excluded from the generated compose (e.g. only-extra).
+        write_working_dir(service, spec)?;
+
+        if filter(service) {
+            let docker_service = prepare_service(service, spec, output_dir)?;
+            services_map.insert(service.full_name.clone(), docker_service);
+        }
     }
 
     let compose = DockerCompose {
