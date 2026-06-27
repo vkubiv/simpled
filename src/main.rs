@@ -292,6 +292,11 @@ fn local(command: &LocalCommands) -> Result<()> {
         ),
     };
 
+    let exclude = match command {
+        LocalCommands::Run { exclude, .. } => exclude.clone().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
     let env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref())?;
     let app_spec = spec_loader::load_app_spec_from_dir(Path::new("."), Some(&env_spec))?;
 
@@ -319,11 +324,11 @@ fn local(command: &LocalCommands) -> Result<()> {
                     run_local::generate_config(&resolved_spec)?;
                 },
                 _ => {
-                    local_ingress::run(resolved_spec.ingress.clone())?;
+                    local_ingress::run(resolved_spec.ingress.clone(), &resolved_spec.current_deployment.name)?;
                     match command {
                         LocalCommands::Run { .. } => {
                             println!("Running local deployment");
-                            run_local::run(&resolved_spec)?;
+                            run_local::run(&resolved_spec, &exclude)?;
                         },
                         LocalCommands::OnlyExtra { .. } => {
                             println!("Running gateway and extra services only");

@@ -173,7 +173,24 @@ pub enum DeploymentSecretSpecExYaml {
 #[serde(untagged)]
 pub enum DeploymentEnvVariablesYaml {
     FromEnvFile(String),
-    FromList(Vec<String>),
+    FromList(Vec<EnvVariableEntryYaml>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnvVariableEntryYaml {
+    // an inline variable as a string, e.g. "SOME_VAR=some_value"
+    Inline(String),
+    // a variable whose value is read from a file, e.g.
+    //     environment:
+    //       - MAIN_SERVICE_DB:
+    //           file: /path/to/file
+    FromFile(HashMap<String, EnvVariableSourceYaml>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnvVariableSourceYaml {
+    pub file: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

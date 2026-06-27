@@ -159,23 +159,47 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
     })
 }
 
-fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>) -> Result<Vec<spec::EnvVariable>> {
+fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>, root: &Path) -> Result<Vec<spec::EnvVariable>> {
     match yaml {
         Some(DeploymentEnvVariablesYaml::FromEnvFile(env_file)) => env_loader::load_env_file(env_file),
-        Some(DeploymentEnvVariablesYaml::FromList(v)) => {
-            v.iter()
-                .map(|s| env_loader::parse_env_variable(s))
+        Some(DeploymentEnvVariablesYaml::FromList(entries)) => {
+            entries.iter()
+                .map(|entry| convert_env_entry(entry, root))
                 .collect::<Result<Vec<_>>>()
         },
         None => Ok(vec![]),
     }
 }
 
+fn convert_env_entry(entry: &EnvVariableEntryYaml, root: &Path) -> Result<spec::EnvVariable> {
+    match entry {
+        EnvVariableEntryYaml::Inline(s) => env_loader::parse_env_variable(s),
+        EnvVariableEntryYaml::FromFile(map) => {
+            if map.len() != 1 {
+                return Err(anyhow!(
+                    "A file-backed environment entry must define exactly one variable, got {}",
+                    map.len()
+                ));
+            }
+            let (name, source) = map.iter().next().unwrap();
+            let file_path = root.join(&source.file);
+            let value = fs::read_to_string(&file_path)
+                .with_context(|| format!("Failed to read value for env variable '{}' from {:?}", name, file_path))?;
+            // Files commonly end with a trailing newline that is not part of the value.
+            let value = value.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+            Ok(spec::EnvVariable {
+                name: name.clone(),
+                value,
+            })
+        }
+    }
+}
+
 fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_type: &DeploymentEnvTypeYaml) -> Result<DeploymentSpec> {
     let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
     let application = convert_deployment_app(&yaml.application)?;
-    let environment = convert_env_variables(&yaml.environment)?;
-    let mut undockerized_environment = convert_env_variables(&yaml.undockerized_environment)?;
+    let environment = convert_env_variables(&yaml.environment, root)?;
+    let mut undockerized_environment = convert_env_variables(&yaml.undockerized_environment, root)?;
 
     // For local runs, a `.env.local` file in the project root overrides
     // `undockerized_environment` variables, letting each developer tweak the
@@ -433,6 +457,45 @@ deployments:
         // unchanged var stays as defined in the spec
         assert_eq!(vars.iter().find(|v| v.name == "REDIS_HOST").unwrap().value, "docker-redis");
         assert_eq!(vars.iter().find(|v| v.name == "EXTRA").unwrap().value, "value");
+    }
+
+    #[test]
+    fn reads_env_variable_value_from_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut f = fs::File::create(root.path().join("db_url")).unwrap();
+        // trailing newline must be stripped
+        writeln!(f, "postgres://localhost/main").unwrap();
+
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    undockerized_environment:
+      - PLAIN=value
+      - MAIN_SERVICE_DB:
+          file: db_url
+    services:
+      web:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+        let vars = undockerized(&spec);
+
+        assert_eq!(vars.iter().find(|v| v.name == "PLAIN").unwrap().value, "value");
+        assert_eq!(
+            vars.iter().find(|v| v.name == "MAIN_SERVICE_DB").unwrap().value,
+            "postgres://localhost/main"
+        );
     }
 
     #[test]

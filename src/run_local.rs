@@ -9,8 +9,8 @@ use serde::Serialize;
 
 
 
-pub fn run(spec: &EnvironmentResolvedSpec) -> Result<()> {
-    run_filtered(spec, |_| true)
+pub fn run(spec: &EnvironmentResolvedSpec, exclude: &[String]) -> Result<()> {
+    run_filtered(spec, |s| !exclude.iter().any(|e| e == &s.full_name))
 }
 
 pub fn run_only_extra(spec: &EnvironmentResolvedSpec) -> Result<()> {
