@@ -191,7 +191,7 @@ fn prepare_deployment_command(
     github_tag_prefix: &Option<String>
 ) -> Result<()> {
     // 1. Load specs
-    let env_spec = spec_loader::load_env_spec(Path::new("."))?;
+    let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name))?;
     
     // Find deployment to get app name
     let deployment = env_spec.deployments.iter()
@@ -292,7 +292,7 @@ fn local(command: &LocalCommands) -> Result<()> {
         ),
     };
 
-    let env_spec = spec_loader::load_env_spec(root)?;
+    let env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref())?;
     let app_spec = spec_loader::load_app_spec_from_dir(Path::new("."), Some(&env_spec))?;
 
     let deployment = select_deployment(&env_spec, deployment_name.as_deref())?;

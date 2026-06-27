@@ -59,7 +59,7 @@ fn load_app_spec_from_tar_gz(path: &Path, env_spec: Option<&spec::DeploymentEnvi
     bail!("appspec.yaml not found in archive {:?}", path);
 }
 
-pub fn load_env_spec(root: &Path) -> Result<spec::DeploymentEnvironmentSpec> {
+pub fn load_env_spec(root: &Path, selected_deployment: Option<&str>) -> Result<spec::DeploymentEnvironmentSpec> {
     let candidates: &[(&str, bool)] = &[
         ("envspec.yaml", false),
         ("envspec.yml", false),
@@ -87,6 +87,6 @@ pub fn load_env_spec(root: &Path) -> Result<spec::DeploymentEnvironmentSpec> {
         }
     }
 
-    let env_spec = transform::convert_env_spec(yaml, root).context("Failed to process env spec")?;
+    let env_spec = transform::convert_env_spec(yaml, root, selected_deployment).context("Failed to process env spec")?;
     Ok(env_spec)
 }

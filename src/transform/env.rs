@@ -9,7 +9,7 @@ use std::path::Path;
 const DEFAULT_MEMORY: &str = "128Mi";
 const DEFAULT_CPU: &str = "100m";
 
-pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Result<DeploymentEnvironmentSpec> {
+pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, selected_deployment: Option<&str>) -> Result<DeploymentEnvironmentSpec> {
     let env_type_yaml = yaml.env_type
         .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
     let swarm_mode_opt = yaml.swarm_mode;
@@ -74,12 +74,21 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
             if !registry.is_empty() {
                 return Err(anyhow!("registry must be empty for Local environment"));
             }
-            if deployments.len() != 1 {
-                return Err(anyhow!("For Local environment exactly one deployment must be specified"));
+            if deployments.is_empty() {
+                return Err(anyhow!("For Local environment at least one deployment must be specified"));
+            }
+            // Multiple deployments are allowed, but only one runs at a time. When more
+            // than one is defined the caller must pick which with --deployment.
+            if deployments.len() > 1 && selected_deployment.is_none() {
+                return Err(anyhow!(
+                    "For Local environment with multiple deployments, specify which one with --deployment"
+                ));
             }
 
-            let mut ports_seen = HashSet::new();
+            // Port uniqueness is checked per deployment: different deployments may reuse
+            // the same external ports since only one runs at a time.
             for dep in &deployments {
+                let mut ports_seen = HashSet::new();
                 if let Some(services) = &dep.services {
                     for (svc_name, svc_spec) in services {
                         if svc_spec.ports.is_empty() {
@@ -87,7 +96,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path) -> Res
                         }
                         for port in &svc_spec.ports {
                             if !ports_seen.insert(port.external) {
-                                return Err(anyhow!("Duplicate external port {} in deployment", port.external));
+                                return Err(anyhow!("Duplicate external port {} in deployment {}", port.external, dep.name));
                             }
                         }
                     }
@@ -416,7 +425,7 @@ deployments:
         writeln!(f, "DB_HOST=localhost").unwrap();
         writeln!(f, "EXTRA=value").unwrap();
 
-        let spec = convert_env_spec(local_env_yaml(), root.path()).unwrap();
+        let spec = convert_env_spec(local_env_yaml(), root.path(), None).unwrap();
         let vars = undockerized(&spec);
 
         let db = vars.iter().find(|v| v.name == "DB_HOST").unwrap();
@@ -429,7 +438,7 @@ deployments:
     #[test]
     fn missing_env_local_leaves_undockerized_vars_unchanged() {
         let root = tempfile::tempdir().unwrap();
-        let spec = convert_env_spec(local_env_yaml(), root.path()).unwrap();
+        let spec = convert_env_spec(local_env_yaml(), root.path(), None).unwrap();
         let vars = undockerized(&spec);
         assert_eq!(vars.len(), 2);
         assert_eq!(vars.iter().find(|v| v.name == "DB_HOST").unwrap().value, "docker-db");
