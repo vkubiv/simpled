@@ -385,7 +385,7 @@ secrets:
 
 #### undockerized_environment
 
-Path to a `.env` file whose variables are exposed to services you run outside Docker (e.g. a process started from your IDE). The values layer on top of `environment` and are written to `<service>/undockerized.env` for `local` environments only.
+Path to a `.env` file whose variables are exposed to services you run outside Docker (e.g. a process started from your IDE). The values layer on top of `environment` and are written to `<service>/undockerized.env` for `local` environments only. A service that sets [`working_dir`](#working_dir) instead gets these variables as a `.env` file in its working directory.
 
 For `local` environments, a `.env.local` file located next to `localenv.yaml` overrides these variables: any name present in both wins from `.env.local`, and names not in `undockerized_environment` are appended. This file is intended for per-developer, machine-specific overrides — keep it out of version control (e.g. add it to `.gitignore`). It has no effect on `k8s` or `docker` environments.
 
@@ -405,6 +405,31 @@ DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=myapp
 | `variant` | string | Image variant to use (must be declared in `appspec.yaml`). |
 | `replicas` | int | Number of pod/container replicas. Overrides `defaults.replicas`. |
 | `resources` | object | CPU/memory requests and limits. Overrides `defaults.resources`. |
+| `working_dir` | string | Local only. Directory of a host-run (non-dockerized) service. See [working_dir](#working_dir). |
+
+#### working_dir
+
+Local only. Marks a service as host-run (started by hand or from your IDE, outside Docker) and points at the directory it runs from. When set, `simpled` writes that service's setup into `working_dir` instead of `local_env/<service>/`:
+
+- the [undockerized environment](#undockerized_environment) is written as a `.env` file in `working_dir` (rather than `local_env/<service>/undockerized.env`),
+- the service's secrets are copied alongside it: `variable:` secrets are merged into the `.env` file, and `path:`/file secrets are written as files relative to `working_dir`.
+
+This pairs with `simpled local only-extra`, which runs the gateway and extra services in Docker while you run the app service yourself. Point your process at `working_dir/.env` and it has the same environment and secrets the dockerized service would get.
+
+```yaml
+# localenv.yaml
+deployments:
+  myapp_local:
+    services:
+      api:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+        working_dir: ../api   # run the api here; .env + secrets written into it
+```
+
+`working_dir` is not valid for `k8s` or `docker` environments.
 
 ---
 
@@ -468,9 +493,15 @@ Generates Docker Compose and starts local services with a reverse proxy.
 simpled local run [OPTIONS]
 
 Options:
-  --exclude <SERVICE>  Exclude a service (repeatable)
-  --path <PATH>        Path to the project directory (default: current dir)
+  --exclude <SERVICE>      Exclude a service (repeatable)
+  --path <PATH>            Path to the project directory (default: current dir)
+  --deployment <NAME>      Deployment to run. Required when the env spec defines
+                           more than one deployment.
 ```
+
+An env spec may define multiple deployments, but only one can run locally at a
+time. When a single deployment is defined it is used automatically; when more
+than one is defined you must pick one with `--deployment <name>`.
 
 ### `simpled local only-extra`
 
@@ -480,7 +511,9 @@ Runs the gateway and only extra services, skipping all app services. Useful when
 simpled local only-extra [OPTIONS]
 
 Options:
-  --path <PATH>  Path to the project directory (default: current dir)
+  --path <PATH>        Path to the project directory (default: current dir)
+  --deployment <NAME>  Deployment to run. Required when the env spec defines
+                       more than one deployment.
 ```
 
 ### `simpled local generate-config`
@@ -491,7 +524,9 @@ Writes `local_env/docker-compose.yaml` and per-service `.env` files without star
 simpled local generate-config [OPTIONS]
 
 Options:
-  --path <PATH>  Path to the project directory (default: current dir)
+  --path <PATH>        Path to the project directory (default: current dir)
+  --deployment <NAME>  Deployment to generate config for. Required when the env
+                       spec defines more than one deployment.
 ```
 
 ### `simpled secrets set`
@@ -550,4 +585,5 @@ Output directory: `local_env/`
 |------|-------------|
 | `docker-compose.yaml` | Compose file for all services |
 | `<service>/.env` | Per-service environment variable file |
-| `undockerized.env` | Variables for services run outside Docker |
+| `<service>/undockerized.env` | Variables for services run outside Docker (unless the service sets `working_dir`) |
+| `<working_dir>/.env` | Environment and secrets for a host-run service that sets `working_dir` |

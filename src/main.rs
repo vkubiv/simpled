@@ -81,16 +81,28 @@ enum LocalCommands {
 
         #[arg(long)]
         path: Option<String>,
+
+        /// Deployment to run. Required when the env spec defines more than one.
+        #[arg(long)]
+        deployment: Option<String>,
     },
     /// Run the gateway and only extra services (no app services)
     OnlyExtra {
         #[arg(long)]
         path: Option<String>,
+
+        /// Deployment to run. Required when the env spec defines more than one.
+        #[arg(long)]
+        deployment: Option<String>,
     },
     /// Regenerate local_env configuration without running the gateway or docker compose
     GenerateConfig {
         #[arg(long)]
         path: Option<String>,
+
+        /// Deployment to generate config for. Required when the env spec defines more than one.
+        #[arg(long)]
+        deployment: Option<String>,
     },
 }
 
@@ -236,19 +248,54 @@ fn prepare_deployment_command(
     Ok(())
 }
 
+/// Selects which deployment to act on for a local command.
+///
+/// - If `requested` is given, the matching deployment is returned (error if not found).
+/// - Otherwise, when exactly one deployment is defined it is used.
+/// - When multiple deployments are defined and none was requested, the user must
+///   disambiguate with `--deployment`.
+fn select_deployment<'a>(
+    env_spec: &'a spec::DeploymentEnvironmentSpec,
+    requested: Option<&str>,
+) -> Result<&'a spec::DeploymentSpec> {
+    if let Some(name) = requested {
+        return env_spec.deployments.iter()
+            .find(|d| d.name == name)
+            .context(format!("Deployment '{}' not found in env spec", name));
+    }
+
+    match env_spec.deployments.as_slice() {
+        [] => bail!("No deployments defined in envspec"),
+        [single] => Ok(single),
+        multiple => {
+            let names = multiple.iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Multiple deployments defined ({}). Specify which one to run with --deployment <name>.",
+                names
+            )
+        }
+    }
+}
+
 fn local(command: &LocalCommands) -> Result<()> {
-    let root = match command {
-        LocalCommands::Run { path, .. }
-        | LocalCommands::OnlyExtra { path }
-        | LocalCommands::GenerateConfig { path } => path.as_ref()
-            .map(|p| Path::new(p))
-            .unwrap_or(Path::new(".")),
+    let (root, deployment_name) = match command {
+        LocalCommands::Run { path, deployment, .. }
+        | LocalCommands::OnlyExtra { path, deployment }
+        | LocalCommands::GenerateConfig { path, deployment } => (
+            path.as_ref()
+                .map(|p| Path::new(p))
+                .unwrap_or(Path::new(".")),
+            deployment,
+        ),
     };
 
     let env_spec = spec_loader::load_env_spec(root)?;
     let app_spec = spec_loader::load_app_spec_from_dir(Path::new("."), Some(&env_spec))?;
 
-    let deployment = env_spec.deployments.first().context("No deployments defined in envspec")?;
+    let deployment = select_deployment(&env_spec, deployment_name.as_deref())?;
 
     validator::validate(&env_spec, &app_spec, &deployment.name).context("Validation failed")?;
 
