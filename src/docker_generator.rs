@@ -252,6 +252,20 @@ fn generate_swarm(
     writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --detach=false")?;
     writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
 
+    // After a successful deploy, reclaim disk space by removing images that are no
+    // longer used by any container/service (e.g. the previous versions replaced by
+    // this rollout). `set -e` above guarantees this only runs when the deploy
+    // succeeded.
+    //
+    // `docker stack deploy` returns before the rollout has converged, so the new
+    // tasks may still be pulling/starting their images. Wait 3 minutes to give the
+    // rollout time to settle before pruning, otherwise we could remove an image a
+    // task still depends on.
+    writeln!(deploy_sh, "echo 'Waiting for rollout to settle before pruning...'")?;
+    writeln!(deploy_sh, "sleep 180")?;
+    writeln!(deploy_sh, "echo 'Pruning unused images...'")?;
+    writeln!(deploy_sh, "docker image prune -af")?;
+
     Ok(())
 }
 
