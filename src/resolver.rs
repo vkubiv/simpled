@@ -2,7 +2,7 @@ use crate::spec::*;
 use crate::spec::EnvVariable;
 use crate::resolved_spec::*;
 use anyhow::{Result, anyhow, Context};
-use std::collections::{HashSet};
+use std::collections::{HashSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::env;
@@ -49,6 +49,9 @@ pub fn resolve(
 
     // 2. Resolve Secrets
     let mut resolved_secrets = Vec::new();
+    // Keyed by the secret's original (unprefixed) name so deployment env values
+    // can reference them via `$secret(name)`.
+    let mut secret_values: HashMap<String, String> = HashMap::new();
     for secret_spec in &deployment.secrets {
         let value = match &secret_spec.source {
             DeploymentSecretSource::EnvVariable(var_name) => {
@@ -63,11 +66,18 @@ pub fn resolve(
             }
             DeploymentSecretSource::Embedded(value) => value.clone(),
         };
+        secret_values.insert(secret_spec.secret_name.clone(), value.clone());
         resolved_secrets.push(SecretResolvedSpec {
             name: format!("{}-{}", app_spec.name, secret_spec.secret_name),
             value,
         });
     }
+
+    // Deployment-level env values may reference secrets via `$secret(name)`.
+    // Expand those references once before the values feed into service resolution.
+    let deployment_environment = substitute_secret_refs(&deployment.environment, &secret_values)?;
+    let deployment_undockerized_environment =
+        substitute_secret_refs(&deployment.undockerized_environment, &secret_values)?;
 
     // 3. Resolve Services
     let mut resolved_services = Vec::new();
@@ -154,12 +164,12 @@ pub fn resolve(
 
         // Resolve Environment Variables
         let use_tls = env_spec.ingress.tls.is_some();
-        let environment_variables = resolve_app_env_vars(app_spec, &deployment.environment, Some(host_domain_name), use_tls)?;
+        let environment_variables = resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
         let final_service_env_vars = filter_service_env_vars(app_service, &environment_variables)?;
 
         // Resolve Undockerized Environment Variables
-        let mut undockerized_values = deployment.environment.clone();
-        for override_var in &deployment.undockerized_environment {
+        let mut undockerized_values = deployment_environment.clone();
+        for override_var in &deployment_undockerized_environment {
             add_unique_var(&mut undockerized_values, override_var.clone());
         }
         let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
@@ -338,6 +348,50 @@ fn add_unique_var(vars: &mut Vec<EnvVariable>, var: EnvVariable) {
     }
 }
 
+/// Expands `$secret(name)` references in a string with the resolved secret value.
+/// `secrets` is keyed by the secret's original (unprefixed) name. Referencing an
+/// unknown secret is an error.
+pub fn resolve_secret_refs_in_string(input: &str, secrets: &HashMap<String, String>) -> Result<String> {
+    const MARKER: &str = "$secret(";
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    while let Some(start) = input[last_end..].find(MARKER) {
+        let absolute_start = last_end + start;
+        result.push_str(&input[last_end..absolute_start]);
+
+        let name_start = absolute_start + MARKER.len();
+        if let Some(close_offset) = input[name_start..].find(')') {
+            let name_end = name_start + close_offset;
+            let secret_name = &input[name_start..name_end];
+
+            match secrets.get(secret_name) {
+                Some(value) => result.push_str(value),
+                None => return Err(anyhow!("Undefined secret reference: $secret({})", secret_name)),
+            }
+
+            last_end = name_end + 1;
+        } else {
+            return Err(anyhow!("Invalid secret reference (missing ')'): {}", input));
+        }
+    }
+
+    result.push_str(&input[last_end..]);
+    Ok(result)
+}
+
+/// Applies `resolve_secret_refs_in_string` to every value in an env variable list.
+fn substitute_secret_refs(vars: &[EnvVariable], secrets: &HashMap<String, String>) -> Result<Vec<EnvVariable>> {
+    vars.iter()
+        .map(|v| {
+            Ok(EnvVariable {
+                name: v.name.clone(),
+                value: resolve_secret_refs_in_string(&v.value, secrets)?,
+            })
+        })
+        .collect()
+}
+
 pub fn resolve_variable_in_string(input: &String, vars: &[EnvVariable]) -> Result<String> {
     let mut result = String::new();
     let mut last_end = 0;
@@ -456,4 +510,53 @@ fn filter_service_env_vars(
          }
     }
     Ok(final_service_env_vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secrets() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("postgres_password".to_string(), "s3cr3t".to_string());
+        m
+    }
+
+    #[test]
+    fn expands_secret_reference() {
+        let out = resolve_secret_refs_in_string(
+            "postgresql://postgres:$secret(postgres_password)@postgres:5432/hobbyshopify",
+            &secrets(),
+        )
+        .unwrap();
+        assert_eq!(out, "postgresql://postgres:s3cr3t@postgres:5432/hobbyshopify");
+    }
+
+    #[test]
+    fn expands_multiple_references() {
+        let out = resolve_secret_refs_in_string(
+            "$secret(postgres_password)-$secret(postgres_password)",
+            &secrets(),
+        )
+        .unwrap();
+        assert_eq!(out, "s3cr3t-s3cr3t");
+    }
+
+    #[test]
+    fn passes_through_without_reference() {
+        let out = resolve_secret_refs_in_string("plain-value", &secrets()).unwrap();
+        assert_eq!(out, "plain-value");
+    }
+
+    #[test]
+    fn errors_on_unknown_secret() {
+        let err = resolve_secret_refs_in_string("$secret(missing)", &secrets()).unwrap_err();
+        assert!(err.to_string().contains("Undefined secret reference"));
+    }
+
+    #[test]
+    fn errors_on_unterminated_reference() {
+        let err = resolve_secret_refs_in_string("$secret(postgres_password", &secrets()).unwrap_err();
+        assert!(err.to_string().contains("Invalid secret reference"));
+    }
 }
