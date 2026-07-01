@@ -71,6 +71,14 @@ pub fn generate(
         writeln!(file, "      containers:")?;
         writeln!(file, "      - name: {}", service.full_name)?;
         writeln!(file, "        image: {}", service.image)?;
+        // docker-compose `command` overrides the image's default command (CMD),
+        // which corresponds to a container's `args` in Kubernetes.
+        if let Some(command) = &service.command {
+            writeln!(file, "        args:")?;
+            for arg in command.to_args() {
+                writeln!(file, "        - \"{}\"", arg)?;
+            }
+        }
         writeln!(file, "        resources:")?;
         writeln!(file, "          requests:")?;
         writeln!(file, "            memory: {}", deployment.defaults.requests.memory)?;

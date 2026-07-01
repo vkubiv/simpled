@@ -54,6 +54,15 @@ pub struct ServiceSpecYaml {
     pub secrets: Option<Vec<ServiceSecretYaml>>,
     pub ports: Option<Vec<String>>,
     pub volumes: Option<Vec<String>>,
+    // Overrides the image's default command, same as docker-compose `command`.
+    pub command: Option<ServiceCommandYaml>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServiceCommandYaml {
+    Shell(String),
+    Exec(Vec<String>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

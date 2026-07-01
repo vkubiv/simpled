@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct AppSpec {
@@ -89,7 +90,29 @@ pub struct ServiceSpec {
     pub secrets: Vec<ServiceSecret>,
     pub ports: Vec<ServicePort>,
     pub volumes: Vec<ServiceVolume>,
+    // Overrides the image's default command, same as docker-compose `command`.
+    pub command: Option<ServiceCommand>,
 }
+
+// Overrides the default command of a service's image. Mirrors docker-compose
+// `command`, which accepts either a shell string or an exec-form list of args.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ServiceCommand {
+    Shell(String),
+    Exec(Vec<String>),
+}
+
+impl ServiceCommand {
+    /// Normalize to an argv vector. The shell (string) form is split on whitespace.
+    pub fn to_args(&self) -> Vec<String> {
+        match self {
+            ServiceCommand::Shell(s) => s.split_whitespace().map(str::to_string).collect(),
+            ServiceCommand::Exec(v) => v.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ServiceEnvOption {
     All,

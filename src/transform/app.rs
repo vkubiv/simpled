@@ -227,6 +227,11 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         .map(|s| parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
 
+     let command = yaml.command.map(|c| match c {
+        ServiceCommandYaml::Shell(s) => ServiceCommand::Shell(s),
+        ServiceCommandYaml::Exec(v) => ServiceCommand::Exec(v),
+    });
+
     Ok(ServiceSpec {
         name,
         service_type,
@@ -236,6 +241,7 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         secrets,
         ports,
         volumes,
+        command,
         is_app_service,
     })
 }

@@ -298,6 +298,27 @@ app_services:
 
 `simpled` returns an error at parse time if a service references a named volume that is not declared in `volumes:`.
 
+## Command
+
+The `command:` field on a service overrides the default command of its image, exactly like docker-compose `command`. It accepts either a shell string or an exec-form list of arguments:
+
+```yaml
+extra_services:
+  postgres:
+    image: postgres:16
+    command: postgres -c max_connections=200
+
+  worker:
+    image: mycompany/worker
+    command:
+      - python
+      - -m
+      - worker
+      - --concurrency=4
+```
+
+The override is applied wherever the service is emitted: as `command:` in generated docker-compose files, appended after the image in the standalone `docker run` script, and as the container `args:` in generated Kubernetes deployments.
+
 ## Defining environments
 
 The Environment is defined in `envspec.yaml` (for Kubernetes and Docker environments) or `localenv.yaml` (for local development).

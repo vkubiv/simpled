@@ -212,6 +212,7 @@ pub fn resolve(
             configs: service_configs,
             secrets: service_secrets,
             volumes: app_service.volumes.clone(),
+            command: app_service.command.clone(),
             ports: deployment_service_opt.map(|s|
                 s.ports.clone()
             ).unwrap_or(app_service.ports.clone()),

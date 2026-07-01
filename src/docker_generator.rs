@@ -122,7 +122,16 @@ fn generate_standalone(
              }
          }
          
-         writeln!(deploy_sh, " {}", service.image)?;
+         write!(deploy_sh, " {}", service.image)?;
+
+         // Append the command override (docker-compose `command`) after the image,
+         // which is where `docker run` expects the container command/args.
+         if let Some(command) = &service.command {
+             for arg in command.to_args() {
+                 write!(deploy_sh, " {}", arg)?;
+             }
+         }
+         writeln!(deploy_sh)?;
     }
     
     // Ingress Container

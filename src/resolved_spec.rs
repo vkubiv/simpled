@@ -1,4 +1,4 @@
-use crate::spec::{DeploymentEnvType, EnvVariable, ResourcesSpec, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume};
+use crate::spec::{DeploymentEnvType, EnvVariable, ResourcesSpec, ServiceCommand, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume};
 
 #[derive(Debug)]
 pub struct EnvironmentResolvedSpec {
@@ -73,6 +73,9 @@ pub struct ServiceResolvedSpec {
     pub ports: Vec<ServicePort>,
 
     pub volumes: Vec<ServiceVolume>,
+
+    // Overrides the image's default command, same as docker-compose `command`.
+    pub command: Option<ServiceCommand>,
 
     // local-only: working directory of a host-run (non-dockerized) service.
     // When set, undockerized env is written there as `.env` and secrets copied alongside.
