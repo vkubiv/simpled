@@ -6,7 +6,7 @@ use anyhow::Context;
 use serde::Serialize;
 use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
 use crate::spec;
-use crate::spec::{EnvVariable, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType};
+use crate::spec::{EnvVariable, Healthcheck, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType};
 
 #[derive(Serialize)]
 pub struct DockerCompose {
@@ -20,7 +20,11 @@ pub struct DockerService {
     pub image: String,
     pub container_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<ServiceCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<ServiceCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -177,7 +181,9 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
     Ok(DockerService {
         image: service.image.clone(),
         container_name: service.full_name.clone(),
+        entrypoint: service.entrypoint.clone(),
         command: service.command.clone(),
+        healthcheck: service.healthcheck.clone(),
         ports,
         volumes,
         env_file: vec![format!("./{}/.env", service.full_name)],

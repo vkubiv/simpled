@@ -56,11 +56,32 @@ pub struct ServiceSpecYaml {
     pub volumes: Option<Vec<String>>,
     // Overrides the image's default command, same as docker-compose `command`.
     pub command: Option<ServiceCommandYaml>,
+    // Overrides the image's ENTRYPOINT, same as docker-compose `entrypoint`.
+    pub entrypoint: Option<ServiceCommandYaml>,
+    // Container health probe, same as docker-compose `healthcheck`.
+    pub healthcheck: Option<HealthcheckYaml>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ServiceCommandYaml {
+    Shell(String),
+    Exec(Vec<String>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthcheckYaml {
+    pub test: Option<HealthcheckTestYaml>,
+    pub interval: Option<String>,
+    pub timeout: Option<String>,
+    pub retries: Option<u32>,
+    pub start_period: Option<String>,
+    pub disable: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HealthcheckTestYaml {
     Shell(String),
     Exec(Vec<String>),
 }

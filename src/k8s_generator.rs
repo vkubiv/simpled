@@ -1,5 +1,5 @@
 use crate::resolved_spec::{EnvironmentResolvedSpec, LetsEncryptResolvedSpec};
-use crate::spec::SecretMount;
+use crate::spec::{parse_duration_secs, Healthcheck, SecretMount};
 use anyhow::Result;
 use std::fs::File;
 use std::io::Write;
@@ -71,12 +71,26 @@ pub fn generate(
         writeln!(file, "      containers:")?;
         writeln!(file, "      - name: {}", service.full_name)?;
         writeln!(file, "        image: {}", service.image)?;
-        // docker-compose `command` overrides the image's default command (CMD),
-        // which corresponds to a container's `args` in Kubernetes.
+        // docker-compose `entrypoint` overrides the image ENTRYPOINT, which maps
+        // to a container's `command` in Kubernetes; `command` overrides the image
+        // CMD, which maps to a container's `args`.
+        if let Some(entrypoint) = &service.entrypoint {
+            writeln!(file, "        command:")?;
+            for arg in entrypoint.to_args() {
+                writeln!(file, "        - \"{}\"", arg)?;
+            }
+        }
         if let Some(command) = &service.command {
             writeln!(file, "        args:")?;
             for arg in command.to_args() {
                 writeln!(file, "        - \"{}\"", arg)?;
+            }
+        }
+        // docker-compose `healthcheck` maps to liveness/readiness probes.
+        if let Some(hc) = &service.healthcheck {
+            if let Some(argv) = hc.probe_argv() {
+                write_probe(&mut file, "livenessProbe", &argv, hc)?;
+                write_probe(&mut file, "readinessProbe", &argv, hc)?;
             }
         }
         writeln!(file, "        resources:")?;
@@ -171,6 +185,33 @@ pub fn generate(
         }
     }
 
+    Ok(())
+}
+
+/// Write a Kubernetes exec probe (`livenessProbe`/`readinessProbe`) built from a
+/// docker-compose healthcheck. Compose durations are parsed to whole seconds;
+/// `retries` maps to `failureThreshold` and `start_period` to
+/// `initialDelaySeconds`. Fields with no compose counterpart are left to the
+/// Kubernetes defaults.
+fn write_probe(file: &mut File, name: &str, argv: &[String], hc: &Healthcheck) -> Result<()> {
+    writeln!(file, "        {}:", name)?;
+    writeln!(file, "          exec:")?;
+    writeln!(file, "            command:")?;
+    for arg in argv {
+        writeln!(file, "            - \"{}\"", arg)?;
+    }
+    if let Some(interval) = hc.interval.as_deref().and_then(parse_duration_secs) {
+        writeln!(file, "          periodSeconds: {}", interval)?;
+    }
+    if let Some(timeout) = hc.timeout.as_deref().and_then(parse_duration_secs) {
+        writeln!(file, "          timeoutSeconds: {}", timeout)?;
+    }
+    if let Some(retries) = hc.retries {
+        writeln!(file, "          failureThreshold: {}", retries)?;
+    }
+    if let Some(start) = hc.start_period.as_deref().and_then(parse_duration_secs) {
+        writeln!(file, "          initialDelaySeconds: {}", start)?;
+    }
     Ok(())
 }
 

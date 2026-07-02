@@ -319,6 +319,47 @@ extra_services:
 
 The override is applied wherever the service is emitted: as `command:` in generated docker-compose files, appended after the image in the standalone `docker run` script, and as the container `args:` in generated Kubernetes deployments.
 
+## Entrypoint
+
+The `entrypoint:` field overrides the image's `ENTRYPOINT`, exactly like docker-compose `entrypoint`. Like `command:`, it accepts either a shell string or an exec-form list:
+
+```yaml
+app_services:
+  api:
+    image: mycompany/api
+    entrypoint: /usr/local/bin/start.sh
+    command: ["--port", "8080"]
+```
+
+It is emitted as `entrypoint:` in docker-compose, as `--entrypoint` in the `docker run` script, and as the container `command:` in Kubernetes (where docker-compose `command` maps to `args`). When both are set the effective process is `entrypoint` followed by `command`, matching docker-compose.
+
+## Healthcheck
+
+The `healthcheck:` field mirrors docker-compose `healthcheck`. `test` accepts a shell string or the exec-form list with a `CMD`, `CMD-SHELL`, or `NONE` prefix; the duration fields use the compose format (`30s`, `1m30s`, `1h`):
+
+```yaml
+app_services:
+  api:
+    image: mycompany/api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+extra_services:
+  postgres:
+    image: postgres:16
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 10s
+```
+
+Set `disable: true` (or `test: ["NONE"]`) to turn a healthcheck off.
+
+The check is emitted as `healthcheck:` in docker-compose, as `--health-*` flags in the `docker run` script, and as both a `livenessProbe` and a `readinessProbe` in Kubernetes. For Kubernetes the durations are converted to whole seconds (`interval` → `periodSeconds`, `timeout` → `timeoutSeconds`, `retries` → `failureThreshold`, `start_period` → `initialDelaySeconds`).
+
 ## Defining environments
 
 The Environment is defined in `envspec.yaml` (for Kubernetes and Docker environments) or `localenv.yaml` (for local development).

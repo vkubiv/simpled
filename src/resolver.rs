@@ -213,6 +213,8 @@ pub fn resolve(
             secrets: service_secrets,
             volumes: app_service.volumes.clone(),
             command: app_service.command.clone(),
+            entrypoint: app_service.entrypoint.clone(),
+            healthcheck: app_service.healthcheck.clone(),
             ports: deployment_service_opt.map(|s|
                 s.ports.clone()
             ).unwrap_or(app_service.ports.clone()),

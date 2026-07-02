@@ -122,14 +122,40 @@ fn generate_standalone(
              }
          }
          
-         write!(deploy_sh, " {}", service.image)?;
-
-         // Append the command override (docker-compose `command`) after the image,
-         // which is where `docker run` expects the container command/args.
-         if let Some(command) = &service.command {
-             for arg in command.to_args() {
-                 write!(deploy_sh, " {}", arg)?;
+         // Healthcheck: map docker-compose `healthcheck` onto `docker run` flags.
+         if let Some(hc) = &service.healthcheck {
+             if hc.is_disabled() {
+                 write!(deploy_sh, " --no-healthcheck")?;
+             } else {
+                 if let Some(cmd) = hc.health_cmd_string() {
+                     write!(deploy_sh, " --health-cmd '{}'", cmd.replace('\'', "'\\''"))?;
+                 }
+                 if let Some(v) = &hc.interval { write!(deploy_sh, " --health-interval {}", v)?; }
+                 if let Some(v) = &hc.timeout { write!(deploy_sh, " --health-timeout {}", v)?; }
+                 if let Some(v) = hc.retries { write!(deploy_sh, " --health-retries {}", v)?; }
+                 if let Some(v) = &hc.start_period { write!(deploy_sh, " --health-start-period {}", v)?; }
              }
+         }
+
+         // `docker run --entrypoint` overrides only the executable, so the first
+         // entrypoint token goes there and any remaining entrypoint tokens are
+         // prepended to the container args after the image. The effective process
+         // is therefore entrypoint ++ command, matching docker-compose.
+         let mut trailing_args: Vec<String> = Vec::new();
+         if let Some(entrypoint) = &service.entrypoint {
+             let mut args = entrypoint.to_args();
+             if !args.is_empty() {
+                 write!(deploy_sh, " --entrypoint {}", args.remove(0))?;
+                 trailing_args.extend(args);
+             }
+         }
+         if let Some(command) = &service.command {
+             trailing_args.extend(command.to_args());
+         }
+
+         write!(deploy_sh, " {}", service.image)?;
+         for arg in trailing_args {
+             write!(deploy_sh, " {}", arg)?;
          }
          writeln!(deploy_sh)?;
     }

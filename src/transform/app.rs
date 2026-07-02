@@ -227,10 +227,9 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         .map(|s| parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
 
-     let command = yaml.command.map(|c| match c {
-        ServiceCommandYaml::Shell(s) => ServiceCommand::Shell(s),
-        ServiceCommandYaml::Exec(v) => ServiceCommand::Exec(v),
-    });
+     let command = yaml.command.map(convert_service_command);
+     let entrypoint = yaml.entrypoint.map(convert_service_command);
+     let healthcheck = yaml.healthcheck.map(convert_healthcheck).transpose()?;
 
     Ok(ServiceSpec {
         name,
@@ -242,7 +241,35 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         ports,
         volumes,
         command,
+        entrypoint,
+        healthcheck,
         is_app_service,
+    })
+}
+
+fn convert_service_command(c: ServiceCommandYaml) -> ServiceCommand {
+    match c {
+        ServiceCommandYaml::Shell(s) => ServiceCommand::Shell(s),
+        ServiceCommandYaml::Exec(v) => ServiceCommand::Exec(v),
+    }
+}
+
+fn convert_healthcheck(yaml: HealthcheckYaml) -> Result<Healthcheck> {
+    let disable = yaml.disable.unwrap_or(false);
+    let test = match yaml.test {
+        Some(HealthcheckTestYaml::Shell(s)) => HealthcheckTest::Shell(s),
+        Some(HealthcheckTestYaml::Exec(v)) => HealthcheckTest::Exec(v),
+        // `test` may be omitted only when the check is being disabled.
+        None if disable => HealthcheckTest::Exec(vec!["NONE".to_string()]),
+        None => return Err(anyhow!("healthcheck requires a 'test' unless 'disable: true' is set")),
+    };
+    Ok(Healthcheck {
+        test,
+        interval: yaml.interval,
+        timeout: yaml.timeout,
+        retries: yaml.retries,
+        start_period: yaml.start_period,
+        disable,
     })
 }
 
