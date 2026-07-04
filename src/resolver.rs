@@ -55,7 +55,11 @@ pub fn resolve(
     for secret_spec in &deployment.secrets {
         let value = match &secret_spec.source {
             DeploymentSecretSource::EnvVariable(var_name) => {
-                env::var(var_name).context(format!("Secret environment variable {} not set", var_name))?
+                let value = env::var(var_name).context(format!("Secret environment variable {} not set", var_name))?;
+                if value.is_empty() {
+                    return Err(anyhow!("Secret environment variable {} is empty", var_name));
+                }
+                value
             }
             DeploymentSecretSource::FilePath(path_str) => {
                 let path = Path::new(path_str);
