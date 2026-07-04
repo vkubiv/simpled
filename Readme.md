@@ -360,6 +360,20 @@ Set `disable: true` (or `test: ["NONE"]`) to turn a healthcheck off.
 
 The check is emitted as `healthcheck:` in docker-compose, as `--health-*` flags in the `docker run` script, and as both a `livenessProbe` and a `readinessProbe` in Kubernetes. For Kubernetes the durations are converted to whole seconds (`interval` → `periodSeconds`, `timeout` → `timeoutSeconds`, `retries` → `failureThreshold`, `start_period` → `initialDelaySeconds`).
 
+## Expose
+
+The `expose:` field lists ports the container listens on internally, same as docker-compose `expose`. Unlike `ports:` (which publishes `host:container` to the host), `expose` only makes a port reachable by other services on the same network:
+
+```yaml
+extra_services:
+  postgres:
+    image: postgres:16
+    expose:
+      - "5432"   # reachable by other services, not published to the host
+```
+
+It is emitted as `expose:` in docker-compose and as `--expose` in the `docker run` script. It is a no-op for Kubernetes, where in-cluster reachability is provided by the generated `Service` (from `ports:`) rather than by declaring the port on the container.
+
 ## Defining environments
 
 The Environment is defined in `envspec.yaml` (for Kubernetes and Docker environments) or `localenv.yaml` (for local development).

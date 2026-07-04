@@ -212,6 +212,7 @@ pub fn resolve(
             configs: service_configs,
             secrets: service_secrets,
             volumes: app_service.volumes.clone(),
+            expose: app_service.expose.clone(),
             command: app_service.command.clone(),
             entrypoint: app_service.entrypoint.clone(),
             healthcheck: app_service.healthcheck.clone(),

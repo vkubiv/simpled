@@ -101,7 +101,13 @@ fn generate_standalone(
          for port in &service.ports {
              write!(deploy_sh, " -p {}:{}", port.external, port.internal)?;
          }
-         
+
+         // `expose` declares internal-only ports (reachable by other containers
+         // on the network but not published to the host).
+         for port in &service.expose {
+             write!(deploy_sh, " --expose {}", port)?;
+         }
+
          write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
          
          for secret in &service.secrets {

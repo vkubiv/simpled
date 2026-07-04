@@ -17,7 +17,9 @@
       "PowerShell(.\\\\target\\\\debug\\\\simpled.exe update --help)",
       "Bash(cargo test *)",
       "PowerShell(cargo build *)",
-      "PowerShell(cargo test *)"
+      "PowerShell(cargo test *)",
+      "Bash(cp ../hc/appspec.yaml .)",
+      "Bash(\"D:\\\\С\\\\apps\\\\simpled\\\\target\\\\debug\\\\simpled.exe\" prepare-deployment *)"
     ]
   }
 }

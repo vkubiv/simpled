@@ -53,6 +53,8 @@ pub struct ServiceSpecYaml {
     pub configs: Option<Vec<HashMap<String, String>>>,
     pub secrets: Option<Vec<ServiceSecretYaml>>,
     pub ports: Option<Vec<String>>,
+    // Internal-only ports, same as docker-compose `expose`.
+    pub expose: Option<Vec<String>>,
     pub volumes: Option<Vec<String>>,
     // Overrides the image's default command, same as docker-compose `command`.
     pub command: Option<ServiceCommandYaml>,

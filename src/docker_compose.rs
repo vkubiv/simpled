@@ -28,6 +28,8 @@ pub struct DockerService {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
@@ -185,6 +187,7 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
         command: service.command.clone(),
         healthcheck: service.healthcheck.clone(),
         ports,
+        expose: service.expose.clone(),
         volumes,
         env_file: vec![format!("./{}/.env", service.full_name)],
         environment,

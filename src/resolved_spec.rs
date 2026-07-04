@@ -72,6 +72,9 @@ pub struct ServiceResolvedSpec {
 
     pub ports: Vec<ServicePort>,
 
+    // Internal-only ports (not published to the host), same as docker-compose `expose`.
+    pub expose: Vec<String>,
+
     pub volumes: Vec<ServiceVolume>,
 
     // Overrides the image's default command, same as docker-compose `command`.

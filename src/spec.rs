@@ -89,6 +89,8 @@ pub struct ServiceSpec {
     pub configs: Vec<ServiceConfigOption>,
     pub secrets: Vec<ServiceSecret>,
     pub ports: Vec<ServicePort>,
+    // Internal-only ports (not published to the host), same as docker-compose `expose`.
+    pub expose: Vec<String>,
     pub volumes: Vec<ServiceVolume>,
     // Overrides the image's default command, same as docker-compose `command`.
     pub command: Option<ServiceCommand>,

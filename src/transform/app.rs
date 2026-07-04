@@ -223,6 +223,8 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
 
     let ports = super::parse_ports(&yaml.ports)?;
 
+    let expose = yaml.expose.unwrap_or_default();
+
     let volumes = yaml.volumes.unwrap_or_default().into_iter()
         .map(|s| parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
@@ -239,6 +241,7 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         configs,
         secrets,
         ports,
+        expose,
         volumes,
         command,
         entrypoint,
