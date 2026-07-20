@@ -25,8 +25,17 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
     let ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
     let registry = yaml.registry.unwrap_or_default();
 
+    // Resolve `extends` inheritance before anything inspects the deployments, so
+    // every downstream check (secrets_folder, working_dir, ...) sees the fully
+    // merged spec. Abstract deployments are templates only and are dropped here.
+    let resolved = resolve_extends(&yaml.deployments)?;
+    let concrete: HashMap<String, DeploymentSpecYaml> = resolved
+        .into_iter()
+        .filter(|(_, dep)| dep.is_abstract != Some(true))
+        .collect();
+
     let mut deployments = Vec::new();
-    for (name, dep) in &yaml.deployments {
+    for (name, dep) in &concrete {
         deployments.push(convert_deployment(name.clone(), dep, root, &env_type_yaml)?);
     }
 
@@ -38,10 +47,10 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for K8S environment"));
             }
-            if yaml.deployments.values().any(|d| d.secrets_folder.is_some()) {
+            if concrete.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for K8S environment"));
             }
-            if any_service_has_working_dir(&yaml.deployments) {
+            if any_service_has_working_dir(&concrete) {
                 return Err(anyhow!("working_dir cannot be set for K8S environment"));
             }
             DeploymentEnvType::K8S
@@ -53,10 +62,10 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                 Some("traefik") | None => DockerIngressType::Traefik,
                 Some(other) => return Err(anyhow!("Unknown ingress type: {}", other)),
             };
-            if yaml.deployments.values().any(|d| d.secrets_folder.is_some()) {
+            if concrete.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for Docker environment"));
             }
-            if any_service_has_working_dir(&yaml.deployments) {
+            if any_service_has_working_dir(&concrete) {
                 return Err(anyhow!("working_dir cannot be set for Docker environment"));
             }
             DeploymentEnvType::Docker(DockerSpecificSpec {
@@ -113,6 +122,144 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
         registry,
         deployments,
     })
+}
+
+/// Resolves `extends` inheritance for every deployment, returning a map of fully
+/// merged specs keyed by the original names. Chains of `extends` are followed and
+/// cycles are reported as errors.
+fn resolve_extends(
+    raw: &HashMap<String, DeploymentSpecYaml>,
+) -> Result<HashMap<String, DeploymentSpecYaml>> {
+    let mut resolved: HashMap<String, DeploymentSpecYaml> = HashMap::new();
+    for name in raw.keys() {
+        resolve_deployment(name, raw, &mut resolved, &mut Vec::new())?;
+    }
+    Ok(resolved)
+}
+
+fn resolve_deployment(
+    name: &str,
+    raw: &HashMap<String, DeploymentSpecYaml>,
+    resolved: &mut HashMap<String, DeploymentSpecYaml>,
+    stack: &mut Vec<String>,
+) -> Result<DeploymentSpecYaml> {
+    if let Some(done) = resolved.get(name) {
+        return Ok(done.clone());
+    }
+    if stack.iter().any(|n| n == name) {
+        stack.push(name.to_string());
+        return Err(anyhow!("Cyclic 'extends' chain in deployments: {}", stack.join(" -> ")));
+    }
+
+    let dep = raw
+        .get(name)
+        .ok_or_else(|| anyhow!("Deployment '{}' extends unknown deployment '{}'", stack.last().map(|s| s.as_str()).unwrap_or(name), name))?;
+
+    let merged = match &dep.extends {
+        Some(base_name) => {
+            stack.push(name.to_string());
+            let base = resolve_deployment(base_name, raw, resolved, stack)?;
+            stack.pop();
+            let mut merged = merge_deployment(&base, dep);
+            // The merged spec is standalone; keeping `extends` would be misleading.
+            merged.extends = None;
+            merged
+        }
+        None => dep.clone(),
+    };
+
+    resolved.insert(name.to_string(), merged.clone());
+    Ok(merged)
+}
+
+/// Merges a child deployment onto its already-resolved base. Scalar fields fall
+/// back to the base when the child leaves them unset; map fields are unioned with
+/// the child's entries winning on key conflicts.
+fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> DeploymentSpecYaml {
+    DeploymentSpecYaml {
+        extends: child.extends.clone(),
+        // Abstractness is a property of the deployment itself, never inherited.
+        is_abstract: child.is_abstract,
+        primary_host: child.primary_host.clone().or_else(|| base.primary_host.clone()),
+        application: merge_application(base.application.as_ref(), child.application.as_ref()),
+        environment: child.environment.clone().or_else(|| base.environment.clone()),
+        undockerized_environment: child
+            .undockerized_environment
+            .clone()
+            .or_else(|| base.undockerized_environment.clone()),
+        configs: merge_opt_map(base.configs.as_ref(), child.configs.as_ref(), |_, c| c.clone()),
+        secrets: merge_opt_map(base.secrets.as_ref(), child.secrets.as_ref(), |_, c| c.clone()),
+        defaults: child.defaults.clone().or_else(|| base.defaults.clone()),
+        services: merge_opt_map(base.services.as_ref(), child.services.as_ref(), merge_service),
+        secrets_folder: child.secrets_folder.clone().or_else(|| base.secrets_folder.clone()),
+    }
+}
+
+/// Unions two optional maps. Keys present in both are combined with `combine`,
+/// which receives the base and child values in that order.
+fn merge_opt_map<V: Clone>(
+    base: Option<&HashMap<String, V>>,
+    child: Option<&HashMap<String, V>>,
+    combine: impl Fn(&V, &V) -> V,
+) -> Option<HashMap<String, V>> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(c)) => Some(c.clone()),
+        (Some(b), Some(c)) => {
+            let mut out = b.clone();
+            for (k, cv) in c {
+                let merged = match out.get(k) {
+                    Some(bv) => combine(bv, cv),
+                    None => cv.clone(),
+                };
+                out.insert(k.clone(), merged);
+            }
+            Some(out)
+        }
+    }
+}
+
+fn merge_application(
+    base: Option<&DeploymentAppSpecYaml>,
+    child: Option<&DeploymentAppSpecYaml>,
+) -> Option<DeploymentAppSpecYaml> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(c)) => Some(c.clone()),
+        (Some(b), Some(c)) => Some(DeploymentAppSpecYaml {
+            name: c.name.clone(),
+            version: c.version.clone().or_else(|| b.version.clone()),
+            extra: match (&b.extra, &c.extra) {
+                (Some(be), Some(ce)) => {
+                    let mut v = be.clone();
+                    v.extend(ce.clone());
+                    Some(v)
+                }
+                (Some(be), None) => Some(be.clone()),
+                (None, ce) => ce.clone(),
+            },
+        }),
+    }
+}
+
+/// Field-wise merge of a per-service override; the child wins on any field it sets.
+fn merge_service(
+    base: &DeploymentServiceSpecYaml,
+    child: &DeploymentServiceSpecYaml,
+) -> DeploymentServiceSpecYaml {
+    DeploymentServiceSpecYaml {
+        variant: child.variant.clone().or_else(|| base.variant.clone()),
+        host: child.host.clone().or_else(|| base.host.clone()),
+        prefix: child.prefix.clone().or_else(|| base.prefix.clone()),
+        strip_prefix: child.strip_prefix.or(base.strip_prefix),
+        prefixes: merge_opt_map(base.prefixes.as_ref(), child.prefixes.as_ref(), |_, c| c.clone()),
+        replicas: child.replicas.or(base.replicas),
+        resources: child.resources.clone().or_else(|| base.resources.clone()),
+        ports: child.ports.clone().or_else(|| base.ports.clone()),
+        working_dir: child.working_dir.clone().or_else(|| base.working_dir.clone()),
+    }
 }
 
 fn any_service_has_working_dir(deployments: &HashMap<String, DeploymentSpecYaml>) -> bool {
@@ -197,7 +344,13 @@ fn convert_env_entry(entry: &EnvVariableEntryYaml, root: &Path) -> Result<spec::
 
 fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_type: &DeploymentEnvTypeYaml) -> Result<DeploymentSpec> {
     let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
-    let application = convert_deployment_app(&yaml.application)?;
+    let primary_host = yaml.primary_host.clone().ok_or_else(|| {
+        anyhow!("Deployment '{}' is missing required field 'primary_host'", name)
+    })?;
+    let application_yaml = yaml.application.as_ref().ok_or_else(|| {
+        anyhow!("Deployment '{}' is missing required field 'application'", name)
+    })?;
+    let application = convert_deployment_app(application_yaml)?;
     let environment = convert_env_variables(&yaml.environment, root)?;
     let mut undockerized_environment = convert_env_variables(&yaml.undockerized_environment, root)?;
 
@@ -308,7 +461,7 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_
     };
 
     Ok(DeploymentSpec {
-        primary_host: yaml.primary_host.clone(),
+        primary_host,
         name,
         application,
         environment,
@@ -505,5 +658,162 @@ deployments:
         let vars = undockerized(&spec);
         assert_eq!(vars.len(), 2);
         assert_eq!(vars.iter().find(|v| v.name == "DB_HOST").unwrap().value, "docker-db");
+    }
+
+    fn deployments_map(raw: &str) -> HashMap<String, DeploymentSpecYaml> {
+        serde_yaml::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn extends_inherits_scalars_and_merges_maps() {
+        let raw = r#"
+base:
+  abstract: true
+  primary_host: web
+  application:
+    name: app
+    version: ^1.0.0
+  configs:
+    shared: ./shared
+  services:
+    api:
+      host: web
+      prefix: /
+      replicas: 2
+child:
+  extends: base
+  configs:
+    child_only: ./child
+  services:
+    api:
+      replicas: 5
+    worker:
+      host: web
+"#;
+        let resolved = resolve_extends(&deployments_map(raw)).unwrap();
+        let child = &resolved["child"];
+
+        // Scalar fields fall back to the base.
+        assert_eq!(child.primary_host.as_deref(), Some("web"));
+        assert_eq!(child.application.as_ref().unwrap().name, "app");
+
+        // Map fields are unioned.
+        let configs = child.configs.as_ref().unwrap();
+        assert_eq!(configs.len(), 2);
+        assert!(configs.contains_key("shared") && configs.contains_key("child_only"));
+
+        // Services merge field-wise on key conflicts and add new keys.
+        let services = child.services.as_ref().unwrap();
+        let api = &services["api"];
+        assert_eq!(api.host.as_deref(), Some("web")); // inherited from base
+        assert_eq!(api.replicas, Some(5)); // overridden by child
+        assert!(services.contains_key("worker"));
+
+        // The resolved spec is standalone.
+        assert!(child.extends.is_none());
+    }
+
+    #[test]
+    fn extends_chain_is_followed() {
+        let raw = r#"
+grandparent:
+  abstract: true
+  primary_host: web
+  application:
+    name: app
+parent:
+  abstract: true
+  extends: grandparent
+  defaults:
+    replicas: 4
+child:
+  extends: parent
+"#;
+        let resolved = resolve_extends(&deployments_map(raw)).unwrap();
+        let child = &resolved["child"];
+        assert_eq!(child.primary_host.as_deref(), Some("web"));
+        assert_eq!(child.application.as_ref().unwrap().name, "app");
+        assert_eq!(child.defaults.as_ref().unwrap().replicas, Some(4));
+    }
+
+    #[test]
+    fn extends_cycle_is_rejected() {
+        let raw = r#"
+a:
+  extends: b
+b:
+  extends: a
+"#;
+        let err = resolve_extends(&deployments_map(raw)).unwrap_err().to_string();
+        assert!(err.contains("Cyclic"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn extends_unknown_base_is_rejected() {
+        let raw = r#"
+a:
+  extends: nope
+  primary_host: web
+"#;
+        let err = resolve_extends(&deployments_map(raw)).unwrap_err().to_string();
+        assert!(err.contains("unknown deployment"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn abstract_base_is_not_deployed_and_children_inherit() {
+        let raw = r#"
+type: k8s
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    disable: true
+deployments:
+  base:
+    abstract: true
+    application:
+      name: app
+    defaults:
+      replicas: 3
+  prod:
+    extends: base
+    primary_host: web
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+
+        // The abstract template is not itself deployed.
+        assert_eq!(spec.deployments.len(), 1);
+        let prod = &spec.deployments[0];
+        assert_eq!(prod.name, "prod");
+        assert_eq!(prod.primary_host, "web");
+        // Fields inherited from the abstract base.
+        assert_eq!(prod.application.name, "app");
+        assert_eq!(prod.defaults.replicas, 3);
+    }
+
+    #[test]
+    fn missing_required_field_after_merge_is_rejected() {
+        // `prod` inherits nothing that supplies primary_host, so conversion fails.
+        let raw = r#"
+type: k8s
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    disable: true
+deployments:
+  base:
+    abstract: true
+    application:
+      name: app
+  prod:
+    extends: base
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
+        assert!(err.contains("primary_host"), "unexpected error: {err}");
     }
 }

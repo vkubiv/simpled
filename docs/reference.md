@@ -344,8 +344,10 @@ deployments:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `primary_host` | string | yes | Gateway host alias used as the base URL for `relative` environment variables. |
-| `application` | object | yes | App name, version constraint, and optional extra service files. |
+| `extends` | string | no | Name of another deployment to inherit from. See [extends](#extends). |
+| `abstract` | bool | no | If `true`, this deployment is a template used only as an `extends` base and is not deployed itself. See [extends](#extends). |
+| `primary_host` | string | yes¹ | Gateway host alias used as the base URL for `relative` environment variables. |
+| `application` | object | yes¹ | App name, version constraint, and optional extra service files. |
 | `environment` | string | no | Path to a `.env` file with variable values. |
 | `undockerized_environment` | string | no | Path to a `.env` file for services running outside Docker. See [undockerized_environment](#undockerized_environment). |
 | `configs` | map | no | Maps config names to directories containing the config files. |
@@ -353,6 +355,45 @@ deployments:
 | `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
 | `defaults` | object | no | Default replica count and resource limits applied to all services. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
+
+¹ Required unless supplied by an `extends` base, or omitted on an `abstract` template.
+
+#### extends
+
+A deployment may inherit from another deployment in the same env spec with `extends`. This keeps shared configuration in one place when several deployments (e.g. `staging` and `prod`) differ only in a few fields.
+
+Merge rules, applied to the base (the deployment named by `extends`) and the child (the deployment declaring it):
+
+- **Scalar fields** (`primary_host`, `application`, `environment`, `undockerized_environment`, `defaults`, `secrets_folder`) are taken from the base unless the child sets them, in which case the child's value replaces the base's entirely.
+- **Map fields** (`configs`, `secrets`, `services`) are unioned. Keys that appear only in the base or only in the child are kept as-is; a key present in both takes the child's value. For `services`, a shared key is merged field-by-field, so a child can override just `replicas` on a service while inheriting its `host`, `prefix`, and `resources` from the base.
+
+`extends` chains are followed to any depth, and cycles are rejected with an error.
+
+Mark a deployment `abstract: true` to use it purely as a template. Abstract deployments are never deployed and may omit fields that are otherwise required (such as `primary_host`), so a base can hold only the fields worth sharing.
+
+```yaml
+deployments:
+  common:
+    abstract: true                # template only, not deployed
+    application:
+      name: myapp
+      version: ^1.0.0
+    defaults:
+      replicas: 2
+    services:
+      api:
+        host: web
+        prefix: /
+  staging:
+    extends: common
+    primary_host: staging
+  prod:
+    extends: common
+    primary_host: web
+    services:
+      api:
+        replicas: 5               # inherits host/prefix from common, overrides replicas
+```
 
 #### application
 
