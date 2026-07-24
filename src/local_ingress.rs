@@ -36,81 +36,86 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
         };
 
         rt.block_on(async move {
-            let mut handles = vec![];
+            use std::collections::BTreeMap;
 
-            for domain in &spec.domains {
-                // domain can be "hostname" or "hostname:port"
-                let (_host, port_str) = if let Some((h, p)) = domain.rsplit_once(':') {
-                    (h, p)
-                } else {
-                    (domain.as_str(), "80")
-                };
+            // A local run binds real sockets on the host, and a port can only be
+            // bound once. The same listen port, however, can be referenced by
+            // several ingress domains: the same "hostname:port" may be declared
+            // under multiple host groups, and distinct hostnames can share a port
+            // (e.g. everything on :80). We therefore group every matching service
+            // rule by its listen port and build a single merged router per port,
+            // instead of binding once per domain entry (which double-binds).
+            //
+            // The value tracks whether a root ("/") fallback has already been
+            // claimed for that port, since two root routes cannot coexist in one
+            // router.
+            let mut routers: BTreeMap<u16, (Router, bool)> = BTreeMap::new();
 
-                let port = port_str.parse::<u16>().unwrap_or(80);
+            for rule in &spec.rules {
+                // domain_name can be "hostname" or "hostname:port".
+                let port = rule
+                    .domain_name
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .unwrap_or(80);
 
-                let mut app = Router::new();
-                let mut rules_found = false;
-                let mut root_fallback_set = false;
-
-                for rule in &spec.rules {
-                    // Match rules for this domain
-                    if &rule.domain_name == domain {
-                        for svc in &rule.services {
-                            // Only route to services of the deployment being run locally.
-                            if svc.deployment_name != current_deployment {
-                                continue;
-                            }
-
-                            if is_root_prefix(&svc.prefix) {
-                                if root_fallback_set {
-                                    eprintln!(
-                                        "Local ingress misconfiguration on {}: multiple services map to the root path '/' for deployment '{}'",
-                                        domain, current_deployment
-                                    );
-                                    process::exit(1);
-                                }
-                                root_fallback_set = true;
-                            }
-
-                            rules_found = true;
-
-                            let mut target = format!("http://{}:{}", "localhost", svc.port);
-
-                            if !svc.strip_prefix {
-                                if !svc.prefix.starts_with('/') {
-                                    target.push('/');
-                                }
-                                target.push_str(&svc.prefix);
-                                if !svc.prefix.ends_with('/') {
-                                    target.push('/');
-                                }
-                            }
-
-                            let path = svc.prefix.clone();
-
-                            let proxy = ReverseProxy::new(&path, &target);
-
-                            app = app.merge(proxy);
-                        }
+                for svc in &rule.services {
+                    // Only route to services of the deployment being run locally.
+                    if svc.deployment_name != current_deployment {
+                        continue;
                     }
-                }
 
-                if rules_found {
-                    let bind_addr = format!("0.0.0.0:{}", port);
-                    match tokio::net::TcpListener::bind(&bind_addr).await {
-                        Ok(listener) => {
-                            println!("Local ingress listening on {}", bind_addr);
-                            handles.push(tokio::spawn(async move {
-                                if let Err(e) = axum::serve(listener, app).await {
-                                    eprintln!("Error serving ingress on {}: {}", bind_addr, e);
-                                    process::exit(1);
-                                }
-                            }));
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to bind local ingress on {}: {}", bind_addr, e);
+                    let entry = routers.entry(port).or_insert_with(|| (Router::new(), false));
+                    let (app, root_fallback_set) = entry;
+
+                    if is_root_prefix(&svc.prefix) {
+                        if *root_fallback_set {
+                            eprintln!(
+                                "Local ingress misconfiguration on port {}: multiple services map to the root path '/' for deployment '{}'",
+                                port, current_deployment
+                            );
                             process::exit(1);
                         }
+                        *root_fallback_set = true;
+                    }
+
+                    let mut target = format!("http://{}:{}", "localhost", svc.port);
+
+                    if !svc.strip_prefix {
+                        if !svc.prefix.starts_with('/') {
+                            target.push('/');
+                        }
+                        target.push_str(&svc.prefix);
+                        if !svc.prefix.ends_with('/') {
+                            target.push('/');
+                        }
+                    }
+
+                    let proxy = ReverseProxy::new(&svc.prefix, &target);
+
+                    // `merge` consumes and returns the router, so swap the stored
+                    // one out to fold the new proxy into it.
+                    *app = std::mem::take(app).merge(proxy);
+                }
+            }
+
+            let mut handles = vec![];
+
+            for (port, (app, _)) in routers {
+                let bind_addr = format!("0.0.0.0:{}", port);
+                match tokio::net::TcpListener::bind(&bind_addr).await {
+                    Ok(listener) => {
+                        println!("Local ingress listening on {}", bind_addr);
+                        handles.push(tokio::spawn(async move {
+                            if let Err(e) = axum::serve(listener, app).await {
+                                eprintln!("Error serving ingress on {}: {}", bind_addr, e);
+                                process::exit(1);
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to bind local ingress on {}: {}", bind_addr, e);
+                        process::exit(1);
                     }
                 }
             }
