@@ -244,7 +244,14 @@ fn generate_ingress(
     if let Some(tls) = &resolved_spec.ingress.tls {
         writeln!(file, "  tls:")?;
         writeln!(file, "  - hosts:")?;
+        // The same domain can be declared under multiple host groups, so
+        // `ingress.domains` may contain duplicates; emit each host only once.
+        let mut seen_hosts: Vec<&String> = Vec::new();
         for domain in &resolved_spec.ingress.domains {
+            if seen_hosts.contains(&domain) {
+                continue;
+            }
+            seen_hosts.push(domain);
             writeln!(file, "    - {}", domain)?;
         }
         if let Some(secret) = &tls.secret {
@@ -256,12 +263,31 @@ fn generate_ingress(
     
     writeln!(file, "  rules:")?;
 
+    // The same domain can be declared under multiple host groups, producing
+    // several rules with the same domain_name. Emit one `- host:` entry per
+    // domain with all of its services merged, rather than repeating the host.
+    // `domains` preserves first-seen order.
+    let mut domains: Vec<&String> = Vec::new();
+    let mut services_by_domain: std::collections::HashMap<
+        &String,
+        Vec<&crate::resolved_spec::IngressToServiceRule>,
+    > = std::collections::HashMap::new();
     for rule in &resolved_spec.ingress.rules {
-        writeln!(file, "  - host: {}", rule.domain_name)?;
+        if !services_by_domain.contains_key(&rule.domain_name) {
+            domains.push(&rule.domain_name);
+        }
+        services_by_domain
+            .entry(&rule.domain_name)
+            .or_default()
+            .extend(rule.services.iter());
+    }
+
+    for domain in domains {
+        writeln!(file, "  - host: {}", domain)?;
         writeln!(file, "    http:")?;
         writeln!(file, "      paths:")?;
-        
-        for svc_rule in &rule.services {
+
+        for svc_rule in &services_by_domain[domain] {
              let path = if svc_rule.strip_prefix {
                  let trimmed = svc_rule.prefix.trim_end_matches('/');
                  format!("{}(/|$)(.*)", trimmed)

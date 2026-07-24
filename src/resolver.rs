@@ -298,6 +298,35 @@ pub fn resolve(
         }
     }
 
+    // Guard against ambiguous ingress routing: within a single domain, two
+    // services mapping to the same path prefix cannot be disambiguated by a
+    // host-based ingress (nginx/traefik/k8s) or the local gateway, so one route
+    // would silently shadow the other. The same domain can be spread across
+    // several rules (declared under multiple host groups), so aggregate the
+    // prefixes by domain across all rules. Prefixes are normalized so that "",
+    // "/", and a trailing-slash variant all compare equal.
+    let normalize_prefix = |prefix: &str| -> String {
+        if prefix.is_empty() || prefix == "/" {
+            "/".to_string()
+        } else {
+            prefix.trim_end_matches('/').to_string()
+        }
+    };
+    let mut seen_prefixes: HashMap<&str, HashMap<String, (&str, &str)>> = HashMap::new();
+    for rule in &ingress_rules {
+        let domain_prefixes = seen_prefixes.entry(rule.domain_name.as_str()).or_default();
+        for svc in &rule.services {
+            let normalized = normalize_prefix(&svc.prefix);
+            if let Some((prev_dep, prev_svc)) = domain_prefixes.get(&normalized) {
+                return Err(anyhow!(
+                    "Ingress misconfiguration: domain '{}' maps path '{}' to multiple services ('{}/{}' and '{}/{}'); each domain and path must route to exactly one service",
+                    rule.domain_name, normalized, prev_dep, prev_svc, svc.deployment_name, svc.service_name
+                ));
+            }
+            domain_prefixes.insert(normalized, (svc.deployment_name.as_str(), svc.service_name.as_str()));
+        }
+    }
+
     let tls = if let Some(tls_spec) = &env_spec.ingress.tls {
         let le_resolved = if let Some(le) = &tls_spec.letsencrypt {
              Some(LetsEncryptResolvedSpec {

@@ -403,14 +403,34 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
 
 fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<()> {
     let mut file = File::create(path)?;
-    
+
     let has_tls = ingress.tls.is_some();
-    
+
+    // The same domain can be declared under multiple host groups, producing
+    // several rules with the same domain_name. nginx treats repeated server
+    // blocks with the same server_name as a conflict and silently ignores all
+    // but the first, dropping those routes, so merge every rule's services under
+    // a single server block per domain. `domains` preserves first-seen order.
+    let mut domains: Vec<&String> = Vec::new();
+    let mut services_by_domain: HashMap<&String, Vec<&crate::resolved_spec::IngressToServiceRule>> =
+        HashMap::new();
     for rule in &ingress.rules {
+        if !services_by_domain.contains_key(&rule.domain_name) {
+            domains.push(&rule.domain_name);
+        }
+        services_by_domain
+            .entry(&rule.domain_name)
+            .or_default()
+            .extend(rule.services.iter());
+    }
+
+    for domain in domains {
+        let services = &services_by_domain[domain];
+
         writeln!(file, "server {{")?;
         writeln!(file, "    listen 80;")?;
-        writeln!(file, "    server_name {};", rule.domain_name)?;
-        
+        writeln!(file, "    server_name {};", domain)?;
+
         if let Some(tls) = &ingress.tls {
             if tls.letsencrypt.is_some() {
                 writeln!(file, "    location /.well-known/acme-challenge/ {{")?;
@@ -418,34 +438,37 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
                 writeln!(file, "    }}")?;
             }
         }
-        
+
         if has_tls {
             writeln!(file, "    location / {{")?;
             writeln!(file, "        return 301 https://$host$request_uri;")?;
             writeln!(file, "    }}")?;
             writeln!(file, "}}")?;
-            
+
             writeln!(file, "server {{")?;
             writeln!(file, "    listen 443 ssl;")?;
-            writeln!(file, "    server_name {};", rule.domain_name)?;
-            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", rule.domain_name)?;
-            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", rule.domain_name)?;
-            
-            generate_locations(&mut file, rule)?;
-            
+            writeln!(file, "    server_name {};", domain)?;
+            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", domain)?;
+            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", domain)?;
+
+            generate_locations(&mut file, services)?;
+
             writeln!(file, "}}")?;
-            
+
         } else {
-            generate_locations(&mut file, rule)?;
+            generate_locations(&mut file, services)?;
             writeln!(file, "}}")?;
         }
     }
-    
+
     Ok(())
 }
 
-fn generate_locations(file: &mut File, rule: &crate::resolved_spec::IngressRule) -> Result<()> {
-    for svc in &rule.services {
+fn generate_locations(
+    file: &mut File,
+    services: &[&crate::resolved_spec::IngressToServiceRule],
+) -> Result<()> {
+    for svc in services {
         let prefix = &svc.prefix;
         let location_path = if prefix.ends_with('/') {
             prefix.clone()
@@ -602,7 +625,11 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
     writeln!(file, "http:")?;
     
     let mut middlewares_written = false;
-     for rule in ingress.rules.iter() {
+     // The same domain can appear in more than one rule (e.g. declared under
+     // multiple host groups), so every generated name must include the rule
+     // index `i` in addition to the service index `j`; using only the domain and
+     // `j` would emit duplicate YAML keys that Traefik rejects.
+     for (i, rule) in ingress.rules.iter().enumerate() {
          let router_name_base = rule.domain_name.replace(".", "-");
          for (j, svc) in rule.services.iter().enumerate() {
              if svc.strip_prefix && svc.prefix != "/" {
@@ -610,7 +637,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
                      writeln!(file, "  middlewares:")?;
                      middlewares_written = true;
                  }
-                 writeln!(file, "    strip-{}-{}:", router_name_base, j)?;
+                 writeln!(file, "    strip-{}-{}-{}:", router_name_base, i, j)?;
                  writeln!(file, "      stripPrefix:")?;
                  writeln!(file, "        prefixes:")?;
                  writeln!(file, "          - \"{}\"", svc.prefix)?;
@@ -633,7 +660,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
              };
              
              writeln!(file, "      rule: \"Host(`{}`){}\"", rule.domain_name, path_rule)?;
-             writeln!(file, "      service: service-{}-{}", router_name_base, j)?;
+             writeln!(file, "      service: service-{}-{}-{}", router_name_base, i, j)?;
              
              if has_tls {
                  writeln!(file, "      entryPoints:")?;
@@ -649,16 +676,16 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
              
              if svc.strip_prefix && svc.prefix != "/" {
                   writeln!(file, "      middlewares:")?;
-                  writeln!(file, "        - strip-{}-{}", router_name_base, j)?;
+                  writeln!(file, "        - strip-{}-{}-{}", router_name_base, i, j)?;
              }
         }
     }
     
     writeln!(file, "  services:")?;
-    for rule in ingress.rules.iter() {
+    for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
         for (j, svc) in rule.services.iter().enumerate() {
-             writeln!(file, "    service-{}-{}:", router_name_base, j)?;
+             writeln!(file, "    service-{}-{}-{}:", router_name_base, i, j)?;
              writeln!(file, "      loadBalancer:")?;
              writeln!(file, "        servers:")?;
              writeln!(file, "          - url: \"http://{}_{}:{}/\"", svc.deployment_name,  svc.service_name, svc.port)?;
