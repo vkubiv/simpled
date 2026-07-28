@@ -81,6 +81,54 @@ jobs:
 
 After this runs, a GitHub Release is created (e.g. `v1.0.52`) containing `myapp.1.0.52.tar.gz`.
 
+### Building side branches
+
+Running the same job on a branch would overwrite the mainline images and collide on the release tag,
+because the version comes from `appspec.yaml` and does not change per branch. Add `--version-suffix`
+to label the build with its branch:
+
+```yaml
+on:
+  push:
+    branches: [main, 'feature/**']
+
+# ...
+
+      - name: Create and upload app bundle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUFFIX_ARG=""
+          if [ "${{ github.ref_name }}" != "main" ]; then
+            SUFFIX_ARG="--version-suffix ${{ github.ref_name }}"
+          fi
+
+          simpled app-bundle create \
+            --registry mycompany=${{ vars.CONTAINER_REGISTRY }} \
+            --push-images \
+            --upload-bundle-to github-release \
+            --github-repo ${{ github.repository }} \
+            $SUFFIX_ARG
+```
+
+A build of `feature/big-refactor` at `version: 1.0.52` then produces images tagged
+`1.0.52-feature-big-refactor`, a `myapp.1.0.52-feature-big-refactor.tar.gz` asset and a matching
+release tag, all beside the untouched `1.0.52` mainline artifacts. The slash is replaced
+automatically — no need to sanitize the branch name yourself.
+
+Deploy it to a test environment by passing that version; no extra flag is needed, since the bundle
+carries the suffix internally:
+
+```yaml
+          simpled prepare-deployment staging \
+            --download-bundle-from github-release \
+            --github-repo mycompany/myapp \
+            --app-version 1.0.52-feature-big-refactor
+```
+
+Deployments that pin a requirement (`version: "^1.0"` in `envspec.yaml`) keep accepting these
+bundles: the suffix is stored as semver build metadata, which version requirements ignore.
+
 ### Multi-architecture builds
 
 For ARM/AMD64 variants, use `docker buildx` with `--platform`:

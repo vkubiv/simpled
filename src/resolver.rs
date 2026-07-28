@@ -141,7 +141,7 @@ pub fn resolve(
              if let DeploymentEnvType::Local = env_spec.env_type {
                   raw_image = format!("{}:latest", raw_image);
              } else {
-                  raw_image = format!("{}:{}", raw_image, app_spec.version.to_string());
+                  raw_image = format!("{}:{}", raw_image, version_to_tag(&app_spec.version.to_string()));
              }
         }
 

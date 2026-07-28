@@ -123,6 +123,11 @@ enum AppBundleCommands {
         github_repo: Option<String>,
         #[arg(long)]
         github_tag_prefix: Option<String>,
+        /// Label appended to the app version for side-branch builds: `big-refactor` turns
+        /// 1.0.2 into 1.0.2+big-refactor, tagging images and the bundle 1.0.2-big-refactor.
+        /// Characters outside [A-Za-z0-9] are replaced with '-', so a branch name works as is.
+        #[arg(long)]
+        version_suffix: Option<String>,
     },
 }
 
@@ -148,8 +153,8 @@ fn main() -> Result<()> {
             AppBundleCommands::Version => {
                 version_command()?;
             }
-            AppBundleCommands::Create { registry, push_images, upload, upload_bundle_to, github_repo, github_tag_prefix } => {
-                app_bundle::create_app_bundle(registry, *push_images, upload, upload_bundle_to, github_repo, github_tag_prefix)?;
+            AppBundleCommands::Create { registry, push_images, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix } => {
+                app_bundle::create_app_bundle(registry, *push_images, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix)?;
             }
         },
         Commands::Secrets { command } => match command {

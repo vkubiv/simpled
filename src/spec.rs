@@ -1,6 +1,16 @@
 use std::collections::HashMap;
 use serde::Serialize;
 
+/// Renders a version for the places that cannot carry a `+`.
+///
+/// A side-branch version keeps its label as semver build metadata
+/// (`1.0.2+big-refactor`), but `+` is not legal in a docker tag and decodes to a space
+/// in a URL query parameter, so docker tags, bundle file names and release tags use `-`
+/// instead: `1.0.2-big-refactor`. Versions without build metadata are unchanged.
+pub fn version_to_tag(version: &str) -> String {
+    version.replace('+', "-")
+}
+
 #[derive(Debug, Clone)]
 pub struct AppSpec {
     pub name: String,

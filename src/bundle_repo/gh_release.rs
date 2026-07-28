@@ -21,9 +21,12 @@ struct Release {
 }
 
 pub fn download(repo: &str, ver: &str, app_name: &str, tag_prefix: Option<&str>) -> Result<String> {
+    // Release assets are named with the `-` form of the version, so accept either
+    // spelling of a side-branch version: `1.0.2+big-refactor` or `1.0.2-big-refactor`.
+    let ver = crate::spec::version_to_tag(ver);
     let filename = format!("{}.{}.tar.gz", app_name, ver);
     let tag = format!("{}{}", tag_prefix.unwrap_or(""), ver);
-    
+
     // Check GITHUB_TOKEN
     let token = env::var("GITHUB_TOKEN").context("GITHUB_TOKEN is not set. It is required for downloading releases.")?;
 

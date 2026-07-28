@@ -505,6 +505,42 @@ Options:
   --upload-bundle-to <TARGET>  Upload bundle: github-release
   --github-repo <OWNER/REPO>   GitHub repository
   --github-tag-prefix <PREFIX> Prefix for GitHub release tag
+  --version-suffix <SUFFIX>    Label appended to the app version (side branches)
+```
+
+#### Version suffix
+
+`--version-suffix` labels a bundle built from a side branch, so it does not collide
+with the mainline build of the same `appspec.yaml` version:
+
+```bash
+simpled app-bundle create --version-suffix big-refactor
+```
+
+For `version: 1.0.2` this produces version `1.0.2+big-refactor` and:
+
+| | Value |
+|---|---|
+| Image tags | `registry/myapp/api:1.0.2-big-refactor` |
+| Bundle file | `myapp.1.0.2-big-refactor.tar.gz` |
+| Release tag | `1.0.2-big-refactor` (after `--github-tag-prefix`) |
+| `version:` in the bundled appspec | `1.0.2+big-refactor` |
+
+The suffix is stored as semver build metadata, which version requirements ignore — a
+deployment pinned to `version: "^1.0"` still accepts the bundle. Because `+` is not a
+legal character in a docker tag, everything that is a tag or a file name uses `-`
+instead.
+
+`appspec.yaml` in your working tree is **not** modified; only the copy written into the
+bundle carries the suffixed version. That is what makes `prepare-deployment` resolve the
+suffixed image tags without needing the flag repeated — see below.
+
+A suffix may be any string; characters outside `[A-Za-z0-9]` are replaced with `-`, so a
+branch name can be passed through directly:
+
+```bash
+simpled app-bundle create --version-suffix "${{ github.ref_name }}"   # feature/big-refactor
+# -> 1.0.2+feature-big-refactor
 ```
 
 ### `simpled prepare-deployment`
@@ -523,6 +559,18 @@ Options:
 ```
 
 Must be run from the directory containing `envspec.yaml`.
+
+There is no `--version-suffix` here: a suffixed bundle carries its version internally, so
+pass the suffixed version to `--app-version` and the images resolve accordingly.
+
+```bash
+simpled prepare-deployment staging \
+  --download-bundle-from github-release \
+  --github-repo myorg/myapp \
+  --app-version 1.0.2-big-refactor
+```
+
+Either spelling of the version is accepted — `1.0.2-big-refactor` or `1.0.2+big-refactor`.
 
 Required environment variables for secrets with `env:` source must be set before running this command.
 

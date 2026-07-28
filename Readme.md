@@ -673,6 +673,27 @@ simpled app-bundle create \
   --github-repo mycompany/myapp
 ```
 
+## Bundles from side branches
+
+To build a branch without colliding with the mainline bundle of the same version, add `--version-suffix`:
+
+```bash
+simpled app-bundle create \
+  --registry mycompany=my-docker-registry.com \
+  --push-images \
+  --version-suffix big-refactor
+```
+
+For `version: 1.0.2` this tags images `mycompany/web-app:1.0.2-big-refactor` and writes
+`myapp.1.0.2-big-refactor.tar.gz`. The suffix is baked into the `appspec.yaml` inside the bundle (as
+semver build metadata, `1.0.2+big-refactor`), so deploying needs no extra flag — just pass the
+suffixed version. Your own `appspec.yaml` is left untouched.
+
+Any string works as a suffix; characters that are not letters or digits become `-`, so a branch name
+can be passed straight from CI: `--version-suffix "$GITHUB_REF_NAME"`.
+
+See [docs/reference.md](docs/reference.md#version-suffix) for details.
+
 # Deploy application
 
 Navigate into the folder with `envspec.yaml`. e.g. `deployments/prod`
