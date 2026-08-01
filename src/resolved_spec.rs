@@ -86,6 +86,9 @@ pub struct ServiceResolvedSpec {
     // Container health probe, same as docker-compose `healthcheck`.
     pub healthcheck: Option<Healthcheck>,
 
+    // full_names of the services that must be running before this one starts.
+    pub depends_on: Vec<String>,
+
     // local-only: working directory of a host-run (non-dockerized) service.
     // When set, undockerized env is written there as `.env` and secrets copied alongside.
     pub working_dir: Option<String>,
@@ -106,6 +109,100 @@ pub struct DeploymentResolvedSpec {
     pub defaults: ResourcesSpec,
     pub services: Vec<ServiceResolvedSpec>,
     pub volumes: Vec<String>,
+}
+
+impl DeploymentResolvedSpec {
+    /// Services that run to completion (`type: job`), in dependency order: a job
+    /// that depends on another job comes after it. Ties are broken by name so the
+    /// generated scripts are stable across runs.
+    pub fn jobs_in_order(&self) -> Vec<&ServiceResolvedSpec> {
+        let mut jobs: Vec<&ServiceResolvedSpec> = self.services.iter()
+            .filter(|s| matches!(s.service_type, ServiceType::Job))
+            .collect();
+        jobs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+
+        let mut ordered: Vec<&ServiceResolvedSpec> = Vec::new();
+        let mut placed: Vec<&str> = Vec::new();
+        for job in &jobs {
+            self.place_job(job, &jobs, &mut ordered, &mut placed);
+        }
+        ordered
+    }
+
+    fn place_job<'a>(
+        &'a self,
+        job: &'a ServiceResolvedSpec,
+        jobs: &[&'a ServiceResolvedSpec],
+        ordered: &mut Vec<&'a ServiceResolvedSpec>,
+        placed: &mut Vec<&'a str>,
+    ) {
+        if placed.contains(&job.full_name.as_str()) {
+            return;
+        }
+        // Marked before recursing so a cycle (rejected by the validator, but the
+        // generator must not hang on one) cannot loop forever.
+        placed.push(&job.full_name);
+        for dep in &job.depends_on {
+            if let Some(dep_job) = jobs.iter().find(|j| &j.full_name == dep) {
+                self.place_job(dep_job, jobs, ordered, placed);
+            }
+        }
+        ordered.push(job);
+    }
+
+    /// Long-running services (everything that is not a job), sorted by name.
+    pub fn long_running_services(&self) -> Vec<&ServiceResolvedSpec> {
+        let mut services: Vec<&ServiceResolvedSpec> = self.services.iter()
+            .filter(|s| !matches!(s.service_type, ServiceType::Job))
+            .collect();
+        services.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+        services
+    }
+
+    /// Long-running services that must be up before any job runs: the transitive
+    /// closure of `depends_on` over every job, with jobs themselves removed.
+    ///
+    /// A job that declares no `depends_on` is treated as depending on every
+    /// long-running service. Without that fallback, upgrading to phased deploys
+    /// would start running jobs before the database exists for specs written
+    /// before `depends_on` existed.
+    pub fn job_prerequisites(&self) -> Vec<&ServiceResolvedSpec> {
+        let jobs = self.jobs_in_order();
+        if jobs.is_empty() {
+            return Vec::new();
+        }
+
+        if jobs.iter().any(|j| j.depends_on.is_empty()) {
+            return self.long_running_services();
+        }
+
+        let mut needed: Vec<&str> = Vec::new();
+        for job in &jobs {
+            for dep in &job.depends_on {
+                self.collect_dependencies(dep, &mut needed);
+            }
+        }
+
+        let mut services: Vec<&ServiceResolvedSpec> = self.services.iter()
+            .filter(|s| !matches!(s.service_type, ServiceType::Job))
+            .filter(|s| needed.contains(&s.full_name.as_str()))
+            .collect();
+        services.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+        services
+    }
+
+    fn collect_dependencies<'a>(&'a self, name: &str, needed: &mut Vec<&'a str>) {
+        let Some(service) = self.services.iter().find(|s| s.full_name == name) else {
+            return;
+        };
+        if needed.contains(&service.full_name.as_str()) {
+            return;
+        }
+        needed.push(&service.full_name);
+        for dep in &service.depends_on {
+            self.collect_dependencies(dep, needed);
+        }
+    }
 }
 
 #[derive(Debug)]

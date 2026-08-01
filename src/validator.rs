@@ -97,6 +97,21 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         }
     }
 
+    // Validate `depends_on` references and reject dependency cycles. A cycle has
+    // no valid start order, and the deploy scripts walk these edges to decide what
+    // must be running before a job runs.
+    for service in app_spec.all_services() {
+        for dep in &service.depends_on {
+            if !available_services.contains(dep) {
+                return Err(anyhow!("Service {} depends on {} which is not defined in application", service.name, dep));
+            }
+        }
+    }
+
+    if let Some(cycle) = find_depends_on_cycle(app_spec) {
+        return Err(anyhow!("Dependency cycle in depends_on: {}", cycle.join(" -> ")));
+    }
+
     // Validate service environment variable references
     let mut app_defined_env_vars = HashSet::new();
     for env in &app_spec.environment.external {
@@ -120,4 +135,123 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     }
 
     Ok(())
+}
+
+/// Depth-first search over `depends_on` edges. Returns the services on the first
+/// cycle found (starting and ending on the same name), or `None` when the graph
+/// is acyclic.
+fn find_depends_on_cycle(app_spec: &AppSpec) -> Option<Vec<String>> {
+    let mut done: HashSet<&str> = HashSet::new();
+
+    for service in app_spec.all_services() {
+        // `path` doubles as the visit stack and as the reported cycle.
+        let mut path: Vec<&str> = Vec::new();
+        if let Some(cycle) = visit(&service.name, app_spec, &mut path, &mut done) {
+            return Some(cycle);
+        }
+    }
+
+    None
+}
+
+fn visit<'a>(
+    name: &'a str,
+    app_spec: &'a AppSpec,
+    path: &mut Vec<&'a str>,
+    done: &mut HashSet<&'a str>,
+) -> Option<Vec<String>> {
+    if done.contains(name) {
+        return None;
+    }
+    if let Some(pos) = path.iter().position(|n| *n == name) {
+        let mut cycle: Vec<String> = path[pos..].iter().map(|n| n.to_string()).collect();
+        cycle.push(name.to_string());
+        return Some(cycle);
+    }
+
+    path.push(name);
+    if let Some(service) = app_spec.all_services().find(|s| s.name == name) {
+        for dep in &service.depends_on {
+            if let Some(cycle) = visit(dep, app_spec, path, done) {
+                return Some(cycle);
+            }
+        }
+    }
+    path.pop();
+    done.insert(name);
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(name: &str, depends_on: &[&str]) -> ServiceSpec {
+        ServiceSpec {
+            name: name.to_string(),
+            service_type: ServiceType::Internal,
+            is_app_service: true,
+            image: ImageSpec::Exact(format!("org/{}", name)),
+            environment: vec![],
+            configs: vec![],
+            secrets: vec![],
+            ports: vec![],
+            expose: vec![],
+            volumes: vec![],
+            command: None,
+            entrypoint: None,
+            healthcheck: None,
+            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    fn app_spec(app_services: Vec<ServiceSpec>) -> AppSpec {
+        AppSpec {
+            name: "shop".to_string(),
+            version: semver::Version::new(1, 0, 0),
+            environment: AppEnvironment {
+                external: vec![], optional: vec![], relative: vec![], internal: vec![],
+            },
+            app_services,
+            extra_services: vec![],
+            configs: vec![],
+            secrets: vec![],
+            volumes: vec![],
+        }
+    }
+
+    #[test]
+    fn acyclic_dependencies_are_accepted() {
+        let spec = app_spec(vec![
+            service("api", &["migrate"]),
+            service("migrate", &["primary-db"]),
+            service("primary-db", &[]),
+        ]);
+        assert_eq!(find_depends_on_cycle(&spec), None);
+    }
+
+    #[test]
+    fn a_dependency_cycle_is_reported() {
+        let spec = app_spec(vec![
+            service("api", &["worker"]),
+            service("worker", &["api"]),
+        ]);
+        let cycle = find_depends_on_cycle(&spec).expect("cycle must be detected");
+        assert_eq!(cycle.first(), cycle.last());
+        assert!(cycle.contains(&"api".to_string()) && cycle.contains(&"worker".to_string()));
+    }
+
+    #[test]
+    fn a_diamond_is_not_a_cycle() {
+        // Both branches reach `primary-db`; revisiting a finished node must not
+        // look like a cycle.
+        let spec = app_spec(vec![
+            service("api", &["migrate", "cache-warm"]),
+            service("migrate", &["primary-db"]),
+            service("cache-warm", &["primary-db"]),
+            service("primary-db", &[]),
+        ]);
+        assert_eq!(find_depends_on_cycle(&spec), None);
+    }
 }

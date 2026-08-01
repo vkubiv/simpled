@@ -220,6 +220,7 @@ pub fn resolve(
             command: app_service.command.clone(),
             entrypoint: app_service.entrypoint.clone(),
             healthcheck: app_service.healthcheck.clone(),
+            depends_on: app_service.depends_on.clone(),
             ports: deployment_service_opt.map(|s|
                 s.ports.clone()
             ).unwrap_or(app_service.ports.clone()),

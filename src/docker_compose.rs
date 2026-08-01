@@ -15,7 +15,7 @@ pub struct DockerCompose {
     pub networks: HashMap<String, DockerComposeNetwork>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct DockerService {
     pub image: String,
     pub container_name: String,
@@ -39,15 +39,25 @@ pub struct DockerService {
     pub networks: HashMap<String, ServiceNetwork>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deploy: Option<DeployConfig>,
+    // Start-order dependencies. `docker stack deploy` ignores this key, so it is
+    // only filled in for compose files that are run with `docker compose up`;
+    // Swarm ordering is handled by the phases of the generated deploy script.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub depends_on: HashMap<String, DependsOnCondition>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
+pub struct DependsOnCondition {
+    pub condition: String,
+}
+
+#[derive(Serialize, Clone)]
 pub struct DeployConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<RestartPolicy>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct RestartPolicy {
     pub condition: String,
 }
@@ -58,7 +68,7 @@ pub struct DockerComposeNetwork {
     pub name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ServiceNetwork {
     pub aliases: Vec<String>,
 }
@@ -193,6 +203,7 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
         environment,
         networks: HashMap::new(),
         deploy,
+        depends_on: HashMap::new(),
     })
 }
 

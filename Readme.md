@@ -136,6 +136,23 @@ There are three service types:
  * **internal** - only accessible to other app services.
  * **job** - runs once per deployment, used to set things up. Not accessible to other services.
 
+A job is a deploy step, not a service: the generated Docker deploy script starts
+whatever the job lists in `depends_on`, waits for it, runs the job, aborts the
+deploy if the job fails, and only then rolls out the rest of the stack. Declare the
+dependencies so a migration cannot race the services that use the schema:
+
+```yaml
+app_services:
+  migrate:
+    type: job
+    image: mycompany/migrate
+    depends_on:
+      - primary-db
+```
+
+See [Jobs and deployment ordering](docs/reference.md#jobs-and-deployment-ordering)
+for the details of each environment.
+
 ### Service variants
 
 A service can define multiple image variants. This is useful when you need to deploy the same service with different base images (e.g. different architectures or flavors) and let each environment pick the appropriate one.

@@ -84,6 +84,8 @@ app_services:
     volumes:
       - named-volume:/container/path
       - ./host/path:/container/path
+    depends_on:
+      - other-service
 
 extra_services:
   postgres:
@@ -107,6 +109,7 @@ extra_services:
 | `secrets` | list | no | Secrets to provide. See below. |
 | `ports` | list | no | Ports to expose (Docker). Informational in Kubernetes. |
 | `volumes` | list | no | Volume mounts. Named volumes must be declared in the top-level `volumes:` list. |
+| `depends_on` | list | no | Services that must be running before this one starts. Drives the ordering of the generated Docker deploy scripts and the local compose file; ignored for Kubernetes. Cycles are rejected. |
 
 #### Service types
 
@@ -115,6 +118,45 @@ extra_services:
 | `public` | Exposed externally via ingress. Must have `host` and `prefix` configured in `envspec.yaml`. Use for any service that responds to HTTP requests.      | Continuously |
 | `internal` | No ingress routing. Use for background workers, queue consumers, and support services (databases, caches) that do not serve HTTP requests extarnaly. | Continuously |
 | `job` | Runs once per deployment. Not accessible from other services. Use for database migrations and one-time setup tasks.                                  | Once |
+
+#### Jobs and deployment ordering
+
+A job runs to completion, so it is not deployed like the other services. Every
+Docker deployment that contains at least one job runs in three phases:
+
+1. **Start what the jobs need.** The transitive `depends_on` closure of all jobs is
+   started first, and the deploy waits for it to be ready.
+2. **Run the jobs**, in dependency order when one job depends on another. A job
+   that fails aborts the deploy — nothing else is rolled out.
+3. **Deploy the rest of the stack**, once the migrations have been applied.
+
+A job that declares no `depends_on` is treated as depending on *every*
+long-running service, so phase 1 starts the whole stack. Declare the dependencies
+explicitly (`depends_on: [primary-db]`) to keep phase 1 small and to guarantee that
+nothing serves traffic against a schema the migration has not touched yet.
+
+Readiness in phase 1 means:
+
+| Environment | Waits for |
+|-------------|-----------|
+| Swarm | `docker stack deploy --detach=false` convergence — tasks running, and healthy when the service declares a `healthcheck` |
+| Standalone Docker | container started; additionally polls `docker inspect` until healthy for dependencies that declare a `healthcheck` (override the 300s limit with `HEALTH_TIMEOUT`) |
+| Local | `docker compose` `depends_on` conditions: `service_healthy` when the dependency declares a `healthcheck`, otherwise `service_started` |
+
+Give a database or other job dependency a `healthcheck`; without one, "ready" only
+means the container was started, which is rarely enough for a migration.
+
+In Swarm the job is not part of the stack file at all. `docker stack deploy` cannot
+express a run-to-completion service (compose's `deploy.mode` has no
+`replicated-job`), so a job placed in a stack would be deployed as a normal
+replicated service that never converges, and a crashed migration would be
+indistinguishable from a successful one. The generated `deploy.sh` instead creates
+the job with `docker service create --mode replicated-job --restart-condition none
+--detach=false`, waits for the task to reach a terminal state (override the 600s
+limit with `JOB_TIMEOUT`), prints its logs, removes the service, and exits non-zero
+unless the task reports `Complete`. Overriding `entrypoint` on a job requires a
+Docker CLI that supports `docker service create --entrypoint` (25.0+); `command`,
+env files, secrets, configs and volume mounts work on any version.
 
 #### Secret mount options
 
@@ -663,7 +705,10 @@ Output directory: `docker-deploy/`
 
 | File | Description |
 |------|-------------|
-| `<deployment>.yaml` | Docker Compose stack file for `docker stack deploy` |
+| `deploy.sh` | Deploy script: ingress, then the job phases, then the stack |
+| `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
+| `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
+| `<deployment>/<service>/` | Per-service `.env`, config and secret files |
 | `ingress/` | Traefik or nginx ingress stack |
 
 ### Local (`type: local`)

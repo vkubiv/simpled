@@ -233,6 +233,11 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
      let entrypoint = yaml.entrypoint.map(convert_service_command);
      let healthcheck = yaml.healthcheck.map(convert_healthcheck).transpose()?;
 
+    let depends_on = yaml.depends_on.unwrap_or_default();
+    if depends_on.iter().any(|d| d == &name) {
+        return Err(anyhow!("Service '{}' cannot depend on itself", name));
+    }
+
     Ok(ServiceSpec {
         name,
         service_type,
@@ -246,6 +251,7 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         command,
         entrypoint,
         healthcheck,
+        depends_on,
         is_app_service,
     })
 }

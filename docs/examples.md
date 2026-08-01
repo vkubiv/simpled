@@ -106,6 +106,9 @@ app_services:
   db-setup:
     type: job
     image: mycompany/admin-svc
+    # Runs after the database is up and before the rest of the stack is deployed.
+    depends_on:
+      - primary-db
     environment:
       - DB_CONNECTION_STRING
     secrets:
@@ -192,6 +195,13 @@ extra_services:
         variable: POSTGRES_PASSWORD
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    # A job that depends on this service waits for the healthcheck, not just for
+    # the container to be created.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     type: internal

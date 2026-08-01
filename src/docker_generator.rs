@@ -8,12 +8,93 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, ServiceNetwork};
+use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, DockerService, ServiceNetwork};
 
 const DOCKER_NETWORK: &str = "common_network";
 const NGINX_IMAGE: &str = "nginx:alpine";
 const TRAEFIK_IMAGE: &str = "traefik:v2.10";
 const TRAEFIK_RESOLVER: &str = "myresolver";
+/// Stack file holding only the services the jobs depend on (phase 1 of a deploy).
+const DEPS_COMPOSE_FILE: &str = "docker-compose.deps.yaml";
+/// Default seconds to wait for one job to reach a terminal state.
+const JOB_TIMEOUT_SECONDS: u32 = 600;
+/// Seconds to wait for a dependency to report healthy in a standalone deploy.
+const HEALTH_TIMEOUT_SECONDS: u32 = 300;
+
+/// `wait_healthy` helper embedded in the generated standalone deploy script.
+/// `docker run -d` returns once the container is created, so a declared
+/// healthcheck is the only readiness signal a job's dependency can offer.
+const WAIT_HEALTHY_FUNCTION: &str = r#"wait_healthy() {
+  name="$1"
+  echo "Waiting for ${name} to become healthy..."
+  waited=0
+  while [ "${waited}" -lt "${HEALTH_TIMEOUT}" ]; do
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${name}" 2>/dev/null || echo missing)"
+    case "${status}" in
+      healthy) return 0 ;;
+      none) return 0 ;;
+    esac
+    sleep 2
+    waited=$((waited + 2))
+  done
+  echo "Timed out after ${HEALTH_TIMEOUT}s waiting for ${name} to become healthy." >&2
+  exit 1
+}
+"#;
+
+/// `run_job` helper embedded in the generated Swarm deploy script.
+///
+/// Swarm's run-to-completion primitive (`--mode replicated-job`) exists only in
+/// the CLI/API — compose's `deploy.mode` does not accept it, so a job placed in a
+/// stack file is deployed as an ordinary replicated service that never converges.
+/// Creating the job as a standalone service instead gives a real pass/fail signal.
+const RUN_JOB_FUNCTION: &str = r#"run_job() {
+  job_name="$1"
+  shift
+  echo "Running job ${job_name}..."
+
+  # A service left over from an earlier deploy (or from an older simpled that put
+  # jobs in the stack file) would make `docker service create` fail on the name.
+  docker service rm "${job_name}" >/dev/null 2>&1 || true
+
+  create_status=0
+  docker service create \
+    --name "${job_name}" \
+    --mode replicated-job \
+    --restart-condition none \
+    --detach=false \
+    --with-registry-auth \
+    "$@" || create_status=$?
+
+  # The task is polled for a terminal state rather than trusting the exit code of
+  # `docker service create` alone, which reports on the rollout, not on the
+  # process the job ran.
+  waited=0
+  state=""
+  while [ "${waited}" -lt "${JOB_TIMEOUT}" ]; do
+    state="$(docker service ps "${job_name}" --format '{{.CurrentState}}' 2>/dev/null | head -n 1)"
+    case "${state}" in
+      Complete*|Failed*|Rejected*|Orphaned*|Shutdown*) break ;;
+    esac
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  case "${state}" in
+    Complete*)
+      docker service logs --tail 50 "${job_name}" || true
+      docker service rm "${job_name}" >/dev/null 2>&1 || true
+      echo "Job ${job_name} completed."
+      ;;
+    *)
+      echo "Job ${job_name} did not complete (state: ${state:-unknown}, create exit code: ${create_status})." >&2
+      docker service logs --tail 200 "${job_name}" >&2 || true
+      docker service rm "${job_name}" >/dev/null 2>&1 || true
+      exit 1
+      ;;
+  esac
+}
+"#;
 
 pub fn generate(
     resolved_spec: &EnvironmentResolvedSpec,
@@ -82,22 +163,61 @@ fn generate_standalone(
     
     let network_name = DOCKER_NETWORK.to_string();
     writeln!(deploy_sh, "docker network create {} || true", network_name)?;
-    
-    for service in &deployment.services {
+
+    // Jobs (migrations and other one-shot tasks) are ordered explicitly: first the
+    // services they depend on, then the jobs themselves — run in the foreground so
+    // a non-zero exit aborts the deploy — and only then the rest of the stack.
+    let jobs = deployment.jobs_in_order();
+    let prerequisites = deployment.job_prerequisites();
+    let mut start_order: Vec<&crate::resolved_spec::ServiceResolvedSpec> = Vec::new();
+    start_order.extend(prerequisites.iter().copied());
+    start_order.extend(jobs.iter().copied());
+    for service in deployment.long_running_services() {
+        if !start_order.iter().any(|s| s.full_name == service.full_name) {
+            start_order.push(service);
+        }
+    }
+
+    if !jobs.is_empty() {
+        writeln!(deploy_sh, "HEALTH_TIMEOUT=\"${{HEALTH_TIMEOUT:-{}}}\"", HEALTH_TIMEOUT_SECONDS)?;
+        write!(deploy_sh, "{}", WAIT_HEALTHY_FUNCTION)?;
+        writeln!(deploy_sh)?;
+    }
+
+    let mut jobs_started = false;
+    for service in start_order {
+         let is_job = matches!(service.service_type, crate::spec::ServiceType::Job);
+
+         // Give the job dependencies a chance to become usable before the first
+         // job starts. `docker run` returns as soon as the container is created,
+         // so a declared healthcheck is the only readiness signal available.
+         if is_job && !jobs_started {
+             jobs_started = true;
+             for dependency in &prerequisites {
+                 if dependency.healthcheck.as_ref().is_some_and(|hc| !hc.is_disabled()) {
+                     writeln!(deploy_sh, "wait_healthy {}", dependency.full_name)?;
+                 }
+             }
+         }
+
          writeln!(deploy_sh, "echo 'Starting {}...'", service.full_name)?;
          writeln!(deploy_sh, "docker rm -f {} || true", service.full_name)?;
-         
+
          // Create env file
          let env_file_name = format!("{}.env", service.full_name);
          let env_path = envs_dir.join(&env_file_name);
          let mut env_file = File::create(&env_path)?;
-         
+
          for env in &service.environment_variables {
              writeln!(env_file, "{}={}", env.name, env.value)?;
          }
 
-         write!(deploy_sh, "docker run -d --name {} --network {}", service.full_name, network_name)?;
-         
+         // A job runs in the foreground: `set -e` then aborts the deploy when the
+         // job exits non-zero, before any service that depends on its result
+         // (e.g. a migrated schema) is started.
+         let detach = if is_job { "" } else { "-d " };
+         write!(deploy_sh, "docker run {}--name {} --network {}", detach, service.full_name, network_name)?;
+
          for port in &service.ports {
              write!(deploy_sh, " -p {}:{}", port.external, port.internal)?;
          }
@@ -201,7 +321,11 @@ fn generate_swarm(
 
     let network_name = DOCKER_NETWORK.to_string();
 
-    let mut services_map = HashMap::new();
+    // Every service (jobs included) is prepared, because that is what writes the
+    // per-service `.env`, config and secret files a job needs at run time. Jobs
+    // are kept out of the stack file itself: `docker stack deploy` has no
+    // run-to-completion mode, so they are run separately by the deploy script.
+    let mut prepared: HashMap<String, DockerService> = HashMap::new();
 
     for service in &deployment.services {
         let mut docker_service = prepare_service(service, resolved_spec, &app_dir)?;
@@ -213,24 +337,55 @@ fn generate_swarm(
 
         docker_service.networks = networks;
 
-        services_map.insert(service.full_name.clone(), docker_service);
+        prepared.insert(service.full_name.clone(), docker_service);
     }
 
-    let mut networks = HashMap::new();
+    let jobs = deployment.jobs_in_order();
+    let long_running = deployment.long_running_services();
+    let prerequisites = deployment.job_prerequisites();
 
-    networks.insert("default".to_string(), DockerComposeNetwork {
-        external: true,
-        name: network_name.clone(),
-    });
+    let compose_network = || {
+        let mut networks = HashMap::new();
+        networks.insert("default".to_string(), DockerComposeNetwork {
+            external: true,
+            name: network_name.clone(),
+        });
+        networks
+    };
+
+    let stack_services: HashMap<String, DockerService> = long_running.iter()
+        .filter_map(|s| prepared.get(&s.full_name).map(|d| (s.full_name.clone(), d.clone())))
+        .collect();
 
     let compose = DockerCompose {
-        services: services_map,
-        networks,
+        services: stack_services,
+        networks: compose_network(),
     };
 
     let compose_path = &app_dir.join("docker-compose.yaml");
     let yaml = serde_yaml::to_string(&compose)?;
     fs::write(&compose_path, yaml)?;
+
+    // Phase-1 stack file: only the services the jobs need. Written when it is a
+    // real subset — when the jobs need everything, phase 1 deploys the full stack
+    // file instead and phase 3 has nothing left to do.
+    let deps_only = !jobs.is_empty()
+        && !prerequisites.is_empty()
+        && prerequisites.len() < long_running.len();
+
+    if deps_only {
+        let dep_services: HashMap<String, DockerService> = prerequisites.iter()
+            .filter_map(|s| prepared.get(&s.full_name).map(|d| (s.full_name.clone(), d.clone())))
+            .collect();
+
+        let deps_compose = DockerCompose {
+            services: dep_services,
+            networks: compose_network(),
+        };
+
+        let deps_path = app_dir.join(DEPS_COMPOSE_FILE);
+        fs::write(&deps_path, serde_yaml::to_string(&deps_compose)?)?;
+    }
 
 
 
@@ -255,6 +410,15 @@ fn generate_swarm(
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
+    if !jobs.is_empty() {
+        writeln!(deploy_sh, "# Absolute paths are needed for the bind mounts of jobs, which are created")?;
+        writeln!(deploy_sh, "# with `docker service create` instead of being part of the stack file.")?;
+        writeln!(deploy_sh, "DEPLOY_DIR=\"$(pwd)\"")?;
+        writeln!(deploy_sh, "# Seconds to wait for a single job to finish before giving up.")?;
+        writeln!(deploy_sh, "JOB_TIMEOUT=\"${{JOB_TIMEOUT:-{}}}\"", JOB_TIMEOUT_SECONDS)?;
+        writeln!(deploy_sh)?;
+        write_run_job_function(&mut deploy_sh)?;
+    }
     writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
 
     // Bind-mounted volume directories are not created automatically on the node
@@ -291,7 +455,47 @@ fn generate_swarm(
     }
 
     writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --detach=false")?;
-    writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
+
+    if jobs.is_empty() {
+        writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
+    } else {
+        // Jobs are run between two partial rollouts of the same stack. `docker
+        // stack deploy` only removes services missing from the file when it is
+        // given --prune, so deploying a subset first and the full file afterwards
+        // is an additive, idempotent rollout: phase 3 reports the phase-1
+        // services as up to date and leaves them running.
+        writeln!(deploy_sh)?;
+        writeln!(deploy_sh, "echo '== Phase 1/3: starting services the jobs depend on =='")?;
+        if prerequisites.is_empty() {
+            writeln!(deploy_sh, "echo 'No job dependencies declared, nothing to start first.'")?;
+        } else {
+            let phase1_file = if deps_only { DEPS_COMPOSE_FILE } else { "docker-compose.yaml" };
+            // --detach=false blocks until every service in the file has converged,
+            // i.e. its tasks are running and (when a healthcheck is declared)
+            // healthy. That is what makes it safe to run the jobs next.
+            writeln!(deploy_sh, "docker stack deploy -c {}/{} {} --with-registry-auth --detach=false",
+                deployment.name, phase1_file, deployment.name)?;
+        }
+
+        writeln!(deploy_sh)?;
+        writeln!(deploy_sh, "echo '== Phase 2/3: running jobs =='")?;
+        for job in &jobs {
+            let docker_service = prepared.get(&job.full_name)
+                .ok_or_else(|| anyhow!("Job {} was not prepared", job.full_name))?;
+            write_job_invocation(&mut deploy_sh, &deployment.name, &job.full_name, docker_service, &network_name)?;
+        }
+
+        writeln!(deploy_sh)?;
+        writeln!(deploy_sh, "echo '== Phase 3/3: deploying the rest of the stack =='")?;
+        if long_running.is_empty() {
+            writeln!(deploy_sh, "echo 'This deployment has no long-running services.'")?;
+        } else if deps_only || prerequisites.is_empty() {
+            writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
+        } else {
+            // Phase 1 already deployed every long-running service.
+            writeln!(deploy_sh, "echo 'All services were started in phase 1, nothing left to deploy.'")?;
+        }
+    }
 
     // After a successful deploy, reclaim disk space by removing images that are no
     // longer used by any container/service (e.g. the previous versions replaced by
@@ -308,6 +512,93 @@ fn generate_swarm(
     writeln!(deploy_sh, "docker image prune -af")?;
 
     Ok(())
+}
+
+fn write_run_job_function(deploy_sh: &mut File) -> Result<()> {
+    write!(deploy_sh, "{}", RUN_JOB_FUNCTION)?;
+    writeln!(deploy_sh)?;
+    Ok(())
+}
+
+/// Emit the `run_job` call for one job, translating the compose representation of
+/// the service into `docker service create` flags. Everything a job needs is
+/// covered: env file, inline environment (including env-variable secrets), bind
+/// mounts (configs, file secrets, volumes), entrypoint and command. Ports and
+/// healthchecks are not translated — neither is meaningful for a task that is
+/// expected to exit.
+fn write_job_invocation(
+    deploy_sh: &mut File,
+    deployment_name: &str,
+    job_name: &str,
+    service: &DockerService,
+    network_name: &str,
+) -> Result<()> {
+    // Named like a stack service so it is recognizable in `docker service ls`
+    // while it runs; the job is removed again once it completes.
+    let service_name = format!("{}_{}", deployment_name, job_name);
+
+    writeln!(deploy_sh, "run_job {} \\", sh_quote(&service_name))?;
+    writeln!(deploy_sh, "  --network {} \\", sh_quote(network_name))?;
+
+    for env_file in &service.env_file {
+        writeln!(deploy_sh, "  --env-file \"{}\" \\", node_path(deployment_name, env_file))?;
+    }
+
+    let mut env_names: Vec<&String> = service.environment.keys().collect();
+    env_names.sort();
+    for name in env_names {
+        let value = &service.environment[name];
+        writeln!(deploy_sh, "  -e {} \\", sh_quote(&format!("{}={}", name, value)))?;
+    }
+
+    for volume in &service.volumes {
+        // Compose volume entries are `<source>:<target>`; the source is relative
+        // to the stack file, i.e. to the deployment directory.
+        let Some((source, target)) = volume.split_once(':') else {
+            return Err(anyhow!("Job {} has an invalid volume entry '{}'", job_name, volume));
+        };
+        writeln!(deploy_sh, "  --mount \"type=bind,source={},target={}\" \\",
+            node_path(deployment_name, source), target)?;
+    }
+
+    // `docker service create --entrypoint` overrides only the executable, so any
+    // remaining entrypoint tokens are prepended to the container args, the same
+    // split `docker run` needs. Requires a Docker CLI that supports the flag
+    // (25.0+); jobs that do not override the entrypoint work on any version.
+    let mut trailing_args: Vec<String> = Vec::new();
+    if let Some(entrypoint) = &service.entrypoint {
+        let mut args = entrypoint.to_args();
+        if !args.is_empty() {
+            writeln!(deploy_sh, "  --entrypoint {} \\", sh_quote(&args.remove(0)))?;
+            trailing_args.extend(args);
+        }
+    }
+    if let Some(command) = &service.command {
+        trailing_args.extend(command.to_args());
+    }
+
+    write!(deploy_sh, "  {}", sh_quote(&service.image))?;
+    for arg in trailing_args {
+        write!(deploy_sh, " {}", sh_quote(&arg))?;
+    }
+    writeln!(deploy_sh)?;
+
+    Ok(())
+}
+
+/// Absolute path on the deployment node for a path written relative to the stack
+/// file. Already-absolute paths (a user-declared host mount) are left alone.
+fn node_path(deployment_name: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("$DEPLOY_DIR/{}/{}", deployment_name, path.trim_start_matches("./"))
+    }
+}
+
+/// Wrap a value in single quotes so the shell passes it through verbatim.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path, deploy_sh: &mut File, network_name: String) -> Result<()> {
@@ -693,4 +984,174 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolved_spec::{DeploymentResolvedSpec, ServiceResolvedSpec};
+    use crate::spec::{DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec, ServiceType};
+
+    fn service(name: &str, service_type: ServiceType, depends_on: &[&str]) -> ServiceResolvedSpec {
+        ServiceResolvedSpec {
+            service_type,
+            is_app_service: true,
+            full_name: name.to_string(),
+            image: format!("registry.example.com/{}:1.0.0", name),
+            service_host: "example.com".to_string(),
+            environment_variables: vec![],
+            undockerized_environment_variables: vec![],
+            configs: vec![],
+            secrets: vec![],
+            ports: vec![],
+            expose: vec![],
+            volumes: vec![],
+            command: None,
+            entrypoint: None,
+            healthcheck: None,
+            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            working_dir: None,
+        }
+    }
+
+    fn healthy(mut service: ServiceResolvedSpec) -> ServiceResolvedSpec {
+        service.healthcheck = Some(Healthcheck {
+            test: HealthcheckTest::Shell("pg_isready".to_string()),
+            interval: None, timeout: None, retries: None, start_period: None, disable: false,
+        });
+        service
+    }
+
+    fn spec(services: Vec<ServiceResolvedSpec>) -> EnvironmentResolvedSpec {
+        EnvironmentResolvedSpec {
+            env_type: DeploymentEnvType::Docker(DockerSpecificSpec {
+                ingress_type: DockerIngressType::Nginx,
+                swarm_mode: true,
+            }),
+            ingress: IngressResolvedSpec {
+                name: "gateway".to_string(),
+                tls: None,
+                domains: vec![],
+                rules: vec![],
+            },
+            current_deployment: DeploymentResolvedSpec {
+                name: "prod".to_string(),
+                application_name: "shop".to_string(),
+                configs: vec![],
+                secrets: vec![],
+                defaults: ResourcesSpec {
+                    replicas: 1,
+                    requests: ResourceLimits { memory: "128Mi".to_string(), cpu: "100m".to_string() },
+                    limits: ResourceLimits { memory: "256Mi".to_string(), cpu: "200m".to_string() },
+                },
+                services,
+                volumes: vec![],
+            },
+        }
+    }
+
+    fn generate_swarm_to_temp(spec: &EnvironmentResolvedSpec) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: true };
+        generate(spec, &docker_spec, dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
+        (dir, script)
+    }
+
+    #[test]
+    fn swarm_without_jobs_deploys_the_stack_in_one_step() {
+        let spec = spec(vec![service("api", ServiceType::Public, &[])]);
+        let (dir, script) = generate_swarm_to_temp(&spec);
+
+        assert!(script.contains("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth\n"));
+        assert!(!script.contains("Phase 1/3"));
+        assert!(!script.contains("run_job"));
+        assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
+    }
+
+    #[test]
+    fn swarm_job_runs_between_two_partial_rollouts() {
+        let spec = spec(vec![
+            service("api", ServiceType::Public, &["migrate"]),
+            healthy(service("primary-db", ServiceType::Internal, &[])),
+            service("migrate", ServiceType::Job, &["primary-db"]),
+        ]);
+        let (dir, script) = generate_swarm_to_temp(&spec);
+
+        // Phase 1 brings up only the job's dependency and waits for convergence.
+        let phase1 = script.find("docker stack deploy -c prod/docker-compose.deps.yaml prod --with-registry-auth --detach=false").unwrap();
+        let job = script.find("run_job 'prod_migrate'").unwrap();
+        let phase3 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth\n").unwrap();
+        assert!(phase1 < job && job < phase3, "phases must be ordered deps -> job -> stack");
+
+        // The dependency stack file holds the database only.
+        let deps = fs::read_to_string(dir.path().join("prod").join(DEPS_COMPOSE_FILE)).unwrap();
+        assert!(deps.contains("primary-db:"));
+        assert!(!deps.contains("api:"));
+        assert!(!deps.contains("migrate:"));
+
+        // Jobs never end up in the stack file: `docker stack deploy` cannot run
+        // them to completion.
+        let stack = fs::read_to_string(dir.path().join("prod").join("docker-compose.yaml")).unwrap();
+        assert!(stack.contains("primary-db:") && stack.contains("api:"));
+        assert!(!stack.contains("migrate:"));
+
+        // The job still gets its generated environment file.
+        assert!(dir.path().join("prod").join("migrate").join(".env").exists());
+        assert!(script.contains("--env-file \"$DEPLOY_DIR/prod/migrate/.env\""));
+        assert!(script.contains("--mode replicated-job"));
+    }
+
+    #[test]
+    fn job_without_depends_on_waits_for_the_whole_stack() {
+        let spec = spec(vec![
+            service("api", ServiceType::Public, &[]),
+            service("migrate", ServiceType::Job, &[]),
+        ]);
+        let (dir, script) = generate_swarm_to_temp(&spec);
+
+        // Nothing declared, so everything long-running is a prerequisite: phase 1
+        // deploys the full stack file and phase 3 has nothing left to do.
+        let phase1 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --detach=false").unwrap();
+        let job = script.find("run_job 'prod_migrate'").unwrap();
+        assert!(phase1 < job);
+        assert!(script.contains("All services were started in phase 1"));
+        assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
+    }
+
+    #[test]
+    fn jobs_run_in_dependency_order() {
+        let spec = spec(vec![
+            healthy(service("primary-db", ServiceType::Internal, &[])),
+            service("seed", ServiceType::Job, &["migrate", "primary-db"]),
+            service("migrate", ServiceType::Job, &["primary-db"]),
+        ]);
+        let (_dir, script) = generate_swarm_to_temp(&spec);
+
+        let migrate = script.find("run_job 'prod_migrate'").unwrap();
+        let seed = script.find("run_job 'prod_seed'").unwrap();
+        assert!(migrate < seed, "a job that depends on another job runs after it");
+    }
+
+    #[test]
+    fn standalone_runs_jobs_in_the_foreground_after_their_dependencies() {
+        let mut spec = spec(vec![
+            service("api", ServiceType::Public, &[]),
+            healthy(service("primary-db", ServiceType::Internal, &[])),
+            service("migrate", ServiceType::Job, &["primary-db"]),
+        ]);
+        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: false };
+        spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, &docker_spec, dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
+
+        let db = script.find("docker run -d --name primary-db").unwrap();
+        let wait = script.find("wait_healthy primary-db").unwrap();
+        // A job blocks the script, so it is started without -d.
+        let job = script.find("docker run --name migrate").unwrap();
+        let api = script.find("docker run -d --name api").unwrap();
+        assert!(db < wait && wait < job && job < api);
+    }
 }

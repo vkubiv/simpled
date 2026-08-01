@@ -62,6 +62,10 @@ pub struct ServiceSpecYaml {
     pub entrypoint: Option<ServiceCommandYaml>,
     // Container health probe, same as docker-compose `healthcheck`.
     pub healthcheck: Option<HealthcheckYaml>,
+    // Services that must be running before this one starts, same as
+    // docker-compose `depends_on`. Used to order the phases of a Swarm/standalone
+    // deployment: everything a `job` depends on is started before the job runs.
+    pub depends_on: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

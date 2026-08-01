@@ -108,6 +108,9 @@ pub struct ServiceSpec {
     pub entrypoint: Option<ServiceCommand>,
     // Container health probe, same as docker-compose `healthcheck`.
     pub healthcheck: Option<Healthcheck>,
+    // Names of services that must be started before this one, same as
+    // docker-compose `depends_on`.
+    pub depends_on: Vec<String>,
 }
 
 // Overrides the default command/entrypoint of a service's image. Mirrors

@@ -65,6 +65,37 @@ where
         }
     }
 
+    // `docker compose up` honours depends_on, so the local run gets the same
+    // ordering the deploy scripts build by hand for Swarm and standalone Docker.
+    // Dependencies that are not part of this compose file (excluded services, or
+    // ones run on the host) are dropped: compose rejects references to services it
+    // does not know.
+    let included: Vec<String> = services_map.keys().cloned().collect();
+    for service in spec.current_deployment.services.iter() {
+        if !included.contains(&service.full_name) {
+            continue;
+        }
+        let mut depends_on = HashMap::new();
+        for dep in &service.depends_on {
+            if !included.contains(dep) {
+                continue;
+            }
+            let Some(dep_service) = spec.current_deployment.services.iter()
+                .find(|s| &s.full_name == dep) else { continue };
+            // Waiting for `service_healthy` is only possible when the dependency
+            // declares a healthcheck; otherwise compose can only order the start.
+            let condition = if dep_service.healthcheck.as_ref().is_some_and(|hc| !hc.is_disabled()) {
+                "service_healthy"
+            } else {
+                "service_started"
+            };
+            depends_on.insert(dep.clone(), DependsOnCondition { condition: condition.to_string() });
+        }
+        if let Some(docker_service) = services_map.get_mut(&service.full_name) {
+            docker_service.depends_on = depends_on;
+        }
+    }
+
     let compose = DockerCompose {
         services: services_map,
         networks: HashMap::new(),
