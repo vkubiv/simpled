@@ -4,6 +4,7 @@ use semver::Version;
 use serde::Deserialize;
 use std::env;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use tar::Archive;
 
 const GITHUB_REPO: &str = "vkubiv/simpled";
@@ -72,6 +73,42 @@ fn fetch_latest_release() -> Result<Release> {
     response.json::<Release>().context("Failed to parse release info")
 }
 
+/// Path of the binary to replace. On unix the path is canonicalized so an
+/// update rewrites the real file rather than clobbering a symlink pointing at
+/// it; on Windows canonicalize only adds a `\\?\` prefix, so it is skipped.
+fn resolve_current_exe() -> Result<PathBuf> {
+    let exe = env::current_exe().context("Failed to determine current executable path")?;
+
+    #[cfg(unix)]
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+
+    Ok(exe)
+}
+
+/// Installs commonly land in a directory the current user cannot write to
+/// (/usr/local/bin on macOS, /usr/bin on Linux), so check up front rather than
+/// failing after the download.
+fn ensure_writable(exe: &Path) -> Result<()> {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let probe = dir.join(".simpled_update_probe");
+
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let hint = if cfg!(windows) {
+                "run simpled update from a terminal opened as Administrator"
+            } else {
+                "run `sudo simpled update`"
+            };
+            bail!("No write access to {} - {}", dir.display(), hint)
+        }
+        Err(e) => Err(e).with_context(|| format!("Cannot write to {}", dir.display())),
+    }
+}
+
 pub fn check_and_update(check_only: bool) -> Result<()> {
     let current = Version::parse(CURRENT_VERSION).expect("invalid package version");
 
@@ -105,6 +142,9 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
             )
         })?;
 
+    let current_exe = resolve_current_exe()?;
+    ensure_writable(&current_exe)?;
+
     println!("Downloading {}...", asset_name);
 
     let mut builder = reqwest::blocking::Client::new()
@@ -121,8 +161,6 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
     if !response.status().is_success() {
         bail!("Download failed with status {}", response.status());
     }
-
-    let current_exe = env::current_exe().context("Failed to determine current executable path")?;
 
     let tmp_path = current_exe.with_extension("update_tmp");
 
@@ -156,10 +194,14 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
     }
 
     if !found {
+        let _ = std::fs::remove_file(&tmp_path);
         bail!("Binary '{}' not found inside archive", binary_name);
     }
 
-    replace_exe(&current_exe, &tmp_path)?;
+    if let Err(e) = replace_exe(&current_exe, &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
 
     println!("Updated to {}. Restart simpled to use the new version.", latest);
     Ok(())

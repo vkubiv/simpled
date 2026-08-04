@@ -154,6 +154,23 @@ jobs:
           name: ${{ matrix.asset_name }}.pkg
           path: dist/${{ matrix.asset_name }}.pkg
 
+      - name: Archive binary for self-update (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # `simpled update` pulls a tarball, not the .pkg, so ship both.
+          # This is the same signed binary that went into the package, and
+          # notarizing the package registered its cdhash, so Gatekeeper
+          # accepts it when it arrives this way too.
+          mkdir -p dist
+          tar -czf dist/${{ matrix.asset_name }}.tar.gz -C target/${{ matrix.target }}/release ${{ matrix.binary_name }}
+
+      - name: Upload tarball (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}.tar.gz
+          path: dist/${{ matrix.asset_name }}.tar.gz
+
       - name: Prepare binary for release (Linux/Windows)
         if: runner.os != 'macOS'
         shell: bash
