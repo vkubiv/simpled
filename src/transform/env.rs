@@ -4,7 +4,7 @@ use crate::{env_loader, spec};
 use anyhow::{Context, Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 const DEFAULT_MEMORY: &str = "128Mi";
 const DEFAULT_CPU: &str = "100m";
@@ -94,18 +94,37 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                 ));
             }
 
-            // Port uniqueness is checked per deployment: different deployments may reuse
-            // the same external ports since only one runs at a time.
+            // Port and working_dir uniqueness are checked per deployment: different
+            // deployments may reuse the same external ports and directories since only
+            // one runs at a time. Services are visited in name order so a conflict is
+            // always reported with the same pair of names.
             for dep in &deployments {
                 let mut ports_seen = HashSet::new();
+                let mut working_dirs_seen: HashMap<PathBuf, &str> = HashMap::new();
                 if let Some(services) = &dep.services {
-                    for (svc_name, svc_spec) in services {
+                    let mut svc_names: Vec<&String> = services.keys().collect();
+                    svc_names.sort();
+                    for svc_name in svc_names {
+                        let svc_spec = &services[svc_name];
                         if svc_spec.ports.is_empty() {
                             return Err(anyhow!("In Local environment, service {} must have at least one port", svc_name));
                         }
                         for port in &svc_spec.ports {
                             if !ports_seen.insert(port.external) {
                                 return Err(anyhow!("Duplicate external port {} in deployment {}", port.external, dep.name));
+                            }
+                        }
+                        // A host-run service writes its `.env` and secret files straight
+                        // into `working_dir`, so two services pointing at the same
+                        // directory would silently overwrite each other's files.
+                        if let Some(dir) = &svc_spec.working_dir {
+                            if let Some(other) = working_dirs_seen.insert(normalize_working_dir(dir), svc_name) {
+                                return Err(anyhow!(
+                                    "Services '{}' and '{}' in deployment '{}' share working_dir '{}'. \
+                                     Each host-run service needs its own directory: its .env file and \
+                                     secrets are written there and would overwrite each other.",
+                                    other, svc_name, dep.name, dir
+                                ));
                             }
                         }
                     }
@@ -260,6 +279,17 @@ fn merge_service(
         ports: child.ports.clone().or_else(|| base.ports.clone()),
         working_dir: child.working_dir.clone().or_else(|| base.working_dir.clone()),
     }
+}
+
+/// Normalizes a `working_dir` for comparison, so that `./a/b`, `a/b` and `a/b/`
+/// are recognised as the same directory. `Path::components` already drops
+/// interior `.` segments and trailing separators; the leading `.` it keeps is
+/// filtered out here.
+fn normalize_working_dir(dir: &str) -> PathBuf {
+    Path::new(dir)
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect()
 }
 
 fn any_service_has_working_dir(deployments: &HashMap<String, DeploymentSpecYaml>) -> bool {
@@ -670,6 +700,70 @@ deployments:
         let vars = undockerized(&spec);
         assert_eq!(vars.len(), 2);
         assert_eq!(vars.iter().find(|v| v.name == "DB_HOST").unwrap().value, "docker-db");
+    }
+
+    fn local_env_with_working_dirs(api_dir: &str, worker_dir: &str) -> DeploymentEnvironmentSpecYaml {
+        let raw = format!(
+            r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    services:
+      api:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+        working_dir: {api_dir}
+      worker:
+        host: web
+        ports:
+          - "8081:80"
+        working_dir: {worker_dir}
+"#
+        );
+        serde_yaml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn duplicate_working_dir_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(local_env_with_working_dirs("./backend", "./backend"), root.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("share working_dir"), "unexpected error: {err}");
+        // Both service names are named, in a stable order.
+        assert!(err.contains("'api' and 'worker'"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn working_dir_comparison_ignores_path_noise() {
+        // `./backend` and `backend/` are the same directory.
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(local_env_with_working_dirs("./backend", "backend/"), root.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("share working_dir"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn distinct_working_dirs_are_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(
+            local_env_with_working_dirs("./backend/api", "./backend/worker"),
+            root.path(),
+            None,
+        )
+        .unwrap();
+        let services = spec.deployments[0].services.as_ref().unwrap();
+        assert_eq!(services["api"].working_dir.as_deref(), Some("./backend/api"));
+        assert_eq!(services["worker"].working_dir.as_deref(), Some("./backend/worker"));
     }
 
     fn deployments_map(raw: &str) -> HashMap<String, DeploymentSpecYaml> {
