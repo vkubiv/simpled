@@ -1,6 +1,7 @@
 use crate::spec::*;
 use crate::spec::EnvVariable;
 use crate::resolved_spec::*;
+use crate::secret_fetch;
 use anyhow::{Result, anyhow, Context};
 use std::collections::{HashSet, HashMap};
 use std::fs;
@@ -52,6 +53,9 @@ pub fn resolve(
     // Keyed by the secret's original (unprefixed) name so deployment env values
     // can reference them via `$secret(name)`.
     let mut secret_values: HashMap<String, String> = HashMap::new();
+    // Names of the secrets that are only read on the deploy target, kept so a
+    // `$secret(name)` reference to one can be rejected with a useful message.
+    let mut deferred_secrets: HashSet<String> = HashSet::new();
     for secret_spec in &deployment.secrets {
         let value = match &secret_spec.source {
             DeploymentSecretSource::EnvVariable(var_name) => {
@@ -59,18 +63,38 @@ pub fn resolve(
                 if value.is_empty() {
                     return Err(anyhow!("Secret environment variable {} is empty", var_name));
                 }
-                value
+                SecretResolvedValue::Literal(value)
             }
             DeploymentSecretSource::FilePath(path_str) => {
                 let path = Path::new(path_str);
                 if !path.exists() {
                     return Err(anyhow!("Secret file not found: {:?}", path_str));
                 }
-                fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?
+                SecretResolvedValue::Literal(
+                    fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?
+                )
             }
-            DeploymentSecretSource::Embedded(value) => value.clone(),
+            DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
+            // A local deployment runs on this machine, so there is no deploy
+            // target to defer to and no artifact for the value to leak into —
+            // the lookup happens right here. Every other target gets the lookup
+            // written into its generated `fetch-secrets.sh` instead.
+            DeploymentSecretSource::Aws(reference) => {
+                if env_spec.env_type == DeploymentEnvType::Local {
+                    SecretResolvedValue::Literal(secret_fetch::fetch_locally(reference)?)
+                } else {
+                    SecretResolvedValue::Deferred(reference.clone())
+                }
+            }
         };
-        secret_values.insert(secret_spec.secret_name.clone(), value.clone());
+        match &value {
+            SecretResolvedValue::Literal(literal) => {
+                secret_values.insert(secret_spec.secret_name.clone(), literal.clone());
+            }
+            SecretResolvedValue::Deferred(_) => {
+                deferred_secrets.insert(secret_spec.secret_name.clone());
+            }
+        }
         resolved_secrets.push(SecretResolvedSpec {
             name: format!("{}-{}", app_spec.name, secret_spec.secret_name),
             value,
@@ -79,9 +103,9 @@ pub fn resolve(
 
     // Deployment-level env values may reference secrets via `$secret(name)`.
     // Expand those references once before the values feed into service resolution.
-    let deployment_environment = substitute_secret_refs(&deployment.environment, &secret_values)?;
+    let deployment_environment = substitute_secret_refs(&deployment.environment, &secret_values, &deferred_secrets)?;
     let deployment_undockerized_environment =
-        substitute_secret_refs(&deployment.undockerized_environment, &secret_values)?;
+        substitute_secret_refs(&deployment.undockerized_environment, &secret_values, &deferred_secrets)?;
 
     // 3. Resolve Services
     let mut resolved_services = Vec::new();
@@ -388,8 +412,14 @@ fn add_unique_var(vars: &mut Vec<EnvVariable>, var: EnvVariable) {
 
 /// Expands `$secret(name)` references in a string with the resolved secret value.
 /// `secrets` is keyed by the secret's original (unprefixed) name. Referencing an
-/// unknown secret is an error.
-pub fn resolve_secret_refs_in_string(input: &str, secrets: &HashMap<String, String>) -> Result<String> {
+/// unknown secret is an error, as is referencing one in `deferred` — a secret
+/// whose value is only fetched on the deploy target, and so is not available to
+/// substitute into the env files written here.
+fn resolve_secret_refs(
+    input: &str,
+    secrets: &HashMap<String, String>,
+    deferred: &HashSet<String>,
+) -> Result<String> {
     const MARKER: &str = "$secret(";
     let mut result = String::new();
     let mut last_end = 0;
@@ -405,6 +435,12 @@ pub fn resolve_secret_refs_in_string(input: &str, secrets: &HashMap<String, Stri
 
             match secrets.get(secret_name) {
                 Some(value) => result.push_str(value),
+                None if deferred.contains(secret_name) => return Err(anyhow!(
+                    "$secret({}) cannot be used: the secret has an 'aws' source, so its value is \
+                     only fetched on the deploy target and cannot be substituted into an env \
+                     variable here. Mount it on the service with `variable:` instead.",
+                    secret_name
+                )),
                 None => return Err(anyhow!("Undefined secret reference: $secret({})", secret_name)),
             }
 
@@ -418,13 +454,17 @@ pub fn resolve_secret_refs_in_string(input: &str, secrets: &HashMap<String, Stri
     Ok(result)
 }
 
-/// Applies `resolve_secret_refs_in_string` to every value in an env variable list.
-fn substitute_secret_refs(vars: &[EnvVariable], secrets: &HashMap<String, String>) -> Result<Vec<EnvVariable>> {
+/// Applies `resolve_secret_refs` to every value in an env variable list.
+fn substitute_secret_refs(
+    vars: &[EnvVariable],
+    secrets: &HashMap<String, String>,
+    deferred: &HashSet<String>,
+) -> Result<Vec<EnvVariable>> {
     vars.iter()
         .map(|v| {
             Ok(EnvVariable {
                 name: v.name.clone(),
-                value: resolve_secret_refs_in_string(&v.value, secrets)?,
+                value: resolve_secret_refs(&v.value, secrets, deferred)?,
             })
         })
         .collect()
@@ -560,41 +600,46 @@ mod tests {
         m
     }
 
+    fn expand(input: &str) -> Result<String> {
+        resolve_secret_refs(input, &secrets(), &HashSet::new())
+    }
+
     #[test]
     fn expands_secret_reference() {
-        let out = resolve_secret_refs_in_string(
-            "postgresql://postgres:$secret(postgres_password)@postgres:5432/hobbyshopify",
-            &secrets(),
-        )
-        .unwrap();
+        let out = expand("postgresql://postgres:$secret(postgres_password)@postgres:5432/hobbyshopify").unwrap();
         assert_eq!(out, "postgresql://postgres:s3cr3t@postgres:5432/hobbyshopify");
     }
 
     #[test]
     fn expands_multiple_references() {
-        let out = resolve_secret_refs_in_string(
-            "$secret(postgres_password)-$secret(postgres_password)",
-            &secrets(),
-        )
-        .unwrap();
+        let out = expand("$secret(postgres_password)-$secret(postgres_password)").unwrap();
         assert_eq!(out, "s3cr3t-s3cr3t");
     }
 
     #[test]
     fn passes_through_without_reference() {
-        let out = resolve_secret_refs_in_string("plain-value", &secrets()).unwrap();
+        let out = expand("plain-value").unwrap();
         assert_eq!(out, "plain-value");
     }
 
     #[test]
     fn errors_on_unknown_secret() {
-        let err = resolve_secret_refs_in_string("$secret(missing)", &secrets()).unwrap_err();
+        let err = expand("$secret(missing)").unwrap_err();
         assert!(err.to_string().contains("Undefined secret reference"));
     }
 
     #[test]
     fn errors_on_unterminated_reference() {
-        let err = resolve_secret_refs_in_string("$secret(postgres_password", &secrets()).unwrap_err();
+        let err = expand("$secret(postgres_password").unwrap_err();
         assert!(err.to_string().contains("Invalid secret reference"));
+    }
+
+    /// A secret that is only fetched on the deploy target has no value here, so
+    /// the reference has to fail with an explanation rather than as "undefined".
+    #[test]
+    fn errors_on_reference_to_a_deferred_secret() {
+        let deferred = HashSet::from(["api_key".to_string()]);
+        let err = resolve_secret_refs("$secret(api_key)", &secrets(), &deferred).unwrap_err();
+        assert!(err.to_string().contains("'aws' source"));
     }
 }

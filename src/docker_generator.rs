@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec};
+use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
+use crate::secret_fetch::{self, sh_quote, FetchScript};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
 use anyhow::{anyhow, Result};
 use std::fs::{self, File};
@@ -118,30 +119,44 @@ fn generate_standalone(
     output_dir: &Path,
 ) -> Result<()> {
     let deployment = &resolved_spec.current_deployment;
-    let app_name = &deployment.application_name;
-    
+
     // Create subdirs
     let configs_dir = output_dir.join("configs");
     fs::create_dir_all(&configs_dir)?;
-    
-    // 1. Configs
+
+    // 1. Configs. The resolver has already prefixed every config and secret name
+    // with the application name, and that prefixed name is what the run commands
+    // below mount back out of `./configs/` and `./secrets/`, so the names are used
+    // verbatim here rather than prefixed a second time.
     for config in &deployment.configs {
-         let dir_name = format!("{}-{}", app_name, config.name);
-         let cfg_dir = configs_dir.join(&dir_name);
+         let cfg_dir = configs_dir.join(&config.name);
          fs::create_dir_all(&cfg_dir)?;
          for cfg_file in &config.files {
              let path = cfg_dir.join(&cfg_file.name);
              fs::write(&path, &cfg_file.content)?;
          }
     }
-    
-    // 2. Secrets
+
+    // 2. Secrets. Ones with an `aws` source have no value yet — `fetch-secrets.sh`
+    // writes their file on the deploy target.
     let secrets_dir = output_dir.join("secrets");
     fs::create_dir_all(&secrets_dir)?;
+    let mut fetch_script = FetchScript::new();
     for secret in &deployment.secrets {
-        let secret_name = format!("{}-{}", app_name, secret.name);
-        let path = secrets_dir.join(&secret_name);
-        fs::write(&path, &secret.value)?;
+        let path = secrets_dir.join(&secret.name);
+        match secret.deferred() {
+            Some(reference) => {
+                fetch_script.fetch(secret, reference);
+                fetch_script.write_to_file(secret, &format!("secrets/{}", secret.name));
+            }
+            None => fs::write(&path, secret.literal().unwrap_or_default())?,
+        }
+    }
+    if !fetch_script.is_empty() {
+        fetch_script.write(
+            &output_dir.join(secret_fetch::SCRIPT_NAME),
+            "deploy.sh sources this script before it starts anything.",
+        )?;
     }
 
     // 3. Envs
@@ -160,7 +175,9 @@ fn generate_standalone(
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
-    
+
+    write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
+
     let network_name = DOCKER_NETWORK.to_string();
     writeln!(deploy_sh, "docker network create {} || true", network_name)?;
 
@@ -307,8 +324,7 @@ fn generate_swarm(
     output_dir: &Path,
 ) -> Result<()> {
     let deployment = &resolved_spec.current_deployment;
-    let app_name = &deployment.application_name;
-    
+
     // Application folder
     let app_dir = output_dir.join(&deployment.name);
     fs::create_dir_all(&app_dir)?;
@@ -327,6 +343,16 @@ fn generate_swarm(
     // run-to-completion mode, so they are run separately by the deploy script.
     let mut prepared: HashMap<String, DockerService> = HashMap::new();
 
+    // Secrets with an `aws` source are fetched by the script below, on the node,
+    // rather than being written into the stack directory here. `prepare_service`
+    // leaves their env values as `${SIMPLED_SECRET_*}` — which `docker stack
+    // deploy` interpolates from the environment the deploy script exports — and
+    // leaves the file behind their mounts to be created by the script.
+    let mut fetch_script = FetchScript::new();
+    for (secret, reference) in deployment.deferred_secrets() {
+        fetch_script.fetch(secret, reference);
+    }
+
     for service in &deployment.services {
         let mut docker_service = prepare_service(service, resolved_spec, &app_dir)?;
 
@@ -337,7 +363,27 @@ fn generate_swarm(
 
         docker_service.networks = networks;
 
+        // File-mounted deferred secrets: the bind mount is in the stack file, but
+        // the file it points at is only created once the script has run. The path
+        // mirrors what `prepare_service` uses, relative to the deploy directory
+        // rather than to the stack file.
+        for secret_option in &service.secrets {
+            let SecretMount::FilePath(mount_path) = &secret_option.mount else { continue };
+            let Some(secret) = deployment.secrets.iter()
+                .find(|s| s.name == secret_option.name && s.deferred().is_some()) else { continue };
+            let rel_path = mount_path.trim_start_matches('/');
+            fetch_script.write_to_file(secret, &format!(
+                "{}/{}/{}", deployment.name, service.full_name, rel_path));
+        }
+
         prepared.insert(service.full_name.clone(), docker_service);
+    }
+
+    if !fetch_script.is_empty() {
+        fetch_script.write(
+            &output_dir.join(secret_fetch::SCRIPT_NAME),
+            "deploy.sh sources this script before it deploys the stack.",
+        )?;
     }
 
     let jobs = deployment.jobs_in_order();
@@ -410,6 +456,7 @@ fn generate_swarm(
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
+    write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
     if !jobs.is_empty() {
         writeln!(deploy_sh, "# Absolute paths are needed for the bind mounts of jobs, which are created")?;
         writeln!(deploy_sh, "# with `docker service create` instead of being part of the stack file.")?;
@@ -514,6 +561,21 @@ fn generate_swarm(
     Ok(())
 }
 
+/// Have the deploy script source `fetch-secrets.sh` before it does anything else.
+/// Sourcing rather than running it is what makes the fetched values visible to
+/// the rest of the script, and to the `${...}` interpolation `docker stack
+/// deploy` performs on the stack file.
+fn write_fetch_secrets_call(deploy_sh: &mut File, fetch_script: &FetchScript) -> Result<()> {
+    if fetch_script.is_empty() {
+        return Ok(());
+    }
+    writeln!(deploy_sh, "# Read the secrets with an `aws` source from AWS Secrets Manager. Sourced, so")?;
+    writeln!(deploy_sh, "# the values it exports are visible to the commands below.")?;
+    writeln!(deploy_sh, ". ./{}", secret_fetch::SCRIPT_NAME)?;
+    writeln!(deploy_sh)?;
+    Ok(())
+}
+
 fn write_run_job_function(deploy_sh: &mut File) -> Result<()> {
     write!(deploy_sh, "{}", RUN_JOB_FUNCTION)?;
     writeln!(deploy_sh)?;
@@ -548,7 +610,15 @@ fn write_job_invocation(
     env_names.sort();
     for name in env_names {
         let value = &service.environment[name];
-        writeln!(deploy_sh, "  -e {} \\", sh_quote(&format!("{}={}", name, value)))?;
+        // A deferred secret is carried as a `${SIMPLED_SECRET_*}` placeholder that
+        // the stack file has `docker stack deploy` interpolate. A job bypasses the
+        // stack file, so the placeholder has to be left unquoted for the shell to
+        // expand it here instead. Everything else is quoted verbatim.
+        if is_secret_placeholder(value) {
+            writeln!(deploy_sh, "  -e \"{}={}\" \\", name, value)?;
+        } else {
+            writeln!(deploy_sh, "  -e {} \\", sh_quote(&format!("{}={}", name, value)))?;
+        }
     }
 
     for volume in &service.volumes {
@@ -586,6 +656,12 @@ fn write_job_invocation(
     Ok(())
 }
 
+/// Whether an env value is the `${SIMPLED_SECRET_*}` reference `prepare_service`
+/// writes for a secret that is only fetched on the deploy target.
+fn is_secret_placeholder(value: &str) -> bool {
+    value.starts_with(&format!("${{{}", SHELL_VAR_PREFIX)) && value.ends_with('}')
+}
+
 /// Absolute path on the deployment node for a path written relative to the stack
 /// file. Already-absolute paths (a user-declared host mount) are left alone.
 fn node_path(deployment_name: &str, path: &str) -> String {
@@ -594,11 +670,6 @@ fn node_path(deployment_name: &str, path: &str) -> String {
     } else {
         format!("$DEPLOY_DIR/{}/{}", deployment_name, path.trim_start_matches("./"))
     }
-}
-
-/// Wrap a value in single quotes so the shell passes it through verbatim.
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path, deploy_sh: &mut File, network_name: String) -> Result<()> {
@@ -989,8 +1060,8 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolved_spec::{DeploymentResolvedSpec, ServiceResolvedSpec};
-    use crate::spec::{DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec, ServiceType};
+    use crate::resolved_spec::{ConfigResolvedFile, ConfigResolvedSpec, DeploymentResolvedSpec, SecretResolvedSpec, SecretResolvedValue, ServiceResolvedSpec};
+    use crate::spec::{AwsSecretRef, DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec, ServiceConfigOption, ServiceSecret, ServiceType};
 
     fn service(name: &str, service_type: ServiceType, depends_on: &[&str]) -> ServiceResolvedSpec {
         ServiceResolvedSpec {
@@ -1011,6 +1082,23 @@ mod tests {
             healthcheck: None,
             depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
             working_dir: None,
+        }
+    }
+
+    fn with_secrets(mut service: ServiceResolvedSpec, secrets: &[(&str, SecretMount)]) -> ServiceResolvedSpec {
+        service.secrets = secrets.iter()
+            .map(|(name, mount)| ServiceSecret { name: name.to_string(), mount: mount.clone() })
+            .collect();
+        service
+    }
+
+    fn aws_secret(name: &str, secret_id: &str, jq: Option<&str>) -> SecretResolvedSpec {
+        SecretResolvedSpec {
+            name: name.to_string(),
+            value: SecretResolvedValue::Deferred(AwsSecretRef {
+                secret_id: secret_id.to_string(),
+                jq: jq.map(str::to_string),
+            }),
         }
     }
 
@@ -1153,5 +1241,144 @@ mod tests {
         let job = script.find("docker run --name migrate").unwrap();
         let api = script.find("docker run -d --name api").unwrap();
         assert!(db < wait && wait < job && job < api);
+    }
+
+    /// The resolver prefixes config and secret names with the application name,
+    /// so the generator must not prefix them again: the run commands mount the
+    /// prefixed name, and a second prefix wrote the files where nothing read them
+    /// (docker then created a directory at the missing mount source).
+    #[test]
+    fn standalone_writes_configs_and_secrets_where_the_run_commands_mount_them() {
+        let mut service = service("api", ServiceType::Public, &[]);
+        service.configs = vec![ServiceConfigOption {
+            config_name: "shop-data".to_string(),
+            mount_path: "/data".to_string(),
+        }];
+        service.secrets = vec![ServiceSecret {
+            name: "shop-tls_key".to_string(),
+            mount: SecretMount::FilePath("/run/secrets/tls.key".to_string()),
+        }];
+
+        let mut spec = spec(vec![service]);
+        spec.current_deployment.configs = vec![ConfigResolvedSpec {
+            name: "shop-data".to_string(),
+            files: vec![ConfigResolvedFile {
+                name: "settings.json".to_string(),
+                content: b"{}".to_vec(),
+            }],
+        }];
+        spec.current_deployment.secrets = vec![SecretResolvedSpec {
+            name: "shop-tls_key".to_string(),
+            value: SecretResolvedValue::Literal("pem".to_string()),
+        }];
+        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: false };
+        spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, &docker_spec, dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
+
+        assert!(script.contains("-v $(pwd)/configs/shop-data:/data"));
+        assert!(script.contains("-v $(pwd)/secrets/shop-tls_key:/run/secrets/tls.key"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("configs").join("shop-data").join("settings.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("secrets").join("shop-tls_key")).unwrap(),
+            "pem"
+        );
+        assert!(!dir.path().join("configs").join("shop-shop-data").exists());
+    }
+
+    #[test]
+    fn swarm_defers_aws_secrets_to_the_deploy_target() {
+        let mut spec = spec(vec![with_secrets(
+            service("api", ServiceType::Public, &[]),
+            &[
+                ("shop-db_password", SecretMount::EnvVariable("DB_PASSWORD".to_string())),
+                ("shop-tls_key", SecretMount::FilePath("/run/secrets/tls.key".to_string())),
+            ],
+        )]);
+        spec.current_deployment.secrets = vec![
+            aws_secret("shop-db_password", "prod/shop/db", Some(".password")),
+            aws_secret("shop-tls_key", "prod/shop/tls", None),
+        ];
+
+        let (dir, script) = generate_swarm_to_temp(&spec);
+
+        // The deploy script sources the fetch script before it deploys anything,
+        // so the exported values reach the stack file's ${...} interpolation.
+        let source = script.find(". ./fetch-secrets.sh").unwrap();
+        let deploy = script.find("docker stack deploy").unwrap();
+        assert!(source < deploy);
+
+        let fetch = fs::read_to_string(dir.path().join("fetch-secrets.sh")).unwrap();
+        assert!(fetch.contains(
+            "SIMPLED_SECRET_SHOP_DB_PASSWORD=\"$(aws secretsmanager get-secret-value \
+             --secret-id 'prod/shop/db' --query SecretString --output text | jq -r '.password')\""
+        ));
+        assert!(fetch.contains("export SIMPLED_SECRET_SHOP_DB_PASSWORD"));
+        // Only the secret that asked for a filter pulls jq into the requirements.
+        assert!(fetch.contains("command -v jq"));
+        assert!(fetch.contains("printf '%s' \"$SIMPLED_SECRET_SHOP_TLS_KEY\" > 'prod/api/run/secrets/tls.key'"));
+
+        // The stack file references the secret instead of carrying its value, and
+        // the file behind the bind mount is left for the fetch script to create.
+        let stack = fs::read_to_string(dir.path().join("prod").join("docker-compose.yaml")).unwrap();
+        assert!(stack.contains("DB_PASSWORD: ${SIMPLED_SECRET_SHOP_DB_PASSWORD}"));
+        assert!(stack.contains("./api/run/secrets/tls.key:/run/secrets/tls.key"));
+        assert!(!dir.path().join("prod").join("api").join("run/secrets/tls.key").exists());
+    }
+
+    #[test]
+    fn swarm_job_expands_deferred_secrets_in_the_shell() {
+        let mut spec = spec(vec![with_secrets(
+            service("migrate", ServiceType::Job, &[]),
+            &[("shop-db_password", SecretMount::EnvVariable("DB_PASSWORD".to_string()))],
+        )]);
+        spec.current_deployment.secrets = vec![aws_secret("shop-db_password", "prod/shop/db", None)];
+
+        let (_dir, script) = generate_swarm_to_temp(&spec);
+
+        // A job is created outside the stack file, so the placeholder has to be
+        // left unquoted for the deploy script's own shell to expand it.
+        assert!(script.contains("-e \"DB_PASSWORD=${SIMPLED_SECRET_SHOP_DB_PASSWORD}\""));
+    }
+
+    #[test]
+    fn standalone_writes_deferred_secrets_where_the_run_commands_read_them() {
+        let mut spec = spec(vec![with_secrets(
+            service("api", ServiceType::Public, &[]),
+            &[
+                ("shop-db_password", SecretMount::EnvVariable("DB_PASSWORD".to_string())),
+                ("shop-api_key", SecretMount::EnvVariable("API_KEY".to_string())),
+            ],
+        )]);
+        spec.current_deployment.secrets = vec![
+            aws_secret("shop-db_password", "prod/shop/db", None),
+            SecretResolvedSpec {
+                name: "shop-api_key".to_string(),
+                value: SecretResolvedValue::Literal("k3y".to_string()),
+            },
+        ];
+        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: false };
+        spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, &docker_spec, dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
+
+        assert!(script.contains(". ./fetch-secrets.sh"));
+        // Both kinds are read back the same way; only where the file comes from
+        // differs, so the names have to line up with what the resolver produced.
+        assert!(script.contains("-e DB_PASSWORD=$(cat ./secrets/shop-db_password)"));
+        let fetch = fs::read_to_string(dir.path().join("fetch-secrets.sh")).unwrap();
+        assert!(fetch.contains("printf '%s' \"$SIMPLED_SECRET_SHOP_DB_PASSWORD\" > 'secrets/shop-db_password'"));
+        assert!(!dir.path().join("secrets").join("shop-db_password").exists());
+
+        // A secret that was resolvable here is still written out as before.
+        let literal = fs::read_to_string(dir.path().join("secrets").join("shop-api_key")).unwrap();
+        assert_eq!(literal, "k3y");
     }
 }

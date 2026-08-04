@@ -551,6 +551,9 @@ Let's deploy a website that contains frontend and headless CMS services.
         env: REDIS_PASSWORD # read secret from environment variable REDIS_PASSWORD during deployment time.
       db_password:
         file: ./secrets/website_db_password.txt # read secret from a file during deployment time.
+      sendgrid_apikey:
+        aws: prod/website/sendgrid # read from AWS Secrets Manager, on the deploy target
+        jq: .api_key               # optional, when the AWS secret holds a JSON document
     # define default resource configuration for all services. Can be overridden for individual services. 
     defaults:
       replicas: 2
@@ -575,6 +578,14 @@ Let's deploy a website that contains frontend and headless CMS services.
           "/admin":
             strip: false
 ```
+
+#### AWS Secrets Manager
+
+`env` and `file` are read while the deployment is prepared, which usually happens in CI — the value ends up inside the directory that is then copied to the deploy target. `aws` avoids that: simpled writes the lookup into a generated `fetch-secrets.sh`, and the value is read from AWS Secrets Manager on the machine that runs the deploy.
+
+`deploy.sh` sources that script before it starts anything, so a Docker deploy needs no extra step. For Kubernetes, run `manifests/fetch-secrets.sh` against the target cluster before `kubectl apply -f manifests/`.
+
+The deploy target needs the AWS CLI on `PATH` (credentials, region and profile come from its own environment), plus `jq` when a secret uses the `jq` filter. See [AWS Secrets Manager](docs/reference.md#aws-secrets-manager) for details.
 
 #### `secrets_folder` (local only)
 

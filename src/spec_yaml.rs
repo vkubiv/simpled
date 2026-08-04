@@ -209,6 +209,11 @@ pub struct DeploymentSpecYaml {
 pub struct DeploymentSecretSpecYaml {
     pub env: Option<String>,
     pub file: Option<String>,
+    // AWS Secrets Manager secret name or ARN. Resolved on the deploy target, not
+    // here, so the value never enters the generated deployment directory.
+    pub aws: Option<String>,
+    // Optional jq filter for `aws` secrets that hold a JSON document.
+    pub jq: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

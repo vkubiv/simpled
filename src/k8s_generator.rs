@@ -1,4 +1,5 @@
 use crate::resolved_spec::{EnvironmentResolvedSpec, LetsEncryptResolvedSpec};
+use crate::secret_fetch::{self, sh_quote, FetchScript};
 use crate::spec::{parse_duration_secs, Healthcheck, SecretMount};
 use anyhow::Result;
 use std::fs::File;
@@ -34,8 +35,22 @@ pub fn generate(
         }
     }
 
-    // 2. Secrets
+    // 2. Secrets. A secret with an `aws` source gets no manifest: its value is
+    // only read where the deploy runs, so `fetch-secrets.sh` applies it with
+    // kubectl instead of shipping it base64-encoded in the manifest directory.
+    let mut fetch_script = FetchScript::new();
     for secret in &deployment.secrets {
+        if let Some(reference) = secret.deferred() {
+            fetch_script.fetch(secret, reference);
+            fetch_script.command(format!(
+                "kubectl create secret generic {name} --from-literal=value=\"${var}\" \
+                 --dry-run=client -o yaml | kubectl apply -f -",
+                name = sh_quote(&secret.name),
+                var = secret.shell_var(),
+            ));
+            continue;
+        }
+
         let file_name = output_dir.join(format!("secret-{}.yaml", secret.name));
         let mut file = File::create(file_name)?;
         writeln!(file, "apiVersion: v1")?;
@@ -44,8 +59,16 @@ pub fn generate(
         writeln!(file, "  name: {}", secret.name)?;
         writeln!(file, "type: Opaque")?;
         writeln!(file, "data:")?;
-        let encoded = general_purpose::STANDARD.encode(&secret.value);
-        writeln!(file, "  {}: {}", "value", encoded)?; 
+        let encoded = general_purpose::STANDARD.encode(secret.literal().unwrap_or_default());
+        writeln!(file, "  {}: {}", "value", encoded)?;
+    }
+
+    if !fetch_script.is_empty() {
+        fetch_script.write(
+            &output_dir.join(secret_fetch::SCRIPT_NAME),
+            "Run it against the target cluster before `kubectl apply -f .`; it creates the \
+             Secrets the manifests here reference.",
+        )?;
     }
 
     // 3. Deployments & Services

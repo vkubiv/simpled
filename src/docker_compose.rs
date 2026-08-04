@@ -141,12 +141,20 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
     }
 
 
-    // Secrets
+    // Secrets. A secret with an `aws` source has no value yet: `fetch-secrets.sh`
+    // exports it as a shell variable and writes its file on the deploy target, so
+    // the compose file only references it — through `${VAR}` interpolation, which
+    // `docker stack deploy` resolves from its own environment — and the file mount
+    // points at a path the fetch script will have populated.
     for secret_option in &service.secrets {
         if let Some(secret_spec) =  spec.current_deployment.secrets.iter().find(|s| s.name == secret_option.name) {
             match &secret_option.mount {
                 SecretMount::EnvVariable(var_name) => {
-                    environment.insert(var_name.clone(), secret_spec.value.clone());
+                    let value = match secret_spec.literal() {
+                        Some(literal) => literal.to_string(),
+                        None => format!("${{{}}}", secret_spec.shell_var()),
+                    };
+                    environment.insert(var_name.clone(), value);
                 },
 
                 SecretMount::FilePath(mount_path) => {
@@ -156,7 +164,9 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
                     if let Some(parent) = host_path.parent() {
                         fs::create_dir_all(parent).context("Failed to create secret parent directory")?;
                     }
-                    fs::write(&host_path, &secret_spec.value).context("Failed to write secret file")?;
+                    if let Some(literal) = secret_spec.literal() {
+                        fs::write(&host_path, literal).context("Failed to write secret file")?;
+                    }
 
                     let rel_path_str = rel_path.replace("\\", "/");
                     volumes.push(format!("./{}/{}:{}", service.full_name, rel_path_str, mount_path));
@@ -228,9 +238,16 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
             eprintln!("Warning: Secret {} not found for service {}", secret_option.name, service.full_name);
             continue;
         };
+        // Host-run services exist for `local` only, where secrets with an `aws`
+        // source are fetched during resolution, so a value is always available.
+        let Some(value) = secret_spec.literal() else {
+            eprintln!("Warning: Secret {} is only fetched on the deploy target and cannot be written \
+                to the working_dir of {}", secret_option.name, service.full_name);
+            continue;
+        };
         match &secret_option.mount {
             SecretMount::EnvVariable(var_name) => {
-                env_vars.push(EnvVariable { name: var_name.clone(), value: secret_spec.value.clone() });
+                env_vars.push(EnvVariable { name: var_name.clone(), value: value.to_string() });
             }
             SecretMount::FilePath(mount_path) => {
                 let rel_path = mount_path.trim_start_matches('/');
@@ -238,7 +255,7 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
                 if let Some(parent) = host_path.parent() {
                     fs::create_dir_all(parent).context("Failed to create secret parent directory")?;
                 }
-                fs::write(&host_path, &secret_spec.value).context("Failed to write secret file")?;
+                fs::write(&host_path, value).context("Failed to write secret file")?;
             }
         }
     }

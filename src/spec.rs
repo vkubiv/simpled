@@ -372,6 +372,20 @@ pub enum DeploymentSecretSource {
     EnvVariable(String),
     FilePath(String),
     Embedded(String),
+    /// AWS Secrets Manager. Unlike the other sources this one is *not* read when
+    /// the deployment is prepared: the generated artifacts carry the lookup, and
+    /// the value is fetched on the machine that runs the deploy. That keeps the
+    /// value out of the directory that is shipped to the target.
+    Aws(AwsSecretRef),
+}
+
+#[derive(Debug, Clone)]
+pub struct AwsSecretRef {
+    /// Name or ARN, passed to `aws secretsmanager get-secret-value --secret-id`.
+    pub secret_id: String,
+    /// Optional `jq` filter applied to the fetched `SecretString`, for secrets
+    /// that hold a JSON document and only one of its fields is wanted.
+    pub jq: Option<String>,
 }
 
 #[derive(Debug, Clone)]

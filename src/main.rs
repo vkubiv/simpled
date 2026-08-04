@@ -9,6 +9,7 @@ mod transform;
 mod validator;
 mod resolved_spec;
 mod resolver;
+mod secret_fetch;
 mod k8s_generator;
 mod docker_generator;
 mod run_local;

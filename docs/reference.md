@@ -300,6 +300,48 @@ This keeps sensitive values out of the spec file while still having a simple, de
 
 ---
 
+### AWS Secrets Manager
+
+A deployment secret can name a secret in AWS Secrets Manager instead of carrying its value:
+
+```yaml
+# envspec.yaml
+deployments:
+  myapp_prod:
+    secrets:
+      db_password:
+        aws: prod/myapp/db      # secret name or full ARN
+        jq: .password           # optional; the secret holds JSON, take one field
+      sendgrid_apikey:
+        aws: prod/myapp/sendgrid
+```
+
+Unlike `env` and `file`, an `aws` secret is **not** read while `simpled prepare-deployment` runs. That command usually runs in CI, and the directory it produces is copied to the deploy target, so a value resolved there would travel through the build artifact and whatever transport carries it. Instead simpled generates `fetch-secrets.sh` next to `deploy.sh`, and the lookup happens on the machine that runs the deploy:
+
+```
+docker-deploy/
+├── deploy.sh           # sources fetch-secrets.sh before it starts anything
+├── fetch-secrets.sh
+└── ...
+```
+
+Nothing extra to run — `deploy.sh` sources it. For `k8s`, `manifests/fetch-secrets.sh` is generated instead and must be run against the target cluster **before** `kubectl apply -f manifests/`; it creates the Secrets with `kubectl create secret generic`.
+
+Requirements on the deploy target:
+
+- The **AWS CLI** on `PATH`. Credentials, region and profile come from its own environment — an instance role, `AWS_REGION`, `AWS_PROFILE`, and so on. The generated script does not configure any of them.
+- **jq** on `PATH`, but only when at least one secret sets `jq`.
+
+The script fails the deploy if a lookup fails or resolves to an empty value, so a missing secret or a `jq` filter that matches nothing cannot reach a running service as a blank credential.
+
+Notes:
+
+- `jq` is only valid together with `aws`, and `aws` cannot be combined with `env` or `file`.
+- `$secret(name)` cannot reference an `aws` secret: env files are written when the deployment is prepared, and the value does not exist yet. Mount the secret on the service with `variable:` instead.
+- For `local` deployments there is no deploy target to defer to, so the lookup runs on your machine while the environment is resolved.
+
+---
+
 ### gateway
 
 ```yaml
@@ -350,10 +392,14 @@ deployments:
       config-name: ./path/to/files
     secrets_folder: ./secrets   # local only; omit on k8s/docker
     secrets:
-      secret_name:
-        value: literal        # local dev only
-        env: ENV_VAR_NAME     # read from shell environment
-        file: ./path/to/file  # read from file
+      literal_secret: the-value   # local dev only
+      from_env:
+        env: ENV_VAR_NAME         # read from shell environment
+      from_file:
+        file: ./path/to/file      # read from file
+      from_aws:
+        aws: prod/myapp/db        # read from AWS Secrets Manager on the deploy target
+        jq: .password             # optional; for secrets holding a JSON document
     defaults:
       replicas: 2
       resources:
@@ -393,7 +439,7 @@ deployments:
 | `environment` | string | no | Path to a `.env` file with variable values. |
 | `undockerized_environment` | string | no | Path to a `.env` file for services running outside Docker. See [undockerized_environment](#undockerized_environment). |
 | `configs` | map | no | Maps config names to directories containing the config files. |
-| `secrets` | map | no | Provides values for the secrets declared in `appspec.yaml`. |
+| `secrets` | map | no | Provides values for the secrets declared in `appspec.yaml`, from a literal, `env`, `file` or `aws`. See [AWS Secrets Manager](#aws-secrets-manager). |
 | `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
 | `defaults` | object | no | Default replica count and resource limits applied to all services. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |

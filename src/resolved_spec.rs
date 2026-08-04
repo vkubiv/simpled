@@ -1,4 +1,4 @@
-use crate::spec::{DeploymentEnvType, EnvVariable, Healthcheck, ResourcesSpec, ServiceCommand, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume};
+use crate::spec::{AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, ResourcesSpec, ServiceCommand, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume};
 
 #[derive(Debug)]
 pub struct EnvironmentResolvedSpec {
@@ -97,8 +97,52 @@ pub struct ServiceResolvedSpec {
 #[derive(Debug)]
 pub struct SecretResolvedSpec {
     pub name: String,
-    pub value: String,
+    pub value: SecretResolvedValue,
 }
+
+/// Where a secret's value comes from once the deployment has been resolved.
+#[derive(Debug, Clone)]
+pub enum SecretResolvedValue {
+    /// Known while the deployment is prepared, and baked into the generated files.
+    Literal(String),
+    /// Only known on the machine that runs the deploy. The generators emit the
+    /// lookup into `fetch-secrets.sh` instead of the value itself.
+    Deferred(AwsSecretRef),
+}
+
+impl SecretResolvedSpec {
+    /// The value to write into a generated file, or `None` when it is only
+    /// available on the deploy target.
+    pub fn literal(&self) -> Option<&str> {
+        match &self.value {
+            SecretResolvedValue::Literal(value) => Some(value),
+            SecretResolvedValue::Deferred(_) => None,
+        }
+    }
+
+    pub fn deferred(&self) -> Option<&AwsSecretRef> {
+        match &self.value {
+            SecretResolvedValue::Literal(_) => None,
+            SecretResolvedValue::Deferred(reference) => Some(reference),
+        }
+    }
+
+    /// Shell variable `fetch-secrets.sh` exports the fetched value as. Used to
+    /// reference a deferred secret from the generated deploy script and, through
+    /// compose's `${VAR}` interpolation, from the generated stack file.
+    pub fn shell_var(&self) -> String {
+        let sanitized: String = self.name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect();
+        format!("{}{}", SHELL_VAR_PREFIX, sanitized)
+    }
+}
+
+/// Prefix of the shell variables that carry deferred secret values. Also used to
+/// recognize a placeholder again when the compose representation of a service is
+/// translated back into `docker service create` flags for a job.
+pub const SHELL_VAR_PREFIX: &str = "SIMPLED_SECRET_";
 
 #[derive(Debug)]
 pub struct DeploymentResolvedSpec {
@@ -112,6 +156,15 @@ pub struct DeploymentResolvedSpec {
 }
 
 impl DeploymentResolvedSpec {
+    /// Secrets whose value is only fetched on the deploy target, paired with the
+    /// AWS lookup that fetches it. Empty for a deployment that declares none, in
+    /// which case no `fetch-secrets.sh` is generated at all.
+    pub fn deferred_secrets(&self) -> Vec<(&SecretResolvedSpec, &AwsSecretRef)> {
+        self.secrets.iter()
+            .filter_map(|secret| secret.deferred().map(|reference| (secret, reference)))
+            .collect()
+    }
+
     /// Services that run to completion (`type: job`), in dependency order: a job
     /// that depends on another job comes after it. Ties are broken by name so the
     /// generated scripts are stable across runs.

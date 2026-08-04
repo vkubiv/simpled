@@ -19,7 +19,29 @@
       "PowerShell(cargo build *)",
       "PowerShell(cargo test *)",
       "Bash(cp ../hc/appspec.yaml .)",
-      "Bash(\"D:\\\\С\\\\apps\\\\simpled\\\\target\\\\debug\\\\simpled.exe\" prepare-deployment *)"
+      "Bash(\"D:\\\\С\\\\apps\\\\simpled\\\\target\\\\debug\\\\simpled.exe\" prepare-deployment *)",
+      "Bash(D:/С/apps/simpled/target/debug/simpled.exe app-bundle *)",
+      "Bash(tar -xzOf C:/Users/volod/AppData/Local/Temp/claude/D----apps-simpled/bd4d4e2e-ba2c-4c6c-864a-5af11273568b/scratchpad/e2e/app/e2e_app.1.0.2-feature-big-refactor.tar.gz appspec.yaml)",
+      "Bash(tar -xzOf e2e_app.1.0.2-feature-big-refactor.tar.gz appspec.yaml)",
+      "Bash(cp C:/Users/volod/AppData/Local/Temp/claude/D----apps-simpled/bd4d4e2e-ba2c-4c6c-864a-5af11273568b/scratchpad/e2e/app/e2e_app.1.0.2-feature-big-refactor.tar.gz C:/Users/volod/AppData/Local/Temp/claude/D----apps-simpled/bd4d4e2e-ba2c-4c6c-864a-5af11273568b/scratchpad/e2e/deploy/)",
+      "Bash(D:/С/apps/simpled/target/debug/simpled.exe prepare-deployment *)",
+      "Bash(python -c ' *)",
+      "Bash(simpled)",
+      "Bash(grep -E \"^error|warning: `simpled`|Finished\")",
+      "Bash(./target/debug/simpled.exe app-bundle *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git merge *)",
+      "Bash(git branch *)",
+      "PowerShell(cargo run *)",
+      "Bash(\"D:/C/apps/simpled/target/debug/simpled.exe\" local *)",
+      "Bash(git check-ignore *)",
+      "Bash(git commit *)",
+      "Bash(xargs wc -l)",
+      "Bash(aws --version)",
+      "Bash(jq --version)",
+      "Bash(rm -f sample-fetch-secrets.sh)"
     ]
   }
 }

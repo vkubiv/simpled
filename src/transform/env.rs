@@ -401,15 +401,27 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_
         for (k, v) in sec {
             match v {
                 DeploymentSecretSpecExYaml::Detailed(v) => {
-                    if v.env.is_some() && v.file.is_some() {
-                        return Err(anyhow!("Secret {} cannot have both env and file sources", k));
+                    let sources = [v.env.is_some(), v.file.is_some(), v.aws.is_some()]
+                        .iter()
+                        .filter(|present| **present)
+                        .count();
+                    if sources > 1 {
+                        return Err(anyhow!("Secret {} can only have one of the env, file and aws sources", k));
+                    }
+                    if v.jq.is_some() && v.aws.is_none() {
+                        return Err(anyhow!("Secret {} sets jq, which is only valid together with an aws source", k));
                     }
                     let source = if let Some(env) = &v.env {
                         DeploymentSecretSource::EnvVariable(env.clone())
                     } else if let Some(file) = &v.file {
                         DeploymentSecretSource::FilePath(file.clone())
+                    } else if let Some(aws) = &v.aws {
+                        DeploymentSecretSource::Aws(AwsSecretRef {
+                            secret_id: aws.clone(),
+                            jq: v.jq.clone(),
+                        })
                     } else {
-                        return Err(anyhow!("Secret {} must have either env or file source", k));
+                        return Err(anyhow!("Secret {} must have an env, file or aws source", k));
                     };
                     list.push(DeploymentSecretSpec {
                         secret_name: k.clone(),
