@@ -10,9 +10,37 @@ use crate::spec::{EnvVariable, Healthcheck, SecretMount, ServiceCommand, Service
 
 #[derive(Serialize)]
 pub struct DockerCompose {
+    // Compose project name. Only set for the local run; `docker stack deploy`
+    // takes the stack name on the command line and ignores this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub services: HashMap<String, DockerService>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub networks: HashMap<String, DockerComposeNetwork>,
+}
+
+/// Compose project name for a local run.
+///
+/// Without an explicit name compose falls back to the directory holding the
+/// file, which is always `local_env` - so every application on the machine
+/// shares one project, and bringing one up removes the containers of the last
+/// one (`--remove-orphans` treats them as orphans of its own project). Naming
+/// the project after the application keeps them apart. Compose only accepts
+/// `[a-z0-9][a-z0-9_-]*`, so anything else in the name folds into an underscore.
+pub fn local_project_name(application_name: &str) -> String {
+    let sanitized: String = application_name
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+
+    let sanitized = sanitized.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+
+    if sanitized.is_empty() {
+        "local".to_string()
+    } else {
+        format!("{}_local", sanitized)
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -270,4 +298,25 @@ fn write_env_file(path: &Path, vars: &[EnvVariable]) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(path, content).context(format!("Failed to write env file {:?}", path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_name_suffixes_the_application_name() {
+        assert_eq!(local_project_name("room_scaner_backend"), "room_scaner_backend_local");
+        assert_eq!(local_project_name("shop-api"), "shop-api_local");
+    }
+
+    #[test]
+    fn project_name_is_a_valid_compose_project() {
+        // Compose rejects anything outside [a-z0-9][a-z0-9_-]*, so an application
+        // name with capitals, spaces or dots must not reach it unchanged.
+        assert_eq!(local_project_name("Room Scaner"), "room_scaner_local");
+        assert_eq!(local_project_name("acme.shop"), "acme_shop_local");
+        assert_eq!(local_project_name("_leading"), "leading_local");
+        assert_eq!(local_project_name("***"), "local");
+    }
 }

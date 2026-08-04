@@ -97,6 +97,7 @@ where
     }
 
     let compose = DockerCompose {
+        name: Some(local_project_name(&spec.current_deployment.application_name)),
         services: services_map,
         networks: HashMap::new(),
     };

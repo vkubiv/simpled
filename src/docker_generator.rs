@@ -404,6 +404,7 @@ fn generate_swarm(
         .collect();
 
     let compose = DockerCompose {
+        name: None,
         services: stack_services,
         networks: compose_network(),
     };
@@ -425,6 +426,7 @@ fn generate_swarm(
             .collect();
 
         let deps_compose = DockerCompose {
+            name: None,
             services: dep_services,
             networks: compose_network(),
         };

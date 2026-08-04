@@ -763,6 +763,8 @@ Output directory: `docker-deploy/`
 
 Output directory: `local_env/`
 
+The compose file sets its project name to `<application.name>_local`, so several applications can be run locally on the same machine without one taking over the other's project.
+
 | File | Description |
 |------|-------------|
 | `docker-compose.yaml` | Compose file for all services |

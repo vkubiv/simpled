@@ -41,7 +41,21 @@
       "Bash(xargs wc -l)",
       "Bash(aws --version)",
       "Bash(jq --version)",
-      "Bash(rm -f sample-fetch-secrets.sh)"
+      "Bash(rm -f sample-fetch-secrets.sh)",
+      "Bash(rm -rf /c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/local3)",
+      "Bash(mkdir -p /c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad)",
+      "Bash(cp -r /d/C/apps/simpled/example/environments/local3 /c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/local3)",
+      "Bash(rm -rf /c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/local3/local_env)",
+      "Read(//c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/**)",
+      "Read(//c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/local3/local_env/admin-svc/**)",
+      "Read(//c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/local3/**)",
+      "Bash(/d/C/apps/simpled/target/debug/simpled.exe local *)",
+      "Bash(rm -f /c/Users/volod/AppData/Local/Temp/claude/D--C-apps-simpled/0b6e35cf-b4f5-4c75-92a6-f3018ddc189b/scratchpad/local3/.env.local)",
+      "Bash(gh release *)",
+      "Bash(cargo fmt *)",
+      "Bash(rustfmt --check --edition 2021 --config max_width=120 src/updater.rs)",
+      "Bash(python *)",
+      "Bash(/d/C/apps/simpled/target/debug/simpled.exe --help)"
     ]
   }
 }
