@@ -192,8 +192,8 @@ fn resolve_deployment(
 }
 
 /// Merges a child deployment onto its already-resolved base. Scalar fields fall
-/// back to the base when the child leaves them unset; map fields are unioned with
-/// the child's entries winning on key conflicts.
+/// back to the base when the child leaves them unset; map fields and environment
+/// lists are unioned with the child's entries winning on key conflicts.
 fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> DeploymentSpecYaml {
     DeploymentSpecYaml {
         extends: child.extends.clone(),
@@ -201,16 +201,70 @@ fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> De
         is_abstract: child.is_abstract,
         primary_host: child.primary_host.clone().or_else(|| base.primary_host.clone()),
         application: merge_application(base.application.as_ref(), child.application.as_ref()),
-        environment: child.environment.clone().or_else(|| base.environment.clone()),
-        undockerized_environment: child
-            .undockerized_environment
-            .clone()
-            .or_else(|| base.undockerized_environment.clone()),
+        environment: merge_env_variables(base.environment.as_ref(), child.environment.as_ref()),
+        undockerized_environment: merge_env_variables(
+            base.undockerized_environment.as_ref(),
+            child.undockerized_environment.as_ref(),
+        ),
         configs: merge_opt_map(base.configs.as_ref(), child.configs.as_ref(), |_, c| c.clone()),
         secrets: merge_opt_map(base.secrets.as_ref(), child.secrets.as_ref(), |_, c| c.clone()),
         defaults: child.defaults.clone().or_else(|| base.defaults.clone()),
         services: merge_opt_map(base.services.as_ref(), child.services.as_ref(), merge_service),
         secrets_folder: child.secrets_folder.clone().or_else(|| base.secrets_folder.clone()),
+    }
+}
+
+/// Merges a child's environment onto the base's, keyed by variable name: the
+/// base order is preserved, a child entry redefining a base variable replaces it
+/// in place, and new variables are appended. A list and an `.env` file path
+/// cannot be combined, so in that case the child replaces the base outright.
+fn merge_env_variables(
+    base: Option<&DeploymentEnvVariablesYaml>,
+    child: Option<&DeploymentEnvVariablesYaml>,
+) -> Option<DeploymentEnvVariablesYaml> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(c)) => Some(c.clone()),
+        (
+            Some(DeploymentEnvVariablesYaml::FromList(b)),
+            Some(DeploymentEnvVariablesYaml::FromList(c)),
+        ) => {
+            let mut out = b.clone();
+            let mut index: HashMap<String, usize> = HashMap::new();
+            for (i, entry) in out.iter().enumerate() {
+                if let Some(name) = env_entry_name(entry) {
+                    index.insert(name, i);
+                }
+            }
+            for entry in c {
+                let name = env_entry_name(entry);
+                match name.as_ref().and_then(|n| index.get(n)).copied() {
+                    Some(pos) => out[pos] = entry.clone(),
+                    None => {
+                        if let Some(n) = name {
+                            index.insert(n, out.len());
+                        }
+                        out.push(entry.clone());
+                    }
+                }
+            }
+            Some(DeploymentEnvVariablesYaml::FromList(out))
+        }
+        (Some(_), Some(c)) => Some(c.clone()),
+    }
+}
+
+/// Name of the variable an entry defines, or `None` when it cannot be
+/// determined. Malformed entries are reported later, when the entry is
+/// converted; here they simply never match a base entry.
+fn env_entry_name(entry: &EnvVariableEntryYaml) -> Option<String> {
+    match entry {
+        EnvVariableEntryYaml::Inline(s) => env_loader::parse_env_string(s).ok().map(|d| d.name),
+        EnvVariableEntryYaml::FromFile(map) => match map.len() {
+            1 => map.keys().next().cloned(),
+            _ => None,
+        },
     }
 }
 
@@ -817,6 +871,72 @@ child:
 
         // The resolved spec is standalone.
         assert!(child.extends.is_none());
+    }
+
+    #[test]
+    fn extends_merges_environment_per_variable() {
+        let raw = r#"
+base:
+  abstract: true
+  primary_host: web
+  application:
+    name: app
+  environment:
+    - DB=postgres://base
+    - REGION=us-east-2
+    - KEEP=1
+  undockerized_environment:
+    - DB=postgres://localhost
+    - KEEP=1
+child:
+  extends: base
+  environment:
+    - DB=postgres://child
+    - EXTRA=yes
+  undockerized_environment:
+    - EXTRA=yes
+"#;
+        let resolved = resolve_extends(&deployments_map(raw)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let env = convert_env_variables(&resolved["child"].environment, root.path()).unwrap();
+
+        // Base order is kept, the child's redefinition replaces in place, and new
+        // variables are appended.
+        let pairs: Vec<(&str, &str)> =
+            env.iter().map(|v| (v.name.as_str(), v.value.as_str())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("DB", "postgres://child"),
+                ("REGION", "us-east-2"),
+                ("KEEP", "1"),
+                ("EXTRA", "yes"),
+            ]
+        );
+
+        // undockerized_environment merges the same way.
+        let undockerized =
+            convert_env_variables(&resolved["child"].undockerized_environment, root.path()).unwrap();
+        let names: Vec<&str> = undockerized.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["DB", "KEEP", "EXTRA"]);
+    }
+
+    #[test]
+    fn extends_env_file_replaces_inherited_list() {
+        let raw = r#"
+base:
+  abstract: true
+  environment:
+    - DB=postgres://base
+child:
+  extends: base
+  environment: ./child.env
+"#;
+        let resolved = resolve_extends(&deployments_map(raw)).unwrap();
+        match resolved["child"].environment.as_ref().unwrap() {
+            DeploymentEnvVariablesYaml::FromEnvFile(path) => assert_eq!(path, "./child.env"),
+            other => panic!("unexpected environment: {other:?}"),
+        }
     }
 
     #[test]

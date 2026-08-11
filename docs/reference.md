@@ -436,8 +436,8 @@ deployments:
 | `abstract` | bool | no | If `true`, this deployment is a template used only as an `extends` base and is not deployed itself. See [extends](#extends). |
 | `primary_host` | string | yes¹ | Gateway host alias used as the base URL for `relative` environment variables. |
 | `application` | object | yes¹ | App name, version constraint, and optional extra service files. |
-| `environment` | string | no | Path to a `.env` file with variable values. |
-| `undockerized_environment` | string | no | Path to a `.env` file for services running outside Docker. See [undockerized_environment](#undockerized_environment). |
+| `environment` | list \| string | no | Either a list of `NAME=value` entries, or a path to a `.env` file with variable values. |
+| `undockerized_environment` | list \| string | no | Same forms as `environment`, for services running outside Docker. See [undockerized_environment](#undockerized_environment). |
 | `configs` | map | no | Maps config names to directories containing the config files. |
 | `secrets` | map | no | Provides values for the secrets declared in `appspec.yaml`, from a literal, `env`, `file` or `aws`. See [AWS Secrets Manager](#aws-secrets-manager). |
 | `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
@@ -452,8 +452,9 @@ A deployment may inherit from another deployment in the same env spec with `exte
 
 Merge rules, applied to the base (the deployment named by `extends`) and the child (the deployment declaring it):
 
-- **Scalar fields** (`primary_host`, `application`, `environment`, `undockerized_environment`, `defaults`, `secrets_folder`) are taken from the base unless the child sets them, in which case the child's value replaces the base's entirely.
+- **Scalar fields** (`primary_host`, `application`, `defaults`, `secrets_folder`) are taken from the base unless the child sets them, in which case the child's value replaces the base's entirely.
 - **Map fields** (`configs`, `secrets`, `services`) are unioned. Keys that appear only in the base or only in the child are kept as-is; a key present in both takes the child's value. For `services`, a shared key is merged field-by-field, so a child can override just `replicas` on a service while inheriting its `host`, `prefix`, and `resources` from the base.
+- **Environment lists** (`environment`, `undockerized_environment`) are merged per variable. The base's variables are all inherited in order; a variable the child redefines takes the child's value in place, and variables only the child declares are appended. So a child listing two variables overrides exactly those two and keeps the rest. A `.env` file path cannot be merged with a list — if either side uses one, the child's value replaces the base's entirely.
 
 `extends` chains are followed to any depth, and cycles are rejected with an error.
 
@@ -466,6 +467,9 @@ deployments:
     application:
       name: myapp
       version: ^1.0.0
+    environment:
+      - REGION=us-east-2
+      - LOG_LEVEL=debug
     defaults:
       replicas: 2
     services:
@@ -478,6 +482,8 @@ deployments:
   prod:
     extends: common
     primary_host: web
+    environment:
+      - LOG_LEVEL=warn            # overrides LOG_LEVEL, keeps common's other variables
     services:
       api:
         replicas: 5               # inherits host/prefix from common, overrides replicas

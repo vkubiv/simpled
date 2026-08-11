@@ -181,10 +181,10 @@ pub enum HostSpecYaml {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeploymentSpecYaml {
     // Name of another deployment in this env spec to inherit from. Scalar fields
-    // (primary_host, application, environment, ...) fall back to the base when not
-    // set here; map fields (configs, secrets, services) are merged with the base,
-    // and this deployment's entries win on key conflicts. `extends` chains are
-    // allowed; cycles are rejected.
+    // (primary_host, application, ...) fall back to the base when not set here;
+    // map fields (configs, secrets, services) and environment lists are merged
+    // with the base, and this deployment's entries win on key conflicts.
+    // `extends` chains are allowed; cycles are rejected.
     pub extends: Option<String>,
     // Marks a deployment as a template that is only used as an `extends` base. An
     // abstract deployment is not deployed on its own and may omit fields that would
