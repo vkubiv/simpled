@@ -90,9 +90,127 @@ fn rewrite_version(content: &str, version: &semver::Version) -> Result<String> {
     Ok(out)
 }
 
+/// An image that lives in an Amazon ECR private registry, split into the parts the
+/// `aws ecr` commands need.
+#[derive(Debug, PartialEq)]
+struct EcrTarget {
+    /// Account that owns the registry. Passed explicitly so that pushing to another
+    /// account's registry does not silently look up the caller's own one.
+    account: String,
+    region: String,
+    /// Repository name, i.e. the image reference without the registry host and tag.
+    repository: String,
+}
+
+/// Recognises `<account>.dkr.ecr[-fips].<region>.amazonaws.com[.cn]/<repository>:<tag>`.
+///
+/// Returns `None` for every other registry: Docker Hub, GHCR and the like create a
+/// repository on first push, so only ECR needs the extra step.
+fn ecr_target(image: &str) -> Option<EcrTarget> {
+    let (host, path) = image.split_once('/')?;
+
+    let parts: Vec<&str> = host.split('.').collect();
+    // `.cn` hosts carry one more label than the commercial ones.
+    let (account, service, region, domain) = match parts.as_slice() {
+        [account, "dkr", service, region, rest @ ..] => (account, service, region, rest),
+        _ => return None,
+    };
+    if *service != "ecr" && *service != "ecr-fips" {
+        return None;
+    }
+    if domain != ["amazonaws", "com"] && domain != ["amazonaws", "com", "cn"] {
+        return None;
+    }
+    if account.is_empty() || region.is_empty() {
+        return None;
+    }
+
+    // A tag cannot contain '/', so the last ':' after the host always starts one.
+    let repository = path.rsplit_once(':').map(|(name, _)| name).unwrap_or(path);
+
+    Some(EcrTarget {
+        account: account.to_string(),
+        region: region.to_string(),
+        repository: repository.to_string(),
+    })
+}
+
+/// Creates the ECR repository behind `image` when it does not exist yet.
+///
+/// ECR, unlike most registries, rejects a push to an unknown repository with
+/// `name unknown: The repository with name '<name>' does not exist`, which would
+/// otherwise force every new service to be registered by hand before the first build.
+fn ensure_ecr_repository(image: &str) -> Result<()> {
+    let Some(target) = ecr_target(image) else {
+        return Ok(());
+    };
+
+    let describe = Command::new("aws")
+        .args([
+            "ecr",
+            "describe-repositories",
+            "--region",
+            &target.region,
+            "--registry-id",
+            &target.account,
+            "--repository-names",
+            &target.repository,
+        ])
+        .output()
+        .context("Failed to run the AWS CLI. It is required to create missing ECR repositories. \
+                  Pass --no-create-repos to push without it.")?;
+
+    if describe.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&describe.stderr);
+    if !stderr.contains("RepositoryNotFoundException") {
+        bail!(
+            "aws ecr describe-repositories failed for '{}': {}",
+            target.repository,
+            stderr.trim()
+        );
+    }
+
+    println!(
+        "Creating ECR repository {} in {} (account {})",
+        target.repository, target.region, target.account
+    );
+
+    let create = Command::new("aws")
+        .args([
+            "ecr",
+            "create-repository",
+            "--region",
+            &target.region,
+            "--registry-id",
+            &target.account,
+            "--repository-name",
+            &target.repository,
+        ])
+        .output()
+        .context("Failed to run the AWS CLI to create an ECR repository")?;
+
+    if !create.status.success() {
+        let stderr = String::from_utf8_lossy(&create.stderr);
+        // Another build of the same app can win the race between describe and create.
+        if !stderr.contains("RepositoryAlreadyExistsException") {
+            bail!(
+                "aws ecr create-repository failed for '{}': {}",
+                target.repository,
+                stderr.trim()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub fn create_app_bundle(
     registry: &Option<String>,
     push_images: bool,
+    create_repos: bool,
     _upload: &Option<String>,
     upload_bundle_to: &Option<String>,
     gh_repo: &Option<String>,
@@ -168,6 +286,10 @@ pub fn create_app_bundle(
              }
              
              if push_images {
+                 if create_repos {
+                     ensure_ecr_repository(&target_image)?;
+                 }
+
                  println!("Pushing {}", target_image);
                  let status = Command::new("docker")
                      .arg("push")
@@ -305,6 +427,46 @@ mod tests {
         assert_eq!(spec::version_to_tag("1.0.2+big-refactor"), "1.0.2-big-refactor");
         assert_eq!(spec::version_to_tag("1.0.2-rc1+big-refactor"), "1.0.2-rc1-big-refactor");
         assert_eq!(spec::version_to_tag("1.0.2"), "1.0.2");
+    }
+
+    fn ecr(account: &str, region: &str, repository: &str) -> Option<EcrTarget> {
+        Some(EcrTarget {
+            account: account.to_string(),
+            region: region.to_string(),
+            repository: repository.to_string(),
+        })
+    }
+
+    #[test]
+    fn test_ecr_target() {
+        assert_eq!(
+            ecr_target("559519637681.dkr.ecr.eu-central-1.amazonaws.com/hobbyshopify/storefront:1.0.2"),
+            ecr("559519637681", "eu-central-1", "hobbyshopify/storefront")
+        );
+
+        // Untagged images and the FIPS and China endpoints are still ECR.
+        assert_eq!(
+            ecr_target("1234.dkr.ecr.us-east-1.amazonaws.com/api"),
+            ecr("1234", "us-east-1", "api")
+        );
+        assert_eq!(
+            ecr_target("1234.dkr.ecr-fips.us-gov-west-1.amazonaws.com/api:1.0.2"),
+            ecr("1234", "us-gov-west-1", "api")
+        );
+        assert_eq!(
+            ecr_target("1234.dkr.ecr.cn-north-1.amazonaws.com.cn/api:1.0.2"),
+            ecr("1234", "cn-north-1", "api")
+        );
+
+        // Everything else creates repositories on push and is left alone.
+        assert_eq!(ecr_target("mycompany/web:1.0.2"), None);
+        assert_eq!(ecr_target("registry.example.com/mycompany/web:1.0.2"), None);
+        assert_eq!(ecr_target("ghcr.io/mycompany/web:1.0.2"), None);
+        assert_eq!(ecr_target("public.ecr.aws/mycompany/web:1.0.2"), None);
+        assert_eq!(ecr_target("localhost:5000/web:1.0.2"), None);
+        // A look-alike host that is not an ECR endpoint.
+        assert_eq!(ecr_target("1234.dkr.ecr.eu-central-1.example.com/api:1.0.2"), None);
+        assert_eq!(ecr_target("1234.dkr.s3.eu-central-1.amazonaws.com/api:1.0.2"), None);
     }
 
     #[test]

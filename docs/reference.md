@@ -598,11 +598,26 @@ simpled app-bundle create [OPTIONS]
 Options:
   --registry <PREFIX=HOST>     Map image prefix to registry (repeatable)
   --push-images                Tag and push images to registry
+  --no-create-repos            Do not create missing Amazon ECR repositories
   --upload-bundle-to <TARGET>  Upload bundle: github-release
   --github-repo <OWNER/REPO>   GitHub repository
   --github-tag-prefix <PREFIX> Prefix for GitHub release tag
   --version-suffix <SUFFIX>    Label appended to the app version (side branches)
 ```
+
+#### Amazon ECR
+
+ECR, unlike Docker Hub or GHCR, does not create a repository on first push and instead fails with:
+
+```
+name unknown: The repository with name 'myapp/web' does not exist in the registry with id '123456789012'
+```
+
+When the registry host is an ECR one (`<account>.dkr.ecr.<region>.amazonaws.com`), `--push-images`
+therefore creates each missing repository before pushing to it, using the account and region from the
+host. This needs the AWS CLI on `PATH` and the `ecr:DescribeRepositories` and `ecr:CreateRepository`
+permissions; existing repositories are left untouched, so only the describe permission is used once
+every repository exists. Pass `--no-create-repos` to turn this off and manage repositories yourself.
 
 #### Version suffix
 
@@ -687,6 +702,12 @@ Options:
 An env spec may define multiple deployments, but only one can run locally at a
 time. When a single deployment is defined it is used automatically; when more
 than one is defined you must pick one with `--deployment <name>`.
+
+The deployments not picked take no part in the run: they are dropped before
+validation, so local deployments are free to share domains, paths, and ports
+with each other. This is what makes [`extends`](#extends) useful locally — a
+variant deployment can inherit its sibling's services wholesale and change only
+the few fields it cares about.
 
 ### `simpled local only-extra`
 

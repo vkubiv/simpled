@@ -116,6 +116,10 @@ enum AppBundleCommands {
         registry: Option<String>,
         #[arg(long)]
         push_images: bool,
+        /// Do not create missing Amazon ECR repositories before pushing. ECR, unlike
+        /// most registries, rejects a push to a repository that does not exist yet.
+        #[arg(long)]
+        no_create_repos: bool,
         #[arg(long)]
         upload: Option<String>,
         #[arg(long)]
@@ -154,8 +158,8 @@ fn main() -> Result<()> {
             AppBundleCommands::Version => {
                 version_command()?;
             }
-            AppBundleCommands::Create { registry, push_images, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix } => {
-                app_bundle::create_app_bundle(registry, *push_images, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix)?;
+            AppBundleCommands::Create { registry, push_images, no_create_repos, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix } => {
+                app_bundle::create_app_bundle(registry, *push_images, !*no_create_repos, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix)?;
             }
         },
         Commands::Secrets { command } => match command {
