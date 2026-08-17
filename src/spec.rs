@@ -415,6 +415,11 @@ pub struct DeploymentServiceSpec {
     pub prefixes: Vec<Prefix>,
     pub resources: ResourcesSpec,
     pub ports: Vec<ServicePort>,
+    // Appended to the service's own volumes, never replacing them.
+    pub volumes: Vec<ServiceVolume>,
+    // Override the app spec's command / entrypoint for this deployment only.
+    pub command: Option<ServiceCommand>,
+    pub entrypoint: Option<ServiceCommand>,
     // local-only: working directory of a host-run (non-dockerized) service.
     pub working_dir: Option<String>,
 }

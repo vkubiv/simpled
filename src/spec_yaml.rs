@@ -284,6 +284,17 @@ pub struct DeploymentServiceSpecYaml {
     // ports are a vector of strings in the form "external:internal"
     pub ports: Option<Vec<String>>,
 
+    // Extra mounts for this service in this deployment, same form as a service's
+    // own `volumes` in the app spec ("./host/path:/container/path" or
+    // "named:/container/path"). Appended to the app spec's, they do not replace
+    // them. This is what lets a deployment mount a source tree into a service so
+    // a watch server can rebuild it in place, without the app spec knowing.
+    pub volumes: Option<Vec<String>>,
+    // Override the image's default command / ENTRYPOINT for this deployment,
+    // same form as a service's own `command` / `entrypoint` in the app spec.
+    pub command: Option<ServiceCommandYaml>,
+    pub entrypoint: Option<ServiceCommandYaml>,
+
     // local-only: directory of a host-run (non-dockerized) service. When set,
     // the undockerized environment is written there as `.env` and the service's
     // secrets are copied alongside it. Setting it for K8S/Docker is an error.

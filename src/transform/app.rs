@@ -226,11 +226,11 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
     let expose = yaml.expose.unwrap_or_default();
 
     let volumes = yaml.volumes.unwrap_or_default().into_iter()
-        .map(|s| parse_service_volume(&s))
+        .map(|s| super::parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
 
-     let command = yaml.command.map(convert_service_command);
-     let entrypoint = yaml.entrypoint.map(convert_service_command);
+     let command = yaml.command.map(super::convert_service_command);
+     let entrypoint = yaml.entrypoint.map(super::convert_service_command);
      let healthcheck = yaml.healthcheck.map(convert_healthcheck).transpose()?;
 
     let depends_on = yaml.depends_on.unwrap_or_default();
@@ -254,13 +254,6 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         depends_on,
         is_app_service,
     })
-}
-
-fn convert_service_command(c: ServiceCommandYaml) -> ServiceCommand {
-    match c {
-        ServiceCommandYaml::Shell(s) => ServiceCommand::Shell(s),
-        ServiceCommandYaml::Exec(v) => ServiceCommand::Exec(v),
-    }
 }
 
 fn convert_healthcheck(yaml: HealthcheckYaml) -> Result<Healthcheck> {
@@ -313,18 +306,3 @@ fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSe
     Ok(secrets)
 }
 
-fn parse_service_volume(s: &str) -> Result<ServiceVolume> {
-    let (vol_str, mount_path) = s.split_once(':')
-        .ok_or_else(|| anyhow!("Invalid volume format '{}'. Expected 'name:mount_path' or './path:mount_path'", s))?;
-
-    let name = if vol_str.starts_with('.') || vol_str.starts_with('/') {
-        ServiceVolumeType::Path(vol_str.to_string())
-    } else {
-        ServiceVolumeType::Named(vol_str.to_string())
-    };
-
-    Ok(ServiceVolume {
-        name,
-        mount_path: mount_path.to_string(),
-    })
-}

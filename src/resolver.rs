@@ -229,6 +229,26 @@ pub fn resolve(
              });
         }
 
+        // The deployment's volumes are appended to the service's own, so a
+        // deployment can mount a source tree into a service (letting a watch
+        // server rebuild it in place) without the app spec knowing about it.
+        // A named volume still has to be declared in the app spec's top-level
+        // `volumes:`, the same rule app-spec-declared mounts obey.
+        let mut service_volumes = app_service.volumes.clone();
+        if let Some(deployment_service) = deployment_service_opt {
+            for volume in &deployment_service.volumes {
+                if let ServiceVolumeType::Named(vol_name) = &volume.name {
+                    if !app_spec.volumes.contains(vol_name) {
+                        return Err(anyhow!(
+                            "Deployment '{}' mounts named volume '{}' on service '{}', but it is not declared in app volumes",
+                            deployment.name, vol_name, app_service.name
+                        ));
+                    }
+                }
+                service_volumes.push(volume.clone());
+            }
+        }
+
         resolved_services.push(ServiceResolvedSpec {
             full_name: format!("{}", app_service.name),
             service_type: app_service.service_type.clone(),
@@ -239,10 +259,14 @@ pub fn resolve(
             undockerized_environment_variables: final_undockerized_service_env_vars,
             configs: service_configs,
             secrets: service_secrets,
-            volumes: app_service.volumes.clone(),
+            volumes: service_volumes,
             expose: app_service.expose.clone(),
-            command: app_service.command.clone(),
-            entrypoint: app_service.entrypoint.clone(),
+            command: deployment_service_opt
+                .and_then(|s| s.command.clone())
+                .or_else(|| app_service.command.clone()),
+            entrypoint: deployment_service_opt
+                .and_then(|s| s.entrypoint.clone())
+                .or_else(|| app_service.entrypoint.clone()),
             healthcheck: app_service.healthcheck.clone(),
             depends_on: app_service.depends_on.clone(),
             ports: deployment_service_opt.map(|s|

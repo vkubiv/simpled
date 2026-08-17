@@ -353,6 +353,19 @@ fn merge_service(
         replicas: child.replicas.or(base.replicas),
         resources: child.resources.clone().or_else(|| base.resources.clone()),
         ports: child.ports.clone().or_else(|| base.ports.clone()),
+        // Volumes concatenate rather than replace: an `extends` child adding a
+        // source mount should keep whatever the base already mounted.
+        volumes: match (&base.volumes, &child.volumes) {
+            (Some(b), Some(c)) => {
+                let mut v = b.clone();
+                v.extend(c.clone());
+                Some(v)
+            }
+            (Some(b), None) => Some(b.clone()),
+            (None, c) => c.clone(),
+        },
+        command: child.command.clone().or_else(|| base.command.clone()),
+        entrypoint: child.entrypoint.clone().or_else(|| base.entrypoint.clone()),
         working_dir: child.working_dir.clone().or_else(|| base.working_dir.clone()),
     }
 }
@@ -669,12 +682,19 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
 
     let ports = super::parse_ports(&yaml.ports)?;
 
+    let volumes = yaml.volumes.clone().unwrap_or_default().into_iter()
+        .map(|s| super::parse_service_volume(&s))
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(DeploymentServiceSpec {
         variant: yaml.variant.clone(),
         host: yaml.host.clone(),
         prefixes,
         resources,
         ports,
+        volumes,
+        command: yaml.command.clone().map(super::convert_service_command),
+        entrypoint: yaml.entrypoint.clone().map(super::convert_service_command),
         working_dir: yaml.working_dir.clone(),
     })
 }
@@ -1142,5 +1162,92 @@ deployments:
         let root = tempfile::tempdir().unwrap();
         let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
         assert!(err.contains("primary_host"), "unexpected error: {err}");
+    }
+
+    fn service<'a>(spec: &'a DeploymentEnvironmentSpec, name: &str) -> &'a DeploymentServiceSpec {
+        spec.deployments[0].services.as_ref().unwrap().get(name).unwrap()
+    }
+
+    #[test]
+    fn deployment_service_volumes_and_command_are_parsed() {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    services:
+      web:
+        host: web
+        ports:
+          - "8080:80"
+        volumes:
+          - ./src:/app/src
+          - cache:/app/.cache
+        command: npm run dev
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+        let web = service(&spec, "web");
+
+        assert_eq!(web.volumes.len(), 2);
+        // A leading `.` marks a host path; a bare word is a named volume.
+        assert!(matches!(&web.volumes[0].name, ServiceVolumeType::Path(p) if p == "./src"));
+        assert_eq!(web.volumes[0].mount_path, "/app/src");
+        assert!(matches!(&web.volumes[1].name, ServiceVolumeType::Named(n) if n == "cache"));
+        assert!(matches!(&web.command, Some(ServiceCommand::Shell(s)) if s == "npm run dev"));
+    }
+
+    #[test]
+    fn extends_concatenates_service_volumes_and_overrides_command() {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  base:
+    abstract: true
+    primary_host: web
+    application:
+      name: app
+    services:
+      web:
+        host: web
+        ports:
+          - "8080:80"
+        volumes:
+          - ./shared:/app/shared
+        command: npm start
+  dev:
+    extends: base
+    services:
+      web:
+        volumes:
+          - ./src:/app/src
+        command: npm run dev
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
+        let web = service(&spec, "web");
+
+        // Volumes concatenate base-first; the child's command wins outright.
+        assert_eq!(web.volumes.len(), 2);
+        assert_eq!(web.volumes[0].mount_path, "/app/shared");
+        assert_eq!(web.volumes[1].mount_path, "/app/src");
+        assert!(matches!(&web.command, Some(ServiceCommand::Shell(s)) if s == "npm run dev"));
+    }
+
+    #[test]
+    fn a_service_without_volumes_still_resolves() {
+        let spec = convert_env_spec(local_env_yaml(), tempfile::tempdir().unwrap().path(), None).unwrap();
+        assert!(service(&spec, "web").volumes.is_empty());
+        assert!(service(&spec, "web").command.is_none());
     }
 }
