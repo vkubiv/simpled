@@ -29,10 +29,32 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
     // every downstream check (secrets_folder, working_dir, ...) sees the fully
     // merged spec. Abstract deployments are templates only and are dropped here.
     let resolved = resolve_extends(&yaml.deployments)?;
-    let concrete: HashMap<String, DeploymentSpecYaml> = resolved
+    let mut concrete: HashMap<String, DeploymentSpecYaml> = resolved
         .into_iter()
         .filter(|(_, dep)| dep.is_abstract != Some(true))
         .collect();
+
+    // In a local environment only one deployment runs at a time, so once the caller
+    // has picked one the others take no part in this run. Dropping them here keeps
+    // checks that span deployments (ingress routing above all) from reporting
+    // conflicts against a deployment that is never going to start — sibling
+    // deployments normally claim the same domains and ports on purpose. Every other
+    // environment type deploys its deployments side by side, so there the full set
+    // is kept and the conflicts are real.
+    if matches!(env_type_yaml, DeploymentEnvTypeYaml::Local) {
+        if let Some(selected) = selected_deployment {
+            if !concrete.contains_key(selected) {
+                let mut available: Vec<&str> = concrete.keys().map(|s| s.as_str()).collect();
+                available.sort();
+                return Err(anyhow!(
+                    "Deployment '{}' not found in env spec. Available deployments: {}",
+                    selected,
+                    available.join(", ")
+                ));
+            }
+            concrete.retain(|name, _| name == selected);
+        }
+    }
 
     let mut deployments = Vec::new();
     for (name, dep) in &concrete {
@@ -1017,6 +1039,85 @@ deployments:
         // Fields inherited from the abstract base.
         assert_eq!(prod.application.name, "app");
         assert_eq!(prod.defaults.replicas, 3);
+    }
+
+    /// A local env spec with two deployments that deliberately claim the same
+    /// domain and path — only one of them ever runs.
+    const LOCAL_SIBLINGS: &str = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:4090
+  tls:
+    disable: true
+deployments:
+  local:
+    primary_host: web
+    application:
+      name: app
+    services:
+      customer:
+        host: web
+        prefix: /
+        ports:
+          - "4003:80"
+  with-prod-firebase:
+    extends: local
+"#;
+
+    #[test]
+    fn local_keeps_only_the_selected_deployment() {
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_SIBLINGS).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("with-prod-firebase")).unwrap();
+
+        // The sibling is not part of this run, so its identical route is not a conflict.
+        assert_eq!(spec.deployments.len(), 1);
+        assert_eq!(spec.deployments[0].name, "with-prod-firebase");
+    }
+
+    #[test]
+    fn local_without_selection_still_requires_one() {
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_SIBLINGS).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
+        assert!(err.contains("--deployment"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn local_unknown_selected_deployment_is_rejected() {
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_SIBLINGS).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(yaml, root.path(), Some("nope")).unwrap_err().to_string();
+        assert!(err.contains("not found in env spec"), "unexpected error: {err}");
+        assert!(err.contains("local, with-prod-firebase"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn non_local_keeps_every_deployment_when_one_is_selected() {
+        // K8S deployments run side by side, so selecting one must not hide the others
+        // (their cross-deployment routing conflicts are real).
+        let raw = r#"
+type: k8s
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    disable: true
+deployments:
+  staging:
+    primary_host: web
+    application:
+      name: app
+  prod:
+    primary_host: web
+    application:
+      name: app
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("prod")).unwrap();
+        assert_eq!(spec.deployments.len(), 2);
     }
 
     #[test]
