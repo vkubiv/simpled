@@ -503,27 +503,37 @@ fn generate_swarm(
         }
     }
 
-    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --detach=false")?;
+    // --prune removes services that still carry the stack label but are no
+    // longer in the file, e.g. after the ingress type was switched.
+    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --prune --detach=false")?;
 
     if jobs.is_empty() {
-        writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
+        // --prune removes services that are still labelled as part of this stack
+        // but are no longer in the stack file, i.e. services deleted from the
+        // spec since the last deploy. Only ever passed when the file being
+        // deployed is the complete stack file.
+        writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune", deployment.name, deployment.name)?;
     } else {
         // Jobs are run between two partial rollouts of the same stack. `docker
         // stack deploy` only removes services missing from the file when it is
         // given --prune, so deploying a subset first and the full file afterwards
         // is an additive, idempotent rollout: phase 3 reports the phase-1
-        // services as up to date and leaves them running.
+        // services as up to date and leaves them running. That also means --prune
+        // must never be passed for a partial file — it would tear down every
+        // service phase 3 is about to bring back.
         writeln!(deploy_sh)?;
         writeln!(deploy_sh, "echo '== Phase 1/3: starting services the jobs depend on =='")?;
         if prerequisites.is_empty() {
             writeln!(deploy_sh, "echo 'No job dependencies declared, nothing to start first.'")?;
         } else {
             let phase1_file = if deps_only { DEPS_COMPOSE_FILE } else { "docker-compose.yaml" };
+            // Only the full stack file may prune; the deps-only subset may not.
+            let prune = if deps_only { "" } else { " --prune" };
             // --detach=false blocks until every service in the file has converged,
             // i.e. its tasks are running and (when a healthcheck is declared)
             // healthy. That is what makes it safe to run the jobs next.
-            writeln!(deploy_sh, "docker stack deploy -c {}/{} {} --with-registry-auth --detach=false",
-                deployment.name, phase1_file, deployment.name)?;
+            writeln!(deploy_sh, "docker stack deploy -c {}/{} {} --with-registry-auth{} --detach=false",
+                deployment.name, phase1_file, deployment.name, prune)?;
         }
 
         writeln!(deploy_sh)?;
@@ -539,7 +549,7 @@ fn generate_swarm(
         if long_running.is_empty() {
             writeln!(deploy_sh, "echo 'This deployment has no long-running services.'")?;
         } else if deps_only || prerequisites.is_empty() {
-            writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth", deployment.name, deployment.name)?;
+            writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune", deployment.name, deployment.name)?;
         } else {
             // Phase 1 already deployed every long-running service.
             writeln!(deploy_sh, "echo 'All services were started in phase 1, nothing left to deploy.'")?;
@@ -1153,7 +1163,7 @@ mod tests {
         let spec = spec(vec![service("api", ServiceType::Public, &[])]);
         let (dir, script) = generate_swarm_to_temp(&spec);
 
-        assert!(script.contains("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth\n"));
+        assert!(script.contains("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune\n"));
         assert!(!script.contains("Phase 1/3"));
         assert!(!script.contains("run_job"));
         assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
@@ -1170,8 +1180,11 @@ mod tests {
 
         // Phase 1 brings up only the job's dependency and waits for convergence.
         let phase1 = script.find("docker stack deploy -c prod/docker-compose.deps.yaml prod --with-registry-auth --detach=false").unwrap();
+        // The deps-only subset must not prune, or phase 3 would have to bring
+        // back every service it removed.
+        assert!(!script.contains("docker-compose.deps.yaml prod --with-registry-auth --prune"));
         let job = script.find("run_job 'prod_migrate'").unwrap();
-        let phase3 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth\n").unwrap();
+        let phase3 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune\n").unwrap();
         assert!(phase1 < job && job < phase3, "phases must be ordered deps -> job -> stack");
 
         // The dependency stack file holds the database only.
@@ -1202,7 +1215,7 @@ mod tests {
 
         // Nothing declared, so everything long-running is a prerequisite: phase 1
         // deploys the full stack file and phase 3 has nothing left to do.
-        let phase1 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --detach=false").unwrap();
+        let phase1 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false").unwrap();
         let job = script.find("run_job 'prod_migrate'").unwrap();
         assert!(phase1 < job);
         assert!(script.contains("All services were started in phase 1"));

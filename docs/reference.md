@@ -780,7 +780,7 @@ Output directory: `docker-deploy/`
 
 | File | Description |
 |------|-------------|
-| `deploy.sh` | Deploy script: ingress, then the job phases, then the stack |
+| `deploy.sh` | Deploy script: ingress, then the job phases, then the stack. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy |
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
 | `<deployment>/<service>/` | Per-service `.env`, config and secret files |
