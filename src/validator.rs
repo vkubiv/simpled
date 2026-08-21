@@ -112,9 +112,21 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         return Err(anyhow!("Dependency cycle in depends_on: {}", cycle.join(" -> ")));
     }
 
-    // Validate service environment variable references
+    validate_service_env_references(app_spec)?;
+
+    Ok(())
+}
+
+/// Every variable a service names must be declared in the app's `environment`.
+fn validate_service_env_references(app_spec: &AppSpec) -> Result<()> {
     let mut app_defined_env_vars = HashSet::new();
     for env in &app_spec.environment.external {
+        app_defined_env_vars.insert(&env.name);
+    }
+    // Optional variables count as defined: a service may reference one directly,
+    // and it is simply left off the service when the environment does not
+    // provide it (see `filter_service_env_vars`).
+    for env in &app_spec.environment.optional {
         app_defined_env_vars.insert(&env.name);
     }
     for env in &app_spec.environment.relative {
@@ -240,6 +252,26 @@ mod tests {
         let cycle = find_depends_on_cycle(&spec).expect("cycle must be detected");
         assert_eq!(cycle.first(), cycle.last());
         assert!(cycle.contains(&"api".to_string()) && cycle.contains(&"worker".to_string()));
+    }
+
+    #[test]
+    fn an_optional_variable_can_be_referenced_directly() {
+        let mut svc = service("backend", &[]);
+        svc.environment = vec![ServiceEnvOption::Simple("LIVEKIT_API_KEY".to_string())];
+        let mut spec = app_spec(vec![svc]);
+        spec.environment.optional = vec![OptionalEnvVariable { name: "LIVEKIT_API_KEY".to_string() }];
+
+        validate_service_env_references(&spec).expect("optional variables are defined");
+    }
+
+    #[test]
+    fn an_undeclared_variable_is_still_rejected() {
+        let mut svc = service("backend", &[]);
+        svc.environment = vec![ServiceEnvOption::Simple("LIVEKIT_API_KEY".to_string())];
+        let spec = app_spec(vec![svc]);
+
+        let err = validate_service_env_references(&spec).unwrap_err();
+        assert!(err.to_string().contains("references undefined environment variable LIVEKIT_API_KEY"));
     }
 
     #[test]

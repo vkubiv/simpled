@@ -32,7 +32,6 @@ environment:
     - VAR_WITH_DEFAULT=value
   optional:
     - OPTIONAL_VAR
-    - OPTIONAL_WITH_DEFAULT=value
   relative:
     - URL_VAR=/some/path
   internal:
@@ -42,13 +41,13 @@ environment:
 | Section | Description |
 |---------|-------------|
 | `external` | Required variables. Deployment fails if not provided and no default set. |
-| `optional` | Optional variables. Deployment succeeds even if missing. |
+| `optional` | Optional variables. No defaults allowed. Deployment succeeds even if missing; a service that references one just does not get the variable. |
 | `relative` | URL variables. Value is prepended with the deployment's primary host domain at deploy time. Can be overridden by the environment. |
 | `internal` | Fixed variables set by the app author. Identical across all environments. |
 
 All sections accept entries in two forms:
 - `VAR_NAME` — no default; must be supplied by the environment (for `external`) or left unset (for `optional`)
-- `VAR_NAME=default` — has a default value
+- `VAR_NAME=default` — has a default value (not allowed in `optional`)
 
 ---
 

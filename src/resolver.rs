@@ -193,7 +193,7 @@ pub fn resolve(
         // Resolve Environment Variables
         let use_tls = env_spec.ingress.tls.is_some();
         let environment_variables = resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
-        let final_service_env_vars = filter_service_env_vars(app_service, &environment_variables)?;
+        let final_service_env_vars = filter_service_env_vars(app_service, app_spec, &environment_variables)?;
 
         // Resolve Undockerized Environment Variables
         let mut undockerized_values = deployment_environment.clone();
@@ -201,7 +201,7 @@ pub fn resolve(
             add_unique_var(&mut undockerized_values, override_var.clone());
         }
         let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
-        let final_undockerized_service_env_vars = filter_service_env_vars(app_service, &undockerized_variables)?;
+        let final_undockerized_service_env_vars = filter_service_env_vars(app_service, app_spec, &undockerized_variables)?;
 
         // Resolve Configs
         let mut service_configs = Vec::new();
@@ -582,10 +582,39 @@ fn resolve_app_env_vars(
     Ok(environment_variables)
 }
 
+/// Collects the names in well-formed `${...}` references. Malformed input is
+/// left to `resolve_variable_in_string`, which reports it properly.
+fn referenced_var_names(input: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = input;
+
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                names.push(&after[..end]);
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+
+    names
+}
+
 fn filter_service_env_vars(
     app_service: &ServiceSpec,
+    app_spec: &AppSpec,
     all_env_vars: &[EnvVariable]
 ) -> Result<Vec<EnvVariable>> {
+    // Optional variables this environment did not provide. A service may reference
+    // one either directly or through `${...}`; the entry is then left off the
+    // service instead of failing the deployment, which is what makes it optional.
+    let unset_optional: HashSet<&str> = app_spec.environment.optional.iter()
+        .map(|o| o.name.as_str())
+        .filter(|name| !all_env_vars.iter().any(|e| e.name == *name))
+        .collect();
+
     let mut final_service_env_vars = Vec::new();
 
     for svc_env_opt in &app_service.environment {
@@ -598,11 +627,14 @@ fn filter_service_env_vars(
              ServiceEnvOption::Simple(name) => {
                  if let Some(env_var) = all_env_vars.iter().find(|e| &e.name == name) {
                      add_unique_var(&mut final_service_env_vars, env_var.clone());
-                 } else {
+                 } else if !unset_optional.contains(name.as_str()) {
                      return Err(anyhow!("Service {} references undefined env var {}", app_service.name, name));
                  }
              }
              ServiceEnvOption::WithValue(k, v) => {
+                 if referenced_var_names(v).iter().any(|n| unset_optional.contains(n)) {
+                     continue;
+                 }
                  add_unique_var(&mut final_service_env_vars,EnvVariable{
                      name: k.clone(),
                      value: resolve_variable_in_string(v, all_env_vars)
@@ -644,6 +676,84 @@ mod tests {
     fn passes_through_without_reference() {
         let out = expand("plain-value").unwrap();
         assert_eq!(out, "plain-value");
+    }
+
+    fn optional_app_spec(optional: &[&str]) -> AppSpec {
+        AppSpec {
+            name: "shop".to_string(),
+            version: semver::Version::new(1, 0, 0),
+            environment: AppEnvironment {
+                external: vec![],
+                optional: optional.iter()
+                    .map(|n| OptionalEnvVariable { name: n.to_string() })
+                    .collect(),
+                relative: vec![],
+                internal: vec![],
+            },
+            app_services: vec![],
+            extra_services: vec![],
+            configs: vec![],
+            secrets: vec![],
+            volumes: vec![],
+        }
+    }
+
+    fn service_with_env(environment: Vec<ServiceEnvOption>) -> ServiceSpec {
+        ServiceSpec {
+            name: "backend".to_string(),
+            service_type: ServiceType::Internal,
+            is_app_service: true,
+            image: ImageSpec::Exact("org/backend".to_string()),
+            environment,
+            configs: vec![],
+            secrets: vec![],
+            ports: vec![],
+            expose: vec![],
+            volumes: vec![],
+            command: None,
+            entrypoint: None,
+            healthcheck: None,
+            depends_on: vec![],
+        }
+    }
+
+    #[test]
+    fn unset_optional_var_is_left_off_the_service() {
+        let app_spec = optional_app_spec(&["LIVEKIT_URL", "LIVEKIT_API_KEY"]);
+        let service = service_with_env(vec![
+            ServiceEnvOption::Simple("LIVEKIT_API_KEY".to_string()),
+            ServiceEnvOption::WithValue("URL".to_string(), "${LIVEKIT_URL}".to_string()),
+        ]);
+
+        let vars = filter_service_env_vars(&service, &app_spec, &[]).unwrap();
+        assert!(vars.is_empty(), "unset optional vars must not reach the service: {:?}", vars);
+    }
+
+    #[test]
+    fn provided_optional_var_reaches_the_service() {
+        let app_spec = optional_app_spec(&["LIVEKIT_URL", "LIVEKIT_API_KEY"]);
+        let service = service_with_env(vec![
+            ServiceEnvOption::Simple("LIVEKIT_API_KEY".to_string()),
+            ServiceEnvOption::WithValue("URL".to_string(), "${LIVEKIT_URL}".to_string()),
+        ]);
+        let all = vec![
+            EnvVariable { name: "LIVEKIT_API_KEY".to_string(), value: "key".to_string() },
+            EnvVariable { name: "LIVEKIT_URL".to_string(), value: "wss://lk".to_string() },
+        ];
+
+        let vars = filter_service_env_vars(&service, &app_spec, &all).unwrap();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars.iter().find(|v| v.name == "LIVEKIT_API_KEY").unwrap().value, "key");
+        assert_eq!(vars.iter().find(|v| v.name == "URL").unwrap().value, "wss://lk");
+    }
+
+    #[test]
+    fn a_variable_that_is_not_optional_still_errors_when_missing() {
+        let app_spec = optional_app_spec(&[]);
+        let service = service_with_env(vec![ServiceEnvOption::Simple("REDIS_URL".to_string())]);
+
+        let err = filter_service_env_vars(&service, &app_spec, &[]).unwrap_err();
+        assert!(err.to_string().contains("references undefined env var REDIS_URL"));
     }
 
     #[test]

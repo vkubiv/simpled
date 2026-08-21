@@ -58,13 +58,17 @@ environment:
 ```
 
 `optional` works like `external` but the deployment will not fail if these variables are missing from the environment.
+They cannot have a default value — a variable with a default belongs in `external`.
 
 ```yaml
 environment:
   optional:
     - FEATURE_FLAG_DARK_MODE
-    - DEBUG_LOGGING=false
+    - DEBUG_LOGGING
 ```
+
+A service may list an optional variable like any other, either by name or through `${...}`.
+When the environment does not provide it, the entry is simply left off the service instead of failing the deployment.
 
 In the `relative` section, a special type of variable is set. They are used to set URLs relative to the application host.
 This frees you from the hassle of defining these variables independently for each environment.

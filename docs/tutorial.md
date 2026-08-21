@@ -36,13 +36,12 @@ environment:
   external:
     - DB_CONNECTION_STRING
     - REDIS_URL
-  optional:
     - LOG_LEVEL=Information
   internal:
     - ASPNETCORE_ENVIRONMENT=Production
 ```
 
-`external` variables must be provided by the environment at deploy time. `optional` ones have defaults and won't block a deployment if missing. `internal` ones are set by you and are the same across all environments.
+`external` variables must be provided by the environment at deploy time, unless they declare a default like `LOG_LEVEL` above. `optional` ones take no default and won't block a deployment if missing — a service that references one simply does not get it. `internal` ones are set by you and are the same across all environments.
 
 ---
 

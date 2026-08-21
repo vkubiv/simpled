@@ -67,7 +67,6 @@ environment:
   external:
     - DB_CONNECTION_STRING
     - REDIS_URL
-  optional:
     - LOG_LEVEL=Information
   internal:
     - ASPNETCORE_ENVIRONMENT=Production
