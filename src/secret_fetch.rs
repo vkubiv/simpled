@@ -60,6 +60,12 @@ pub struct FetchScript {
 /// behind, because `deploy.sh` sources it.
 const GIVE_BACK_FUNCTION_NAME: &str = "simpled_give_back";
 
+/// Mode the fetched secret files end up with, matching what
+/// `prepare-deployment` writes the literal ones with. World-readable on the
+/// deploy target, because the container that mounts the file runs as a user of
+/// its own and would not be able to read anything narrower.
+const SECRET_FILE_MODE: &str = "644";
+
 impl FetchScript {
     pub fn new() -> Self {
         FetchScript {
@@ -117,6 +123,13 @@ impl FetchScript {
             secret.shell_var(),
             sh_quote(&path)
         ));
+        // The umask above creates the file readable by its owner only, which closes
+        // the window between the value landing in it and this line. Widened right
+        // after, because the file is bind-mounted into a container whose user is
+        // almost never the owner: a service that does not run as root could not
+        // read its own secret otherwise. This is the mode `prepare-deployment`
+        // itself writes literal secrets with, so the directory stays uniform.
+        self.lines.push(format!("chmod {} {}", SECRET_FILE_MODE, sh_quote(&path)));
         new_paths.extend(self.record_created(path));
 
         // Right here rather than at the end of the script: a secret that fails to
@@ -180,7 +193,9 @@ impl FetchScript {
         // Restored afterwards because this script is sourced: leaving a tightened
         // umask behind would silently change the permissions of everything the
         // calling deploy script creates after it.
-        writeln!(file, "# Keep the files this script writes readable by their owner only.")?;
+        writeln!(file, "# Create the files below readable by their owner only. Each is widened to")?;
+        writeln!(file, "# {} right after it is written, so the value is never in a file more readable", SECRET_FILE_MODE)?;
+        writeln!(file, "# than that before it has to be.")?;
         writeln!(file, "simpled_previous_umask=\"$(umask)\"")?;
         writeln!(file, "umask 077")?;
         writeln!(file)?;
@@ -250,6 +265,9 @@ mod tests {
              --secret-id 'prod/shop/db' --query SecretString --output text)\""
         ));
         assert!(out.contains("mkdir -p 'secrets'"));
+        // A container mounting the file runs as a user of its own, so the value has
+        // to be readable by more than the owner the deploy leaves behind.
+        assert!(out.contains("chmod 644 'secrets/shop-db_password'"));
         // Run with sudo, the script gives what it wrote back to the user that
         // invoked sudo — the directory included — so the next deployment can still
         // be copied over it.

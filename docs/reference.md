@@ -326,7 +326,7 @@ docker-deploy/
 
 Nothing extra to run — `deploy.sh` sources it. For `k8s`, `manifests/fetch-secrets.sh` is generated instead and must be run against the target cluster **before** `kubectl apply -f manifests/`; it creates the Secrets with `kubectl create secret generic`.
 
-The secret files it writes are created with `umask 077`, so only their owner can read them. A Docker deploy is run with sudo, which would make that owner root and stop the unprivileged user that copies the next deployment onto the target from overwriting them — so the script hands each file and directory it creates back to the user that invoked sudo (`$SUDO_UID`), permissions unchanged.
+The files it writes end up as `0644` owned by the user that ran the deploy — the same as the secrets `prepare-deployment` writes itself. Both halves of that matter on the target: a Docker deploy is run with sudo, so without the `chown` the files would belong to root and the unprivileged user that copies the next deployment in could no longer overwrite them; and a container that bind-mounts a secret runs as a user of its own, so a mode narrower than `0644` means a service that does not run as root cannot read its own secret. Each file is created readable by its owner only and widened once the value is in it.
 
 Requirements on the deploy target:
 
