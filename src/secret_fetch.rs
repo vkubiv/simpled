@@ -89,7 +89,6 @@ impl FetchScript {
             secret.shell_var(),
             sh_quote(&path)
         ));
-        self.lines.push(format!("chmod 600 {}", sh_quote(&path)));
     }
 
     /// Append a raw command to the target-specific part of the script.
