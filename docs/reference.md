@@ -326,6 +326,8 @@ docker-deploy/
 
 Nothing extra to run — `deploy.sh` sources it. For `k8s`, `manifests/fetch-secrets.sh` is generated instead and must be run against the target cluster **before** `kubectl apply -f manifests/`; it creates the Secrets with `kubectl create secret generic`.
 
+The secret files it writes are created with `umask 077`, so only their owner can read them. A Docker deploy is run with sudo, which would make that owner root and stop the unprivileged user that copies the next deployment onto the target from overwriting them — so the script hands each file and directory it creates back to the user that invoked sudo (`$SUDO_UID`), permissions unchanged.
+
 Requirements on the deploy target:
 
 - The **AWS CLI** on `PATH`. Credentials, region and profile come from its own environment — an instance role, `AWS_REGION`, `AWS_PROFILE`, and so on. The generated script does not configure any of them.

@@ -45,13 +45,30 @@ fn fetch_pipeline(reference: &AwsSecretRef) -> String {
 /// secret files for Docker, `kubectl create secret` for Kubernetes.
 pub struct FetchScript {
     lines: Vec<String>,
+    /// Every path the script creates on the deploy target, parent directories
+    /// included, so that none of them is handed back to the invoking user twice.
+    created: Vec<String>,
+    /// Whether anything is handed back, i.e. whether the script needs the
+    /// `simpled_give_back` helper defined in its preamble.
+    gives_back: bool,
     needs_jq: bool,
     fetched: bool,
 }
 
+/// Name of the helper the script uses to hand what it creates back to the user
+/// that invoked sudo. Prefixed like the other shell state this script leaves
+/// behind, because `deploy.sh` sources it.
+const GIVE_BACK_FUNCTION_NAME: &str = "simpled_give_back";
+
 impl FetchScript {
     pub fn new() -> Self {
-        FetchScript { lines: Vec::new(), needs_jq: false, fetched: false }
+        FetchScript {
+            lines: Vec::new(),
+            created: Vec::new(),
+            gives_back: false,
+            needs_jq: false,
+            fetched: false,
+        }
     }
 
     /// Whether anything has been fetched yet — generators skip writing the script
@@ -81,14 +98,48 @@ impl FetchScript {
     /// script runs in.
     pub fn write_to_file(&mut self, secret: &SecretResolvedSpec, path: &str) {
         let path = path.replace('\\', "/");
+        let mut new_paths = Vec::new();
         if let Some(parent) = path.rsplit_once('/').map(|(parent, _)| parent) {
             self.lines.push(format!("mkdir -p {}", sh_quote(parent)));
+            // `mkdir -p` creates the whole chain, and any part of it may be the one
+            // that did not exist yet, so every ancestor is handed back too.
+            let mut prefix = String::new();
+            for component in parent.split('/').filter(|c| !c.is_empty() && *c != ".") {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                new_paths.extend(self.record_created(prefix.clone()));
+            }
         }
         self.lines.push(format!(
             "printf '%s' \"${}\" > {}",
             secret.shell_var(),
             sh_quote(&path)
         ));
+        new_paths.extend(self.record_created(path));
+
+        // Right here rather than at the end of the script: a secret that fails to
+        // resolve aborts the deploy, and what was written before it must not be
+        // left behind owned by root either.
+        if !new_paths.is_empty() {
+            self.gives_back = true;
+            self.lines.push(format!(
+                "{} {}",
+                GIVE_BACK_FUNCTION_NAME,
+                new_paths.iter().map(|path| sh_quote(path)).collect::<Vec<_>>().join(" ")
+            ));
+        }
+    }
+
+    /// Remember `path` as created by the script, and report whether it is the
+    /// first time — a path handed back once needs no second `chown`.
+    fn record_created(&mut self, path: String) -> Option<String> {
+        if self.created.contains(&path) {
+            return None;
+        }
+        self.created.push(path.clone());
+        Some(path)
     }
 
     /// Append a raw command to the target-specific part of the script.
@@ -133,6 +184,25 @@ impl FetchScript {
         writeln!(file, "simpled_previous_umask=\"$(umask)\"")?;
         writeln!(file, "umask 077")?;
         writeln!(file)?;
+
+        // A deploy script needs root for Docker, so it is run with sudo. Everything
+        // this script writes would then be owned by root, and the unprivileged user
+        // that copies the next deployment onto the target could no longer overwrite
+        // it — the second deploy would fail on a permission error, on the secret
+        // files of all things. Ownership is handed back; the permissions the umask
+        // above sets are left alone, so the values stay as readable as they were.
+        if self.gives_back {
+            writeln!(file, "# Run with sudo, everything below would belong to root, and the user that")?;
+            writeln!(file, "# copies the next deployment in could no longer overwrite it. Give each path")?;
+            writeln!(file, "# back to the user that invoked sudo, permissions untouched.")?;
+            writeln!(file, "{}() {{", GIVE_BACK_FUNCTION_NAME)?;
+            writeln!(file, "  [ \"$(id -u)\" = '0' ] || return 0")?;
+            writeln!(file, "  [ -n \"${{SUDO_UID:-}}\" ] || return 0")?;
+            writeln!(file, "  chown \"$SUDO_UID:${{SUDO_GID:-$SUDO_UID}}\" \"$@\" \\")?;
+            writeln!(file, "    || echo \"Warning: $* stay owned by root.\" >&2")?;
+            writeln!(file, "}}")?;
+            writeln!(file)?;
+        }
 
         for line in &self.lines {
             writeln!(file, "{}", line)?;
@@ -180,7 +250,11 @@ mod tests {
              --secret-id 'prod/shop/db' --query SecretString --output text)\""
         ));
         assert!(out.contains("mkdir -p 'secrets'"));
-        assert!(out.contains("chmod 600 'secrets/shop-db_password'"));
+        // Run with sudo, the script gives what it wrote back to the user that
+        // invoked sudo — the directory included — so the next deployment can still
+        // be copied over it.
+        assert!(out.contains("chown \"$SUDO_UID:${SUDO_GID:-$SUDO_UID}\" \"$@\""));
+        assert!(out.contains("simpled_give_back 'secrets' 'secrets/shop-db_password'"));
         // Sourced by the deploy script, so the umask it tightens is put back.
         assert!(out.contains("umask \"$simpled_previous_umask\""));
     }
