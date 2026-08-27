@@ -159,10 +159,27 @@ pub struct IngressSpecYaml {
     pub name: String,
     pub hosts: HashMap<String, HostSpecYaml>,
     pub tls: Option<IngressTlsSpecYaml>,
+    // Domains the gateway answers only to send the client somewhere else, e.g.
+    // the bare apex redirecting to the `www` host that actually serves the app.
+    // They are never routed to a service, but they are still part of the
+    // certificate, since the redirect has to be served over HTTPS too.
+    pub redirects: Option<Vec<RedirectSpecYaml>>,
 
     // if env_type is Docker, ingress_type can be nginx or traefik(default). In other cases it will cause an error
     #[serde(rename = "type")]
     pub ingress_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RedirectSpecYaml {
+    // Source domain, or a list of them. Written out in full, not as a host alias:
+    // a redirect source is by definition not one of the served hosts.
+    pub from: HostSpecYaml,
+    // Destination. Either a bare domain (the gateway's own scheme is used) or a
+    // full URL when the target lives outside this environment.
+    pub to: String,
+    // 301 when set or omitted, 302 when false.
+    pub permanent: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

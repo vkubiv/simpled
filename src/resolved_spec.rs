@@ -11,8 +11,42 @@ pub struct EnvironmentResolvedSpec {
 pub struct IngressResolvedSpec {
     pub name: String,
     pub tls: Option<IngressTlsResolvedSpec>,
+    /// Every domain the gateway answers on, redirect sources included, so that a
+    /// certificate covers the redirect too.
     pub domains: Vec<String>,
     pub rules: Vec<IngressRule>,
+    pub redirects: Vec<RedirectRule>,
+}
+
+/// One source domain bounced to one destination. The spec allows several sources
+/// per entry; the resolver flattens them so every generator sees a flat list.
+#[derive(Debug, Clone)]
+pub struct RedirectRule {
+    pub from_domain: String,
+    /// Either a bare domain or a full URL, exactly as written in the spec.
+    pub to: String,
+    /// 301 when true, 302 when false.
+    pub permanent: bool,
+}
+
+impl RedirectRule {
+    /// Destination as an absolute URL without a trailing slash. A bare domain in
+    /// the spec picks up the gateway's own scheme, so an environment that
+    /// terminates TLS redirects to `https://`.
+    pub fn target_url(&self, has_tls: bool) -> String {
+        let to = self.to.trim_end_matches('/');
+        if to.contains("://") {
+            to.to_string()
+        } else if has_tls {
+            format!("https://{}", to)
+        } else {
+            format!("http://{}", to)
+        }
+    }
+
+    pub fn status_code(&self) -> u16 {
+        if self.permanent { 301 } else { 302 }
+    }
 }
 
 #[derive(Debug, Clone)]

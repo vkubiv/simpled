@@ -322,6 +322,18 @@ pub struct IngressSpec {
     pub name: String,
     pub hosts: Vec<HostSpec>,
     pub tls: Option<IngressTlsSpec>,
+    pub redirects: Vec<RedirectSpec>,
+}
+
+/// A domain the gateway serves only to bounce the client to another one, such as
+/// `somesite.com` -> `www.somesite.com`. Sources carry no routes of their own but
+/// still belong on the certificate.
+#[derive(Debug, Clone)]
+pub struct RedirectSpec {
+    pub from: Vec<String>,
+    pub to: String,
+    /// 301 when true, 302 when false.
+    pub permanent: bool,
 }
 
 #[derive(Debug, Clone)]

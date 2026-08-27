@@ -393,10 +393,21 @@ pub fn resolve(
         None
     };
 
+    let redirects = resolve_redirects(&env_spec.ingress)?;
+
+    // Redirect sources are domains the gateway answers on without routing them to
+    // a service, so they belong in `domains` (which drives the certificate) even
+    // though they carry no rules.
+    let mut domains: Vec<String> = env_spec.ingress.hosts.iter()
+        .flat_map(|h| h.domain_names.clone())
+        .collect();
+    domains.extend(redirects.iter().map(|r| r.from_domain.clone()));
+
     let ingress_resolved = IngressResolvedSpec {
         name: env_spec.ingress.name.clone(),
-        domains: env_spec.ingress.hosts.iter().flat_map(|h| h.domain_names.clone()).collect(),
+        domains,
         rules: ingress_rules,
+        redirects,
         tls,
     };
 
@@ -405,6 +416,45 @@ pub fn resolve(
         current_deployment,
         env_type: env_spec.env_type.clone(),
     })
+}
+
+/// Flattens `gateway.redirects` into one rule per source domain.
+///
+/// A source that is also declared under `gateway.hosts` would shadow every route
+/// on that domain, and a source declared twice has no defined winner, so both are
+/// rejected here rather than silently resolved by whichever generator runs.
+fn resolve_redirects(ingress: &IngressSpec) -> Result<Vec<RedirectRule>> {
+    let served_domains: Vec<&str> = ingress.hosts.iter()
+        .flat_map(|h| h.domain_names.iter().map(|d| d.as_str()))
+        .collect();
+
+    let mut redirects: Vec<RedirectRule> = Vec::new();
+    for redirect in &ingress.redirects {
+        for from in &redirect.from {
+            if served_domains.contains(&from.as_str()) {
+                return Err(anyhow!(
+                    "Gateway redirect source '{}' is also declared under gateway.hosts; a domain cannot both serve traffic and redirect away from it",
+                    from
+                ));
+            }
+            if from == &redirect.to {
+                return Err(anyhow!("Gateway redirect from '{}' points at itself", from));
+            }
+            if let Some(previous) = redirects.iter().find(|r| &r.from_domain == from) {
+                return Err(anyhow!(
+                    "Gateway redirect source '{}' is declared twice (to '{}' and to '{}')",
+                    from, previous.to, redirect.to
+                ));
+            }
+            redirects.push(RedirectRule {
+                from_domain: from.clone(),
+                to: redirect.to.clone(),
+                permanent: redirect.permanent,
+            });
+        }
+    }
+
+    Ok(redirects)
 }
 
 fn resolve_app_service_image(env_spec: &DeploymentEnvironmentSpec, raw_image: String) -> Result<String> {
@@ -649,6 +699,99 @@ fn filter_service_env_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ingress_with(hosts: &[(&str, &[&str])], redirects: Vec<RedirectSpec>) -> IngressSpec {
+        IngressSpec {
+            name: "gateway".to_string(),
+            hosts: hosts.iter()
+                .map(|(name, domains)| HostSpec {
+                    name: name.to_string(),
+                    domain_names: domains.iter().map(|d| d.to_string()).collect(),
+                })
+                .collect(),
+            tls: None,
+            redirects,
+        }
+    }
+
+    fn redirect(from: &[&str], to: &str, permanent: bool) -> RedirectSpec {
+        RedirectSpec {
+            from: from.iter().map(|f| f.to_string()).collect(),
+            to: to.to_string(),
+            permanent,
+        }
+    }
+
+    #[test]
+    fn a_redirect_becomes_one_rule_per_source_domain() {
+        let ingress = ingress_with(
+            &[("web", &["www.somesite.com"])],
+            vec![redirect(&["somesite.com", "somesite.net"], "www.somesite.com", true)],
+        );
+
+        let rules = resolve_redirects(&ingress).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].from_domain, "somesite.com");
+        assert_eq!(rules[1].from_domain, "somesite.net");
+        assert!(rules.iter().all(|r| r.to == "www.somesite.com" && r.permanent));
+    }
+
+    #[test]
+    fn a_redirect_source_that_is_also_served_is_rejected() {
+        let ingress = ingress_with(
+            &[("web", &["www.somesite.com", "somesite.com"])],
+            vec![redirect(&["somesite.com"], "www.somesite.com", true)],
+        );
+
+        let err = resolve_redirects(&ingress).unwrap_err().to_string();
+        assert!(err.contains("somesite.com"), "unexpected error: {}", err);
+        assert!(err.contains("gateway.hosts"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn the_same_source_cannot_redirect_to_two_places() {
+        let ingress = ingress_with(
+            &[("web", &["www.somesite.com"])],
+            vec![
+                redirect(&["somesite.com"], "www.somesite.com", true),
+                redirect(&["somesite.com"], "other.com", true),
+            ],
+        );
+
+        let err = resolve_redirects(&ingress).unwrap_err().to_string();
+        assert!(err.contains("declared twice"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn a_redirect_to_itself_is_rejected() {
+        let ingress = ingress_with(
+            &[("web", &["www.somesite.com"])],
+            vec![redirect(&["somesite.com"], "somesite.com", true)],
+        );
+
+        let err = resolve_redirects(&ingress).unwrap_err().to_string();
+        assert!(err.contains("points at itself"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn a_bare_target_domain_picks_up_the_gateway_scheme() {
+        let rule = RedirectRule {
+            from_domain: "somesite.com".to_string(),
+            to: "www.somesite.com".to_string(),
+            permanent: false,
+        };
+        assert_eq!(rule.target_url(true), "https://www.somesite.com");
+        assert_eq!(rule.target_url(false), "http://www.somesite.com");
+        assert_eq!(rule.status_code(), 302);
+
+        let absolute = RedirectRule {
+            from_domain: "somesite.com".to_string(),
+            to: "https://elsewhere.example/".to_string(),
+            permanent: true,
+        };
+        assert_eq!(absolute.target_url(false), "https://elsewhere.example");
+        assert_eq!(absolute.status_code(), 301);
+    }
 
     fn secrets() -> HashMap<String, String> {
         let mut m = HashMap::new();

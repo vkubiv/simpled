@@ -354,6 +354,10 @@ gateway:
     multi-domain-alias:
       - www.domain.com
       - domain.com
+  redirects:
+    - from: domain.com      # a domain, or a list of them
+      to: www.domain.com    # bare domain or full URL
+      permanent: true       # optional; 301 when true (default), 302 when false
   tls:
     disable: true           # no TLS
     secret: tls-secret      # existing TLS secret (k8s)
@@ -363,6 +367,31 @@ gateway:
 ```
 
 `hosts` maps abstract names (used in `services[].host`) to real domain names. For local environments, use `localhost:port`.
+
+#### redirects
+
+Domains the gateway answers on only to send the visitor somewhere else, typically the bare apex pointing at the `www` host that serves the app:
+
+```yaml
+gateway:
+  hosts:
+    website: www.somesite.com
+  redirects:
+    - from: somesite.com
+      to: www.somesite.com
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `from` | string or list | yes | Source domain(s). Written in full, not as a `hosts` alias. |
+| `to` | string | yes | Destination. A bare domain takes the gateway's own scheme (`https://` when TLS is on); a value containing `://` is used as-is. |
+| `permanent` | bool | no | `true` (default) sends 301, `false` sends 302. |
+
+The path and query string are preserved: `somesite.com/pricing?ref=x` → `www.somesite.com/pricing?ref=x`.
+
+Redirect sources are included in the gateway's certificate, since the redirect itself has to be served over HTTPS. On Kubernetes each destination becomes its own `Ingress` carrying the ingress-nginx `permanent-redirect`/`temporal-redirect` annotation; on Docker it becomes an nginx `server` block or a Traefik `redirectRegex` middleware; locally the gateway matches the `Host` header, so a redirect can share a port with routed services.
+
+A domain may not appear under both `hosts` and `redirects`, and a source may not be listed twice — both make routing ambiguous and are rejected.
 
 #### TLS options (mutually exclusive)
 

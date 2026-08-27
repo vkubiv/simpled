@@ -455,6 +455,44 @@ gateway:
 
 The `name` field is optional and defaults to `"gateway"`.
 
+#### Redirects
+
+Domains that should not serve the app themselves, only send visitors to the one that does:
+
+```yaml
+gateway:
+  hosts:
+    website: www.myapp.com
+  redirects:
+    - from: myapp.com
+      to: www.myapp.com
+```
+
+`from` takes a single domain or a list of them, and `to` is either a bare domain — which picks up
+the gateway's own scheme, so `https://` when TLS is on — or a full URL when the target lives
+outside this environment:
+
+```yaml
+gateway:
+  hosts:
+    website: www.myapp.com
+  redirects:
+    - from:
+        - myapp.com
+        - myapp.net
+      to: www.myapp.com
+    - from: old.myapp.com
+      to: https://blog.myapp.com
+      permanent: false   # 302 instead of the default 301
+```
+
+The path and query string are carried over, so `myapp.com/pricing?ref=x` lands on
+`www.myapp.com/pricing?ref=x`.
+
+Redirect sources are part of the gateway's certificate — the redirect has to be served over HTTPS
+too, or the browser reports a name mismatch before it ever follows it. A domain cannot appear under
+both `hosts` and `redirects`; that would make its routes unreachable, so `simpled` rejects the spec.
+
 #### TLS options
 
 ```yaml

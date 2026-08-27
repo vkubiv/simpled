@@ -15,6 +15,8 @@ const DOCKER_NETWORK: &str = "common_network";
 const NGINX_IMAGE: &str = "nginx:alpine";
 const TRAEFIK_IMAGE: &str = "traefik:v2.10";
 const TRAEFIK_RESOLVER: &str = "myresolver";
+/// Placeholder backend for redirect-only routers, which still have to name one.
+const TRAEFIK_REDIRECT_SERVICE: &str = "redirect-noop";
 /// Stack file holding only the services the jobs depend on (phase 1 of a deploy).
 const DEPS_COMPOSE_FILE: &str = "docker-compose.deps.yaml";
 /// Default seconds to wait for one job to reach a terminal state.
@@ -685,7 +687,7 @@ fn node_path(deployment_name: &str, path: &str) -> String {
 }
 
 fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path, deploy_sh: &mut File, network_name: String) -> Result<()> {
-    if !resolved_spec.ingress.rules.is_empty() {
+    if !resolved_spec.ingress.rules.is_empty() || !resolved_spec.ingress.redirects.is_empty() {
         let nginx_dir = output_dir.join("nginx");
         fs::create_dir_all(&nginx_dir)?;
         generate_nginx_config(&resolved_spec.ingress, &nginx_dir.join("default.conf"))?;
@@ -726,7 +728,14 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
             writeln!(certbot_sh, "  -v $(pwd)/certs:/etc/nginx/certs \\")?;
             writeln!(certbot_sh, "  certbot/certbot certonly --webroot --webroot-path=/var/www/letsencrypt \\")?;
             writeln!(certbot_sh, "  --email {} --agree-tos --no-eff-email \\", le.email)?;
-            for domain in &resolved_spec.ingress.domains {
+            // One certificate covers every domain, so pin the lineage name
+            // rather than letting it default to whichever domain comes first —
+            // the nginx config points every server block at this directory.
+            let requested = certificate_domains(&resolved_spec.ingress);
+            if let Some(primary) = requested.first() {
+                writeln!(certbot_sh, "  --cert-name {} \\", primary)?;
+            }
+            for domain in requested {
                 writeln!(certbot_sh, "   -d {} \\", domain)?;
             }
             writeln!(certbot_sh, "   && docker restart nginx-ingress")?;
@@ -736,7 +745,7 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
 }
 
 fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &Path, network_name: String) -> Result<()> {
-    if resolved_spec.ingress.rules.is_empty() {
+    if resolved_spec.ingress.rules.is_empty() && resolved_spec.ingress.redirects.is_empty() {
         return Ok(());
     }
 
@@ -773,6 +782,32 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
     write_swarm_compose_network(&mut stack, &network_name)?;
 
     Ok(())
+}
+
+/// Every domain the gateway answers on, in the order certbot is asked for them,
+/// with the repeats that `hosts` groups can produce removed.
+fn certificate_domains(ingress: &IngressResolvedSpec) -> Vec<&String> {
+    let mut unique: Vec<&String> = Vec::new();
+    for domain in &ingress.domains {
+        if !unique.contains(&domain) {
+            unique.push(domain);
+        }
+    }
+    unique
+}
+
+/// Directory under `certs/live` holding the certificate for `domain`.
+///
+/// certbot issues a single certificate covering every `-d`, stored under one
+/// lineage named after `--cert-name`, so with Let's Encrypt all server blocks —
+/// the redirect-only ones included — read the same files. Without it each domain
+/// is expected to bring its own certificate.
+fn nginx_cert_lineage<'a>(ingress: &'a IngressResolvedSpec, domain: &'a str) -> &'a str {
+    let uses_letsencrypt = ingress.tls.as_ref().map_or(false, |t| t.letsencrypt.is_some());
+    if !uses_letsencrypt {
+        return domain;
+    }
+    certificate_domains(ingress).first().map(|d| d.as_str()).unwrap_or(domain)
 }
 
 fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<()> {
@@ -822,8 +857,9 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
             writeln!(file, "server {{")?;
             writeln!(file, "    listen 443 ssl;")?;
             writeln!(file, "    server_name {};", domain)?;
-            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", domain)?;
-            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", domain)?;
+            let lineage = nginx_cert_lineage(ingress, domain);
+            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", lineage)?;
+            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", lineage)?;
 
             generate_locations(&mut file, services)?;
 
@@ -831,6 +867,52 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
 
         } else {
             generate_locations(&mut file, services)?;
+            writeln!(file, "}}")?;
+        }
+    }
+
+    generate_nginx_redirects(&mut file, ingress)?;
+
+    Ok(())
+}
+
+/// Server blocks for domains that only bounce the client elsewhere, e.g.
+/// `somesite.com` -> `www.somesite.com`. With TLS on, the source needs its own
+/// certificate and its own :443 block, otherwise the browser hits a name
+/// mismatch before it ever sees the redirect.
+fn generate_nginx_redirects(file: &mut File, ingress: &IngressResolvedSpec) -> Result<()> {
+    let has_tls = ingress.tls.is_some();
+    let uses_letsencrypt = ingress.tls.as_ref().map_or(false, |t| t.letsencrypt.is_some());
+
+    for redirect in &ingress.redirects {
+        let target = redirect.target_url(has_tls);
+        let code = redirect.status_code();
+
+        writeln!(file, "server {{")?;
+        writeln!(file, "    listen 80;")?;
+        writeln!(file, "    server_name {};", redirect.from_domain)?;
+        if uses_letsencrypt {
+            // The ACME challenge must stay reachable over plain HTTP, or the
+            // certificate for this very domain can never be issued.
+            writeln!(file, "    location /.well-known/acme-challenge/ {{")?;
+            writeln!(file, "        root /var/www/letsencrypt;")?;
+            writeln!(file, "    }}")?;
+            writeln!(file, "    location / {{")?;
+            writeln!(file, "        return {} {}$request_uri;", code, target)?;
+            writeln!(file, "    }}")?;
+        } else {
+            writeln!(file, "    return {} {}$request_uri;", code, target)?;
+        }
+        writeln!(file, "}}")?;
+
+        if has_tls {
+            writeln!(file, "server {{")?;
+            writeln!(file, "    listen 443 ssl;")?;
+            writeln!(file, "    server_name {};", redirect.from_domain)?;
+            let lineage = nginx_cert_lineage(ingress, &redirect.from_domain);
+            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", lineage)?;
+            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", lineage)?;
+            writeln!(file, "    return {} {}$request_uri;", code, target)?;
             writeln!(file, "}}")?;
         }
     }
@@ -1019,6 +1101,20 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
          }
     }
     
+    for redirect in &ingress.redirects {
+        if !middlewares_written {
+            writeln!(file, "  middlewares:")?;
+            middlewares_written = true;
+        }
+        // `redirectRegex` rather than `redirectScheme`, because the destination
+        // is a different host, and the path and query have to survive the bounce.
+        writeln!(file, "    {}:", traefik_redirect_name(&redirect.from_domain))?;
+        writeln!(file, "      redirectRegex:")?;
+        writeln!(file, "        regex: \"^https?://[^/]+/(.*)\"")?;
+        writeln!(file, "        replacement: \"{}/${{1}}\"", redirect.target_url(has_tls))?;
+        writeln!(file, "        permanent: {}", redirect.permanent)?;
+    }
+
     writeln!(file, "  routers:")?;
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
@@ -1055,6 +1151,28 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         }
     }
     
+    for redirect in &ingress.redirects {
+        let name = traefik_redirect_name(&redirect.from_domain);
+        writeln!(file, "    {}:", name)?;
+        writeln!(file, "      rule: \"Host(`{}`)\"", redirect.from_domain)?;
+        // A router needs a service even when the middleware answers first; the
+        // dummy below is never reached.
+        writeln!(file, "      service: {}", TRAEFIK_REDIRECT_SERVICE)?;
+        if has_tls {
+            writeln!(file, "      entryPoints:")?;
+            writeln!(file, "        - websecure")?;
+            writeln!(file, "      tls:")?;
+            if use_le {
+                writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
+            }
+        } else {
+            writeln!(file, "      entryPoints:")?;
+            writeln!(file, "        - web")?;
+        }
+        writeln!(file, "      middlewares:")?;
+        writeln!(file, "        - {}", name)?;
+    }
+
     writeln!(file, "  services:")?;
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
@@ -1065,14 +1183,28 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
              writeln!(file, "          - url: \"http://{}_{}:{}/\"", svc.deployment_name,  svc.service_name, svc.port)?;
         }
     }
-    
+
+    if !ingress.redirects.is_empty() {
+        // Every router must name a service. The redirect middleware answers
+        // before the request is forwarded, so this address is never dialled.
+        writeln!(file, "    {}:", TRAEFIK_REDIRECT_SERVICE)?;
+        writeln!(file, "      loadBalancer:")?;
+        writeln!(file, "        servers:")?;
+        writeln!(file, "          - url: \"http://127.0.0.1:1/\"")?;
+    }
+
     Ok(())
+}
+
+/// Traefik router/middleware names may not contain dots.
+fn traefik_redirect_name(from_domain: &str) -> String {
+    format!("redirect-{}", from_domain.replace('.', "-").replace(':', "-"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolved_spec::{ConfigResolvedFile, ConfigResolvedSpec, DeploymentResolvedSpec, SecretResolvedSpec, SecretResolvedValue, ServiceResolvedSpec};
+    use crate::resolved_spec::{ConfigResolvedFile, ConfigResolvedSpec, DeploymentResolvedSpec, IngressRule, IngressToServiceRule, IngressTlsResolvedSpec, RedirectRule, SecretResolvedSpec, SecretResolvedValue, ServiceResolvedSpec};
     use crate::spec::{AwsSecretRef, DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec, ServiceConfigOption, ServiceSecret, ServiceType};
 
     fn service(name: &str, service_type: ServiceType, depends_on: &[&str]) -> ServiceResolvedSpec {
@@ -1133,6 +1265,7 @@ mod tests {
                 tls: None,
                 domains: vec![],
                 rules: vec![],
+                redirects: vec![],
             },
             current_deployment: DeploymentResolvedSpec {
                 name: "prod".to_string(),
@@ -1148,6 +1281,117 @@ mod tests {
                 volumes: vec![],
             },
         }
+    }
+
+    fn ingress_with_redirect(tls: Option<IngressTlsResolvedSpec>) -> IngressResolvedSpec {
+        IngressResolvedSpec {
+            name: "gateway".to_string(),
+            tls,
+            domains: vec!["www.somesite.com".to_string(), "somesite.com".to_string()],
+            rules: vec![IngressRule {
+                domain_name: "www.somesite.com".to_string(),
+                services: vec![IngressToServiceRule {
+                    service_name: "api".to_string(),
+                    deployment_name: "prod".to_string(),
+                    port: 80,
+                    prefix: "/".to_string(),
+                    strip_prefix: false,
+                }],
+            }],
+            redirects: vec![RedirectRule {
+                from_domain: "somesite.com".to_string(),
+                to: "www.somesite.com".to_string(),
+                permanent: true,
+            }],
+        }
+    }
+
+    fn letsencrypt_tls() -> IngressTlsResolvedSpec {
+        IngressTlsResolvedSpec {
+            secret: None,
+            letsencrypt: Some(LetsEncryptResolvedSpec {
+                server: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
+                email: "ops@somesite.com".to_string(),
+            }),
+        }
+    }
+
+    fn write_config(ingress: &IngressResolvedSpec, traefik: bool) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conf");
+        if traefik {
+            generate_traefik_dynamic_config(ingress, &path).unwrap();
+        } else {
+            generate_nginx_config(ingress, &path).unwrap();
+        }
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn nginx_redirects_the_bare_domain_to_the_served_one() {
+        let conf = write_config(&ingress_with_redirect(None), false);
+
+        assert!(conf.contains("server_name somesite.com;"), "{}", conf);
+        assert!(conf.contains("return 301 http://www.somesite.com$request_uri;"), "{}", conf);
+        // The redirect source carries no routes of its own.
+        assert!(!conf.contains("proxy_pass http://api:80/;"), "{}", conf);
+    }
+
+    #[test]
+    fn nginx_serves_the_redirect_over_tls_and_keeps_the_acme_path_open() {
+        let conf = write_config(&ingress_with_redirect(Some(letsencrypt_tls())), false);
+
+        // Without its own :443 block the browser hits a certificate name
+        // mismatch before it ever sees the redirect.
+        // certbot issues one certificate for every domain, so the redirect's
+        // server block reads the same lineage as the served host.
+        assert!(conf.contains("ssl_certificate /etc/nginx/certs/live/www.somesite.com/fullchain.pem;"), "{}", conf);
+        assert!(!conf.contains("live/somesite.com/"), "{}", conf);
+        assert!(conf.contains("return 301 https://www.somesite.com$request_uri;"), "{}", conf);
+        // The ACME challenge has to stay on plain HTTP or the certificate for
+        // this domain can never be issued.
+        let plain = conf.split("listen 443 ssl;").next().unwrap();
+        assert!(plain.contains("location /.well-known/acme-challenge/"), "{}", conf);
+    }
+
+    #[test]
+    fn traefik_redirects_with_a_middleware_on_a_router_of_its_own() {
+        let conf = write_config(&ingress_with_redirect(Some(letsencrypt_tls())), true);
+
+        assert!(conf.contains("    redirect-somesite-com:"), "{}", conf);
+        assert!(conf.contains("        replacement: \"https://www.somesite.com/${1}\""), "{}", conf);
+        assert!(conf.contains("        permanent: true"), "{}", conf);
+        assert!(conf.contains("      rule: \"Host(`somesite.com`)\""), "{}", conf);
+        // Redirect-only routers still have to name a backend.
+        assert!(conf.contains(&format!("      service: {}", TRAEFIK_REDIRECT_SERVICE)), "{}", conf);
+        assert!(conf.contains(&format!("    {}:", TRAEFIK_REDIRECT_SERVICE)), "{}", conf);
+    }
+
+    #[test]
+    fn a_temporary_redirect_answers_302() {
+        let mut ingress = ingress_with_redirect(None);
+        ingress.redirects[0].permanent = false;
+
+        assert!(write_config(&ingress, false).contains("return 302 http://www.somesite.com$request_uri;"));
+        assert!(write_config(&ingress, true).contains("        permanent: false"));
+    }
+
+    #[test]
+    fn certbot_requests_a_certificate_for_the_redirect_source() {
+        let mut spec = spec(vec![service("api", ServiceType::Public, &[])]);
+        spec.ingress = ingress_with_redirect(Some(letsencrypt_tls()));
+        // `domains` repeats when a domain is declared under several host groups.
+        spec.ingress.domains.push("www.somesite.com".to_string());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut deploy_sh = File::create(dir.path().join("deploy.sh")).unwrap();
+        generate_nginx_standalone(&spec, dir.path(), &mut deploy_sh, DOCKER_NETWORK.to_string()).unwrap();
+
+        let certbot = fs::read_to_string(dir.path().join("certbot.sh")).unwrap();
+        assert!(certbot.contains("-d somesite.com"), "{}", certbot);
+        assert_eq!(certbot.matches("-d www.somesite.com").count(), 1, "{}", certbot);
+        // The nginx config points every server block at this one lineage.
+        assert!(certbot.contains("--cert-name www.somesite.com"), "{}", certbot);
     }
 
     fn generate_swarm_to_temp(spec: &EnvironmentResolvedSpec) -> (tempfile::TempDir, String) {

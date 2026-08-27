@@ -418,10 +418,30 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         }
     };
 
+    let mut redirects = Vec::new();
+    for redirect in yaml.redirects.unwrap_or_default() {
+        let from = match redirect.from {
+            HostSpecYaml::Single(s) => vec![s],
+            HostSpecYaml::Multiple(v) => v,
+        };
+        if from.is_empty() {
+            return Err(anyhow!("Gateway redirect to '{}' has no 'from' domain", redirect.to));
+        }
+        if redirect.to.trim().is_empty() {
+            return Err(anyhow!("Gateway redirect from '{}' has an empty 'to'", from.join(", ")));
+        }
+        redirects.push(RedirectSpec {
+            from,
+            to: redirect.to,
+            permanent: redirect.permanent.unwrap_or(true),
+        });
+    }
+
     Ok(IngressSpec {
         name: yaml.name,
         hosts,
         tls,
+        redirects,
     })
 }
 
