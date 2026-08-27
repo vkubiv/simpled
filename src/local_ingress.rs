@@ -30,11 +30,62 @@ struct LocalRedirect {
     permanent: bool,
 }
 
+/// A body limit bound to the path prefix it guards.
+#[derive(Clone)]
+struct LocalBodyLimit {
+    prefix: String,
+    max_bytes: u64,
+}
+
+/// Whether `path` falls under `prefix`, using the same prefix matching the
+/// generated nginx and Traefik configurations use.
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
+}
+
 /// A proxy path is treated by `axum-reverse-proxy` as a root fallback when it is
 /// empty or "/". Two root fallbacks cannot be merged into the same router, so we
 /// only allow a single one per domain.
 fn is_root_prefix(prefix: &str) -> bool {
     prefix.is_empty() || prefix == "/"
+}
+
+/// `413` when the request declares a body larger than the limit on the most
+/// specific matching prefix, `None` otherwise.
+///
+/// The check reads `Content-Length`, which is what an upload sends and what
+/// nginx rejects on in a real deployment. A chunked request that never declares
+/// its length is passed through: the local gateway is here to reproduce the
+/// limit a developer will hit in production, not to police the dev machine.
+fn body_limit_exceeded(limits: &[LocalBodyLimit], req: &Request) -> Option<StatusCode> {
+    let declared: u64 = req
+        .headers()
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+
+    let path = req.uri().path();
+    let limit = limits
+        .iter()
+        .filter(|l| path_has_prefix(path, &l.prefix))
+        // Longest prefix wins, matching how the request is routed.
+        .max_by_key(|l| l.prefix.trim_end_matches('/').len())?;
+
+    // 0 is nginx's spelling of "no limit".
+    if limit.max_bytes != 0 && declared > limit.max_bytes {
+        Some(StatusCode::PAYLOAD_TOO_LARGE)
+    } else {
+        None
+    }
 }
 
 /// The response for a request whose Host is a redirect source, or `None` when the
@@ -62,6 +113,7 @@ fn redirect_response(
 /// and otherwise lets the port's routed services handle it.
 async fn apply_redirects(
     redirects: Vec<LocalRedirect>,
+    limits: Vec<LocalBodyLimit>,
     req: Request,
     next: Next,
 ) -> axum::response::Response {
@@ -72,6 +124,10 @@ async fn apply_redirects(
 
     if let Some((status, location)) = redirect_response(&redirects, host, req.uri()) {
         return (status, [(header::LOCATION, location)]).into_response();
+    }
+
+    if let Some(status) = body_limit_exceeded(&limits, &req) {
+        return status.into_response();
     }
 
     next.run(req).await
@@ -141,6 +197,10 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
         routers.entry(*port).or_insert_with(|| (Router::new(), false));
     }
 
+    // Body limits are enforced per path prefix, so they are collected per port
+    // and applied in the same layer as the redirects.
+    let mut limits_by_port: BTreeMap<u16, Vec<LocalBodyLimit>> = BTreeMap::new();
+
     for rule in &spec.rules {
         let (_, port) = split_domain(&rule.domain_name);
 
@@ -148,6 +208,13 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
             // Only route to services of the deployment being run locally.
             if svc.deployment_name != current_deployment {
                 continue;
+            }
+
+            if let Some(max_bytes) = svc.body_limit {
+                limits_by_port.entry(port).or_default().push(LocalBodyLimit {
+                    prefix: svc.prefix.clone(),
+                    max_bytes,
+                });
             }
 
             let (app, root_fallback_set) =
@@ -194,12 +261,16 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
     // non-blocking mode.
     let mut bound = Vec::new();
     for (port, (app, _)) in routers {
-        let app = match redirects_by_port.remove(&port) {
-            Some(redirects) => app.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let redirects = redirects_by_port.remove(&port).unwrap_or_default();
+        let limits = limits_by_port.remove(&port).unwrap_or_default();
+        let app = if redirects.is_empty() && limits.is_empty() {
+            app
+        } else {
+            app.layer(middleware::from_fn(move |req: Request, next: Next| {
                 let redirects = redirects.clone();
-                async move { apply_redirects(redirects, req, next).await }
-            })),
-            None => app,
+                let limits = limits.clone();
+                async move { apply_redirects(redirects, limits, req, next).await }
+            }))
         };
         let bind_addr = format!("0.0.0.0:{}", port);
         let listener = StdTcpListener::bind(&bind_addr)
@@ -288,6 +359,61 @@ mod tests {
     fn another_host_on_the_same_port_falls_through_to_the_services() {
         assert!(response(Some("www.somesite.local:8080"), "/").is_none());
         assert!(response(None, "/").is_none());
+    }
+
+    fn request(path: &str, content_length: Option<u64>) -> Request {
+        let mut builder = axum::http::Request::builder().uri(path);
+        if let Some(length) = content_length {
+            builder = builder.header(header::CONTENT_LENGTH, length.to_string());
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    fn limits() -> Vec<LocalBodyLimit> {
+        vec![
+            LocalBodyLimit { prefix: "/".to_string(), max_bytes: 1024 },
+            LocalBodyLimit { prefix: "/upload".to_string(), max_bytes: 1024 * 1024 },
+        ]
+    }
+
+    #[test]
+    fn an_oversized_body_is_rejected_with_413() {
+        assert_eq!(
+            body_limit_exceeded(&limits(), &request("/api", Some(2048))),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    #[test]
+    fn the_most_specific_prefix_sets_the_limit() {
+        // /upload allows far more than the gateway-wide default on "/".
+        assert_eq!(body_limit_exceeded(&limits(), &request("/upload/file", Some(2048))), None);
+        assert_eq!(
+            body_limit_exceeded(&limits(), &request("/upload/file", Some(2 * 1024 * 1024))),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        // A prefix only matches on a path segment boundary.
+        assert_eq!(
+            body_limit_exceeded(&limits(), &request("/uploader", Some(2048))),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_declared_length_is_passed_through() {
+        assert_eq!(body_limit_exceeded(&limits(), &request("/api", None)), None);
+    }
+
+    #[test]
+    fn a_zero_limit_means_no_limit() {
+        let unlimited = vec![LocalBodyLimit { prefix: "/".to_string(), max_bytes: 0 }];
+        assert_eq!(body_limit_exceeded(&unlimited, &request("/api", Some(u64::MAX))), None);
+    }
+
+    #[test]
+    fn a_route_without_a_limit_is_not_capped_by_another_route() {
+        let only_upload = vec![LocalBodyLimit { prefix: "/upload".to_string(), max_bytes: 16 }];
+        assert_eq!(body_limit_exceeded(&only_upload, &request("/api", Some(4096))), None);
     }
 
     #[test]

@@ -933,7 +933,12 @@ fn generate_locations(
         };
         
         writeln!(file, "    location {} {{", location_path)?;
-        
+
+        // Per-location, so two services behind the same domain can differ.
+        if let Some(limit) = svc.body_limit {
+            writeln!(file, "        client_max_body_size {};", limit)?;
+        }
+
         if svc.strip_prefix {
             writeln!(file, "        proxy_pass http://{}:{}/;", svc.service_name, svc.port)?;
         } else {
@@ -1101,6 +1106,24 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
          }
     }
     
+    for (i, rule) in ingress.rules.iter().enumerate() {
+        let router_name_base = rule.domain_name.replace(".", "-");
+        for (j, svc) in rule.services.iter().enumerate() {
+            // Traefik has no plain "reject oversized" switch: `buffering` is the
+            // only middleware that caps a request body, and it spools the body
+            // before forwarding it.
+            if let Some(limit) = svc.body_limit {
+                if !middlewares_written {
+                    writeln!(file, "  middlewares:")?;
+                    middlewares_written = true;
+                }
+                writeln!(file, "    limit-{}-{}-{}:", router_name_base, i, j)?;
+                writeln!(file, "      buffering:")?;
+                writeln!(file, "        maxRequestBodyBytes: {}", limit)?;
+            }
+        }
+    }
+
     for redirect in &ingress.redirects {
         if !middlewares_written {
             writeln!(file, "  middlewares:")?;
@@ -1144,9 +1167,15 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
                  writeln!(file, "        - web")?;
              }
              
-             if svc.strip_prefix && svc.prefix != "/" {
+             let strips = svc.strip_prefix && svc.prefix != "/";
+             if strips || svc.body_limit.is_some() {
                   writeln!(file, "      middlewares:")?;
-                  writeln!(file, "        - strip-{}-{}-{}", router_name_base, i, j)?;
+                  if strips {
+                      writeln!(file, "        - strip-{}-{}-{}", router_name_base, i, j)?;
+                  }
+                  if svc.body_limit.is_some() {
+                      writeln!(file, "        - limit-{}-{}-{}", router_name_base, i, j)?;
+                  }
              }
         }
     }
@@ -1296,6 +1325,7 @@ mod tests {
                     port: 80,
                     prefix: "/".to_string(),
                     strip_prefix: false,
+                    body_limit: None,
                 }],
             }],
             redirects: vec![RedirectRule {
@@ -1304,6 +1334,64 @@ mod tests {
                 permanent: true,
             }],
         }
+    }
+
+    fn ingress_with_limits(limits: &[(&str, &str, Option<u64>)]) -> IngressResolvedSpec {
+        IngressResolvedSpec {
+            name: "gateway".to_string(),
+            tls: None,
+            domains: vec!["somesite.com".to_string()],
+            rules: vec![IngressRule {
+                domain_name: "somesite.com".to_string(),
+                services: limits.iter().map(|(name, prefix, limit)| IngressToServiceRule {
+                    service_name: name.to_string(),
+                    deployment_name: "prod".to_string(),
+                    port: 80,
+                    prefix: prefix.to_string(),
+                    strip_prefix: false,
+                    body_limit: *limit,
+                }).collect(),
+            }],
+            redirects: vec![],
+        }
+    }
+
+    #[test]
+    fn nginx_caps_the_body_per_location() {
+        let ingress = ingress_with_limits(&[
+            ("api", "/api", Some(1024)),
+            ("upload", "/upload", Some(10 * 1024 * 1024)),
+            ("web", "/", None),
+        ]);
+        let conf = write_config(&ingress, false);
+
+        let api = conf.split("location /upload/").next().unwrap();
+        assert!(api.contains("client_max_body_size 1024;"), "{}", conf);
+        assert!(conf.contains("client_max_body_size 10485760;"), "{}", conf);
+        // A service without a limit keeps nginx's own default.
+        let web = conf.split("location / {").nth(1).unwrap();
+        assert!(!web.contains("client_max_body_size"), "{}", conf);
+    }
+
+    #[test]
+    fn traefik_caps_the_body_with_a_buffering_middleware() {
+        let ingress = ingress_with_limits(&[("upload", "/upload", Some(10 * 1024 * 1024))]);
+        let conf = write_config(&ingress, true);
+
+        assert!(conf.contains("    limit-somesite-com-0-0:"), "{}", conf);
+        assert!(conf.contains("      buffering:"), "{}", conf);
+        assert!(conf.contains("        maxRequestBodyBytes: 10485760"), "{}", conf);
+        assert!(conf.contains("        - limit-somesite-com-0-0"), "{}", conf);
+    }
+
+    #[test]
+    fn traefik_keeps_both_middlewares_when_a_route_strips_and_caps() {
+        let mut ingress = ingress_with_limits(&[("upload", "/upload", Some(2048))]);
+        ingress.rules[0].services[0].strip_prefix = true;
+        let conf = write_config(&ingress, true);
+
+        assert!(conf.contains("        - strip-somesite-com-0-0"), "{}", conf);
+        assert!(conf.contains("        - limit-somesite-com-0-0"), "{}", conf);
     }
 
     fn letsencrypt_tls() -> IngressTlsResolvedSpec {

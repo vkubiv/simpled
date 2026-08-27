@@ -311,7 +311,11 @@ pub fn resolve(
 
             for dep in &env_spec.deployments {
                 let dep_primary_host = &dep.primary_host;
-                for (service_name, ds) in dep.services.clone().unwrap_or_default() {
+                // Services live in a HashMap, so sort by name to keep the
+                // generated ingress configuration byte-identical across runs.
+                let mut dep_services: Vec<_> = dep.services.clone().unwrap_or_default().into_iter().collect();
+                dep_services.sort_by(|a, b| a.0.cmp(&b.0));
+                for (service_name, ds) in dep_services {
                         let h = ds.host.clone().unwrap_or(dep_primary_host.clone());
                         if &h == &host_spec.name {
                             let full_name = format!("{}", service_name);
@@ -324,6 +328,11 @@ pub fn resolve(
                                 80 // Default
                             };
 
+                            // A service's own limit wins over the gateway-wide
+                            // default; resolving it here means every generator
+                            // sees one effective number per route.
+                            let body_limit = ds.body_limit.or(env_spec.ingress.body_limit);
+
                             for prefix in &ds.prefixes {
                                 service_rules.push(IngressToServiceRule {
                                     service_name: full_name.clone(),
@@ -331,6 +340,7 @@ pub fn resolve(
                                     port,
                                     prefix: prefix.prefix.clone(),
                                     strip_prefix: prefix.strip,
+                                    body_limit,
                                 });
                             }
                     }
@@ -711,6 +721,7 @@ mod tests {
                 .collect(),
             tls: None,
             redirects,
+            body_limit: None,
         }
     }
 

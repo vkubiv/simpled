@@ -347,6 +347,7 @@ fn merge_service(
     DeploymentServiceSpecYaml {
         variant: child.variant.clone().or_else(|| base.variant.clone()),
         host: child.host.clone().or_else(|| base.host.clone()),
+        body_limit: child.body_limit.clone().or_else(|| base.body_limit.clone()),
         prefix: child.prefix.clone().or_else(|| base.prefix.clone()),
         strip_prefix: child.strip_prefix.or(base.strip_prefix),
         prefixes: merge_opt_map(base.prefixes.as_ref(), child.prefixes.as_ref(), |_, c| c.clone()),
@@ -437,12 +438,27 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         });
     }
 
+    let body_limit = convert_body_limit(yaml.body_limit.as_deref(), "gateway")?;
+
     Ok(IngressSpec {
         name: yaml.name,
         hosts,
         tls,
         redirects,
+        body_limit,
     })
+}
+
+/// Parses a `body_limit` value, naming what carries it so a typo points at the
+/// right place in the spec.
+fn convert_body_limit(value: Option<&str>, owner: &str) -> Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(raw) => parse_body_size_bytes(raw).map(Some).ok_or_else(|| anyhow!(
+            "Invalid body_limit '{}' on {}: expected a byte count with an optional k/m/g suffix, e.g. \"10m\"",
+            raw, owner
+        )),
+    }
 }
 
 fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>, root: &Path) -> Result<Vec<spec::EnvVariable>> {
@@ -604,7 +620,7 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_
     let services = if let Some(svcs) = &yaml.services {
         let mut map = HashMap::new();
         for (k, v) in svcs {
-            map.insert(k.clone(), convert_deployment_service(v, &defaults)?);
+            map.insert(k.clone(), convert_deployment_service(v, k, &defaults)?);
         }
         Some(map)
     } else {
@@ -666,7 +682,7 @@ fn convert_limits(yaml: Option<&ResourceLimitsYaml>) -> ResourceLimits {
     }
 }
 
-fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &ResourcesSpec) -> Result<DeploymentServiceSpec> {
+fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, name: &str, defaults: &ResourcesSpec) -> Result<DeploymentServiceSpec> {
     let mut prefixes = if let Some(p) = &yaml.prefixes {
         p.iter().map(|(k, v)| Prefix {
             prefix: k.clone(),
@@ -706,10 +722,13 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, defaults: &Resou
         .map(|s| super::parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
 
+    let body_limit = convert_body_limit(yaml.body_limit.as_deref(), &format!("service '{}'", name))?;
+
     Ok(DeploymentServiceSpec {
         variant: yaml.variant.clone(),
         host: yaml.host.clone(),
         prefixes,
+        body_limit,
         resources,
         ports,
         volumes,

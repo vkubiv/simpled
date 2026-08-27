@@ -159,6 +159,9 @@ pub struct IngressSpecYaml {
     pub name: String,
     pub hosts: HashMap<String, HostSpecYaml>,
     pub tls: Option<IngressTlsSpecYaml>,
+    // Default maximum request body size for every route, in nginx notation
+    // ("10m", "512k", "1g", or a plain byte count). "0" means no limit.
+    pub body_limit: Option<String>,
     // Domains the gateway answers only to send the client somewhere else, e.g.
     // the bare apex redirecting to the `www` host that actually serves the app.
     // They are never routed to a service, but they are still part of the
@@ -293,6 +296,9 @@ pub struct ResourceLimitsYaml {
 pub struct DeploymentServiceSpecYaml {
     pub variant: Option<String>,
     pub host: Option<String>,
+    // Maximum request body size for this service's routes, overriding the
+    // gateway-wide `body_limit`. Same notation as the gateway's.
+    pub body_limit: Option<String>,
     pub prefix: Option<String>,
     pub strip_prefix: Option<bool>,
     pub prefixes: Option<HashMap<String, PrefixOptionsYaml>>,

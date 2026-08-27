@@ -74,6 +74,10 @@ pub struct IngressToServiceRule {
     pub port: u16,
     pub prefix: String,
     pub strip_prefix: bool,
+    /// Maximum request body in bytes, already resolved against the gateway-wide
+    /// default. `None` leaves whatever the gateway would do on its own; `Some(0)`
+    /// is nginx's spelling of "no limit".
+    pub body_limit: Option<u64>,
 }
 
 #[derive(Debug)]

@@ -493,6 +493,31 @@ Redirect sources are part of the gateway's certificate — the redirect has to b
 too, or the browser reports a name mismatch before it ever follows it. A domain cannot appear under
 both `hosts` and `redirects`; that would make its routes unreachable, so `simpled` rejects the spec.
 
+#### Request body limit
+
+Gateways cap how large a request body they will accept — nginx and ingress-nginx default to 1 MB,
+which is easy to hit with a file upload. `body_limit` raises (or lowers) that cap, either for the
+whole gateway or for one service:
+
+```yaml
+gateway:
+  body_limit: 10m          # default for every route
+  hosts:
+    myapp: app.myapp.com
+
+deployments:
+  myapp_prod:
+    services:
+      upload-svc:
+        host: myapp
+        prefix: /upload
+        body_limit: 500m   # this service only
+```
+
+Sizes use nginx notation: a plain byte count, or a number with a `k`, `m` or `g` suffix (`10m`,
+`512k`, `1g`, `2mb`). `0` means no limit. A service's own `body_limit` wins over the gateway
+default; a service that sets neither keeps the gateway's built-in default.
+
 #### TLS options
 
 ```yaml

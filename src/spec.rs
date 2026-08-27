@@ -199,6 +199,40 @@ impl Healthcheck {
     }
 }
 
+/// Parse a request body size (e.g. "10m", "512k", "1G", "2mb", "1048576") into
+/// bytes, in the notation nginx's `client_max_body_size` uses.
+///
+/// `0` is not "no size" but nginx's spelling of "no limit", and is returned as
+/// such; the generators pass it through rather than treating it as unset.
+pub fn parse_body_size_bytes(input: &str) -> Option<u64> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+
+    // An optional `b` is accepted so that "10mb" reads the same as "10m".
+    let unit = s[digits.len()..].trim().to_ascii_lowercase();
+    let factor: u64 = match unit.trim_end_matches('b') {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    // "10b" is bytes, but a bare "b" after nothing ("10bb") is not a unit.
+    if unit.matches('b').count() > 1 {
+        return None;
+    }
+
+    value.checked_mul(factor)
+}
+
 /// Parse a compose duration (e.g. "30s", "1m30s", "1h") into whole seconds.
 /// Supports `h`, `m`, `s`, `ms` and `us`/`µs` segments; sub-second parts round up.
 pub fn parse_duration_secs(input: &str) -> Option<u64> {
@@ -323,6 +357,9 @@ pub struct IngressSpec {
     pub hosts: Vec<HostSpec>,
     pub tls: Option<IngressTlsSpec>,
     pub redirects: Vec<RedirectSpec>,
+    /// Default maximum request body, in bytes, for every route the gateway
+    /// serves. `None` leaves the gateway's own default in place.
+    pub body_limit: Option<u64>,
 }
 
 /// A domain the gateway serves only to bounce the client to another one, such as
@@ -425,6 +462,9 @@ pub struct DeploymentServiceSpec {
     pub variant: Option<String>,
     pub host: Option<String>,
     pub prefixes: Vec<Prefix>,
+    /// Maximum request body, in bytes, for this service's routes. Overrides the
+    /// gateway-wide default.
+    pub body_limit: Option<u64>,
     pub resources: ResourcesSpec,
     pub ports: Vec<ServicePort>,
     // Appended to the service's own volumes, never replacing them.
@@ -451,6 +491,26 @@ mod tests {
         assert_eq!(parse_duration_secs("30s"), Some(30));
         assert_eq!(parse_duration_secs("2m"), Some(120));
         assert_eq!(parse_duration_secs("1h"), Some(3600));
+    }
+
+    #[test]
+    fn parses_body_sizes_in_nginx_notation() {
+        assert_eq!(parse_body_size_bytes("1024"), Some(1024));
+        assert_eq!(parse_body_size_bytes("512k"), Some(512 * 1024));
+        assert_eq!(parse_body_size_bytes("10m"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_body_size_bytes("1G"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_body_size_bytes(" 2mb "), Some(2 * 1024 * 1024));
+        // nginx spells "no limit" as 0, so it is a value rather than an absence.
+        assert_eq!(parse_body_size_bytes("0"), Some(0));
+    }
+
+    #[test]
+    fn rejects_body_sizes_that_are_not_sizes() {
+        assert_eq!(parse_body_size_bytes(""), None);
+        assert_eq!(parse_body_size_bytes("m"), None);
+        assert_eq!(parse_body_size_bytes("10t"), None);
+        assert_eq!(parse_body_size_bytes("10 megabytes"), None);
+        assert_eq!(parse_body_size_bytes("1.5m"), None);
     }
 
     #[test]

@@ -354,6 +354,7 @@ gateway:
     multi-domain-alias:
       - www.domain.com
       - domain.com
+  body_limit: 10m         # optional; max request body for every route
   redirects:
     - from: domain.com      # a domain, or a list of them
       to: www.domain.com    # bare domain or full URL
@@ -392,6 +393,36 @@ The path and query string are preserved: `somesite.com/pricing?ref=x` → `www.s
 Redirect sources are included in the gateway's certificate, since the redirect itself has to be served over HTTPS. On Kubernetes each destination becomes its own `Ingress` carrying the ingress-nginx `permanent-redirect`/`temporal-redirect` annotation; on Docker it becomes an nginx `server` block or a Traefik `redirectRegex` middleware; locally the gateway matches the `Host` header, so a redirect can share a port with routed services.
 
 A domain may not appear under both `hosts` and `redirects`, and a source may not be listed twice — both make routing ambiguous and are rejected.
+
+#### body_limit
+
+Maximum size of a request body the gateway will accept. Set it on `gateway` for every route, and on an individual service under `deployments[].services[]` to override that default:
+
+```yaml
+gateway:
+  body_limit: 10m
+  hosts:
+    myapp: app.myapp.com
+
+deployments:
+  prod:
+    services:
+      upload-svc:
+        host: myapp
+        prefix: /upload
+        body_limit: 500m
+```
+
+Values use nginx notation: a plain byte count, or a number with a `k`/`m`/`g` suffix (a trailing `b` is allowed, so `2mb` reads the same as `2m`). `0` means no limit. Omitting it everywhere leaves the gateway's own default in place — 1 MB for nginx and ingress-nginx, unlimited for Traefik.
+
+How it is applied per target:
+
+| Target | Mechanism |
+|--------|-----------|
+| `k8s` | `nginx.ingress.kubernetes.io/proxy-body-size`. The annotation covers a whole Ingress, so routes with different limits are split into separate Ingress objects (`<gateway>--limit-<bytes>`); the primary object keeps the gateway name and owns the TLS certificate. |
+| `docker` + nginx | `client_max_body_size` inside each `location` block. |
+| `docker` + traefik | A `buffering` middleware with `maxRequestBodyBytes`. Traefik has no non-buffering size cap, so a limited route spools the request body before forwarding it. |
+| `local` | The gateway rejects a request whose `Content-Length` exceeds the limit with `413`. A chunked request that declares no length is passed through. |
 
 #### TLS options (mutually exclusive)
 

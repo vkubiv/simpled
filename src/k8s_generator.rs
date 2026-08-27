@@ -1,4 +1,4 @@
-use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec};
+use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, IngressToServiceRule, LetsEncryptResolvedSpec};
 use crate::secret_fetch::{self, sh_quote, FetchScript};
 use crate::spec::{parse_duration_secs, Healthcheck, SecretMount};
 use anyhow::{anyhow, Result};
@@ -245,88 +245,131 @@ fn generate_ingress(
 ) -> Result<()> {
     let file_name = output_dir.join("ingress.yaml");
     let mut file = File::create(file_name)?;
-    
-    writeln!(file, "apiVersion: networking.k8s.io/v1")?;
-    writeln!(file, "kind: Ingress")?;
-    writeln!(file, "metadata:")?;
-    writeln!(file, "  name: {}", resolved_spec.ingress.name)?;
-    writeln!(file, "  annotations:")?;
-    // Annotations for strip-prefix and cert-manager
-    if let Some(tls) = &resolved_spec.ingress.tls {
-        if tls.letsencrypt.is_some() {
-            writeln!(file, "    cert-manager.io/cluster-issuer: {}", LETSENCRYPT_ISSUER)?;
-        }
-    }
-    // Check if any rule needs strip-prefix
-    let needs_strip_prefix = resolved_spec.ingress.rules.iter().any(|r| r.services.iter().any(|s| s.strip_prefix));
-    if needs_strip_prefix {
-        writeln!(file, "    nginx.ingress.kubernetes.io/rewrite-target: /$2")?;
-    }
+    let ingress = &resolved_spec.ingress;
 
-    writeln!(file, "spec:")?;
-    writeln!(file, "  ingressClassName: nginx")?;
-    if let Some(tls) = &resolved_spec.ingress.tls {
-        writeln!(file, "  tls:")?;
-        writeln!(file, "  - hosts:")?;
-        // The same domain can be declared under multiple host groups, so
-        // `ingress.domains` may contain duplicates; emit each host only once.
-        let mut seen_hosts: Vec<&String> = Vec::new();
-        for domain in &resolved_spec.ingress.domains {
-            if seen_hosts.contains(&domain) {
-                continue;
+    // `proxy-body-size` is an annotation, and annotations cover a whole Ingress
+    // rather than a single path, so routes that want different limits cannot
+    // share one object. Group them by limit and emit an Ingress per group; with
+    // a single limit (the usual case) that is still just one object.
+    let mut limits: Vec<Option<u64>> = Vec::new();
+    let mut services_by_limit: HashMap<Option<u64>, Vec<(&String, &IngressToServiceRule)>> =
+        HashMap::new();
+    for rule in &ingress.rules {
+        for svc in &rule.services {
+            if !services_by_limit.contains_key(&svc.body_limit) {
+                limits.push(svc.body_limit);
             }
-            seen_hosts.push(domain);
-            writeln!(file, "    - {}", domain)?;
-        }
-        if let Some(secret) = &tls.secret {
-             writeln!(file, "    secretName: {}", secret)?;
-        } else if tls.letsencrypt.is_some() {
-             writeln!(file, "    secretName: {}--tls", resolved_spec.ingress.name)?;
+            services_by_limit.entry(svc.body_limit).or_default().push((&rule.domain_name, svc));
         }
     }
-    
-    writeln!(file, "  rules:")?;
-
-    // The same domain can be declared under multiple host groups, producing
-    // several rules with the same domain_name. Emit one `- host:` entry per
-    // domain with all of its services merged, rather than repeating the host.
-    // `domains` preserves first-seen order.
-    let mut domains: Vec<&String> = Vec::new();
-    let mut services_by_domain: std::collections::HashMap<
-        &String,
-        Vec<&crate::resolved_spec::IngressToServiceRule>,
-    > = std::collections::HashMap::new();
-    for rule in &resolved_spec.ingress.rules {
-        if !services_by_domain.contains_key(&rule.domain_name) {
-            domains.push(&rule.domain_name);
-        }
-        services_by_domain
-            .entry(&rule.domain_name)
-            .or_default()
-            .extend(rule.services.iter());
+    // A gateway with no routes at all still emits its (empty) Ingress, as before.
+    if limits.is_empty() {
+        limits.push(None);
+        services_by_limit.insert(None, Vec::new());
     }
+    // Which group is written first decides which object keeps the gateway's name
+    // and owns the certificate, so it must not depend on the order routes happen
+    // to arrive in. `None` sorts before `Some`, so an unlimited group leads.
+    limits.sort();
 
-    for domain in domains {
-        writeln!(file, "  - host: {}", domain)?;
-        writeln!(file, "    http:")?;
-        writeln!(file, "      paths:")?;
+    for (index, limit) in limits.iter().enumerate() {
+        // Named after the limit rather than the position, so adding a third group
+        // later cannot rename an object that is already deployed.
+        let limit_suffix = limit.map(|l| l.to_string()).unwrap_or_else(|| "default".to_string());
+        // The first group keeps the gateway's own name and owns the certificate.
+        // The rest only add paths to hosts the first one already serves, so they
+        // need neither a tls block nor the issuer annotation - a second
+        // Certificate would just race the first for the same secret.
+        let primary = index == 0;
+        let services = &services_by_limit[limit];
 
-        for svc_rule in &services_by_domain[domain] {
-             let path = if svc_rule.strip_prefix {
-                 let trimmed = svc_rule.prefix.trim_end_matches('/');
-                 format!("{}(/|$)(.*)", trimmed)
-             } else {
-                 svc_rule.prefix.clone()
-             };
-             
-             let path_type = if svc_rule.strip_prefix { "ImplementationSpecific" } else { "Prefix" };
-             writeln!(file, "      - path: {}", path)?;
-             writeln!(file, "        pathType: {}", path_type)?;
-             writeln!(file, "        backend:")?;
-             writeln!(file, "          service:")?;
-             writeln!(file, "            name: {}", svc_rule.service_name)?;
-             writeln!(file, "            port:")?;
-             writeln!(file, "              number: {}", svc_rule.port)?;
+        if !primary {
+            writeln!(file, "---")?;
+        }
+        writeln!(file, "apiVersion: networking.k8s.io/v1")?;
+        writeln!(file, "kind: Ingress")?;
+        writeln!(file, "metadata:")?;
+        if primary {
+            writeln!(file, "  name: {}", ingress.name)?;
+        } else {
+            writeln!(file, "  name: {}--limit-{}", ingress.name, limit_suffix)?;
+        }
+        writeln!(file, "  annotations:")?;
+        if primary {
+            if let Some(tls) = &ingress.tls {
+                if tls.letsencrypt.is_some() {
+                    writeln!(file, "    cert-manager.io/cluster-issuer: {}", LETSENCRYPT_ISSUER)?;
+                }
+            }
+        }
+        // rewrite-target is per-Ingress too, so it follows the group.
+        if services.iter().any(|(_, svc)| svc.strip_prefix) {
+            writeln!(file, "    nginx.ingress.kubernetes.io/rewrite-target: /$2")?;
+        }
+        if let Some(limit) = limit {
+            writeln!(file, "    nginx.ingress.kubernetes.io/proxy-body-size: \"{}\"", limit)?;
+        }
+
+        writeln!(file, "spec:")?;
+        writeln!(file, "  ingressClassName: nginx")?;
+        if primary {
+            if let Some(tls) = &ingress.tls {
+                writeln!(file, "  tls:")?;
+                writeln!(file, "  - hosts:")?;
+                // The same domain can be declared under multiple host groups, so
+                // `ingress.domains` may contain duplicates; emit each host only once.
+                let mut seen_hosts: Vec<&String> = Vec::new();
+                for domain in &ingress.domains {
+                    if seen_hosts.contains(&domain) {
+                        continue;
+                    }
+                    seen_hosts.push(domain);
+                    writeln!(file, "    - {}", domain)?;
+                }
+                if let Some(secret) = &tls.secret {
+                     writeln!(file, "    secretName: {}", secret)?;
+                } else if tls.letsencrypt.is_some() {
+                     writeln!(file, "    secretName: {}--tls", ingress.name)?;
+                }
+            }
+        }
+
+        writeln!(file, "  rules:")?;
+
+        // The same domain can be declared under multiple host groups, producing
+        // several rules with the same domain_name. Emit one `- host:` entry per
+        // domain with all of its services merged, rather than repeating the host.
+        let mut domains: Vec<&String> = Vec::new();
+        let mut services_by_domain: HashMap<&String, Vec<&IngressToServiceRule>> = HashMap::new();
+        for (domain, svc) in services {
+            if !services_by_domain.contains_key(domain) {
+                domains.push(domain);
+            }
+            services_by_domain.entry(domain).or_default().push(svc);
+        }
+
+        for domain in domains {
+            writeln!(file, "  - host: {}", domain)?;
+            writeln!(file, "    http:")?;
+            writeln!(file, "      paths:")?;
+
+            for svc_rule in &services_by_domain[domain] {
+                 let path = if svc_rule.strip_prefix {
+                     let trimmed = svc_rule.prefix.trim_end_matches('/');
+                     format!("{}(/|$)(.*)", trimmed)
+                 } else {
+                     svc_rule.prefix.clone()
+                 };
+
+                 let path_type = if svc_rule.strip_prefix { "ImplementationSpecific" } else { "Prefix" };
+                 writeln!(file, "      - path: {}", path)?;
+                 writeln!(file, "        pathType: {}", path_type)?;
+                 writeln!(file, "        backend:")?;
+                 writeln!(file, "          service:")?;
+                 writeln!(file, "            name: {}", svc_rule.service_name)?;
+                 writeln!(file, "            port:")?;
+                 writeln!(file, "              number: {}", svc_rule.port)?;
+            }
         }
     }
 
@@ -447,7 +490,7 @@ fn generate_cluster_issuer(output_dir: &Path, le_spec: &LetsEncryptResolvedSpec)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolved_spec::{IngressRule, IngressToServiceRule, IngressTlsResolvedSpec, RedirectRule};
+    use crate::resolved_spec::{IngressRule, IngressTlsResolvedSpec, RedirectRule};
     use std::fs;
 
     fn ingress(redirects: Vec<RedirectRule>, tls: Option<IngressTlsResolvedSpec>) -> IngressResolvedSpec {
@@ -463,6 +506,7 @@ mod tests {
                     port: 8080,
                     prefix: "/".to_string(),
                     strip_prefix: false,
+                    body_limit: None,
                 }],
             }],
             redirects,
@@ -485,6 +529,100 @@ mod tests {
             generate_redirect_ingresses(ingress, &mut file).unwrap();
         }
         fs::read_to_string(path).unwrap()
+    }
+
+    fn spec_with_limits(limits: &[(&str, &str, Option<u64>)]) -> EnvironmentResolvedSpec {
+        EnvironmentResolvedSpec {
+            env_type: crate::spec::DeploymentEnvType::K8S,
+            ingress: IngressResolvedSpec {
+                name: "gateway".to_string(),
+                tls: Some(IngressTlsResolvedSpec { secret: Some("tls".to_string()), letsencrypt: None }),
+                domains: vec!["somesite.com".to_string()],
+                rules: vec![IngressRule {
+                    domain_name: "somesite.com".to_string(),
+                    services: limits.iter().map(|(name, prefix, limit)| IngressToServiceRule {
+                        service_name: name.to_string(),
+                        deployment_name: "prod".to_string(),
+                        port: 80,
+                        prefix: prefix.to_string(),
+                        strip_prefix: false,
+                        body_limit: *limit,
+                    }).collect(),
+                }],
+                redirects: vec![],
+            },
+            current_deployment: crate::resolved_spec::DeploymentResolvedSpec {
+                name: "prod".to_string(),
+                application_name: "shop".to_string(),
+                configs: vec![],
+                secrets: vec![],
+                defaults: crate::spec::ResourcesSpec {
+                    replicas: 1,
+                    requests: crate::spec::ResourceLimits { memory: "1".to_string(), cpu: "1".to_string() },
+                    limits: crate::spec::ResourceLimits { memory: "1".to_string(), cpu: "1".to_string() },
+                },
+                services: vec![],
+                volumes: vec![],
+            },
+        }
+    }
+
+    fn render_ingress(spec: &EnvironmentResolvedSpec) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        generate_ingress(spec, dir.path()).unwrap();
+        fs::read_to_string(dir.path().join("ingress.yaml")).unwrap()
+    }
+
+    #[test]
+    fn one_shared_limit_stays_a_single_ingress() {
+        let yaml = render_ingress(&spec_with_limits(&[
+            ("api", "/api", Some(2048)),
+            ("web", "/", Some(2048)),
+        ]));
+
+        assert_eq!(yaml.matches("kind: Ingress").count(), 1, "{}", yaml);
+        assert!(yaml.contains("nginx.ingress.kubernetes.io/proxy-body-size: \"2048\""), "{}", yaml);
+    }
+
+    #[test]
+    fn differing_limits_split_into_separate_ingresses() {
+        let yaml = render_ingress(&spec_with_limits(&[
+            ("web", "/", None),
+            ("upload", "/upload", Some(10 * 1024 * 1024)),
+        ]));
+
+        // proxy-body-size is a per-Ingress annotation, so the routes cannot share
+        // one object.
+        assert_eq!(yaml.matches("kind: Ingress").count(), 2, "{}", yaml);
+        assert!(yaml.contains("  name: gateway
+"), "{}", yaml);
+        assert!(yaml.contains("  name: gateway--limit-10485760"), "{}", yaml);
+        assert!(yaml.contains("nginx.ingress.kubernetes.io/proxy-body-size: \"10485760\""), "{}", yaml);
+
+        // Only the primary owns the certificate; the second just adds paths to a
+        // host the first already serves.
+        assert_eq!(yaml.matches("secretName: tls").count(), 1, "{}", yaml);
+
+        let second = yaml.split("--limit-10485760").nth(1).unwrap();
+        assert!(second.contains("      - path: /upload"), "{}", yaml);
+        assert!(!second.contains("      - path: /
+"), "{}", yaml);
+    }
+
+    #[test]
+    fn rewrite_target_follows_the_group_that_needs_it() {
+        let mut spec = spec_with_limits(&[
+            ("web", "/", None),
+            ("upload", "/upload", Some(2048)),
+        ]);
+        spec.ingress.rules[0].services[1].strip_prefix = true;
+        let yaml = render_ingress(&spec);
+
+        // The annotation rewrites every path in its Ingress, so it must land on
+        // the group that actually strips.
+        let (first, second) = yaml.split_once("--limit-2048").unwrap();
+        assert!(!first.contains("rewrite-target"), "{}", yaml);
+        assert!(second.contains("rewrite-target"), "{}", yaml);
     }
 
     #[test]
