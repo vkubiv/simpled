@@ -145,13 +145,16 @@ fn generate_standalone(
     fs::create_dir_all(&secrets_dir)?;
     let mut fetch_script = FetchScript::new();
     for secret in &deployment.secrets {
-        let path = secrets_dir.join(&secret.name);
         match secret.deferred() {
-            Some(reference) => {
-                fetch_script.fetch(secret, reference);
-                fetch_script.write_to_file(secret, &format!("secrets/{}", secret.name));
-            }
-            None => fs::write(&path, secret.literal().unwrap_or_default())?,
+            Some(reference) => fetch_script.fetch(secret, reference),
+            None => fs::write(secrets_dir.join(&secret.name), secret.literal().unwrap_or_default())?,
+        }
+    }
+    // Every lookup first, then the files: a secret that does not resolve stops the
+    // script before any of the others has been written to the deploy target.
+    for secret in &deployment.secrets {
+        if secret.deferred().is_some() {
+            fetch_script.write_to_file(secret, &format!("secrets/{}", secret.name));
         }
     }
     if !fetch_script.is_empty() {
@@ -1662,8 +1665,8 @@ mod tests {
 
         let fetch = fs::read_to_string(dir.path().join("fetch-secrets.sh")).unwrap();
         assert!(fetch.contains(
-            "SIMPLED_SECRET_SHOP_DB_PASSWORD=\"$(aws secretsmanager get-secret-value \
-             --secret-id 'prod/shop/db' --query SecretString --output text | jq -r '.password')\""
+            "SIMPLED_SECRET_SHOP_DB_PASSWORD=\"$(simpled_read_secret \
+             'shop-db_password' 'prod/shop/db' '.password')\" || exit 1"
         ));
         assert!(fetch.contains("export SIMPLED_SECRET_SHOP_DB_PASSWORD"));
         // Only the secret that asked for a filter pulls jq into the requirements.

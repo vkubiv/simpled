@@ -333,7 +333,14 @@ Requirements on the deploy target:
 - The **AWS CLI** on `PATH`. Credentials, region and profile come from its own environment — an instance role, `AWS_REGION`, `AWS_PROFILE`, and so on. The generated script does not configure any of them.
 - **jq** on `PATH`, but only when at least one secret sets `jq`.
 
-The script fails the deploy if a lookup fails or resolves to an empty value, so a missing secret or a `jq` filter that matches nothing cannot reach a running service as a blank credential.
+Every secret is read, and checked, before the script writes the first file or creates the first Kubernetes Secret — one that does not resolve stops the deploy instead of leaving the others half-applied. A lookup fails the deploy when:
+
+- the secret does not exist in the account and region the target is configured for, or the target may not read it;
+- it exists but carries no string value — an empty secret, or one that holds only binary data;
+- a `jq` filter selects a key the secret's JSON does not have, or one whose value is `null`. Without that check jq prints the four characters `null` and the service would start with `null` as its credential;
+- a `jq` filter cannot be applied at all, because the filter is invalid or the secret's value is not JSON.
+
+jq's own error output is discarded rather than printed: a parse error quotes the input it choked on, which is the secret. The messages the script prints name the secret and the id it tried, never the value.
 
 Notes:
 

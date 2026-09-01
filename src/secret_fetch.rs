@@ -28,17 +28,10 @@ pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// The shell pipeline that prints one secret's value to stdout.
-fn fetch_pipeline(reference: &AwsSecretRef) -> String {
-    let mut pipeline = format!(
-        "aws secretsmanager get-secret-value --secret-id {} --query SecretString --output text",
-        sh_quote(&reference.secret_id)
-    );
-    if let Some(filter) = &reference.jq {
-        pipeline.push_str(&format!(" | jq -r {}", sh_quote(filter)));
-    }
-    pipeline
-}
+/// Name of the helper the script uses to read one secret, defined in its
+/// preamble. Prefixed like the other shell state the script leaves behind,
+/// because `deploy.sh` sources it.
+const READ_FUNCTION_NAME: &str = "simpled_read_secret";
 
 /// Accumulates the body of `fetch-secrets.sh`. Each generator fetches the
 /// deferred secrets it has and then appends the target-specific part: writing
@@ -83,19 +76,22 @@ impl FetchScript {
         !self.fetched
     }
 
-    /// Look up one secret and export it as its `shell_var()`.
+    /// Look up one secret and export it as its `shell_var()`. The lookup itself,
+    /// and every check that it produced a real value, lives in the
+    /// `simpled_read_secret` helper of the preamble; a secret that does not
+    /// resolve stops the script before anything is written or deployed.
     pub fn fetch(&mut self, secret: &SecretResolvedSpec, reference: &AwsSecretRef) {
         self.fetched = true;
         self.needs_jq |= reference.jq.is_some();
         let var = secret.shell_var();
         self.lines.push(format!("echo 'Fetching secret {} from AWS Secrets Manager...'", secret.name));
-        self.lines.push(format!("{}=\"$({})\"", var, fetch_pipeline(reference)));
-        // An empty value means the lookup silently produced nothing (a missing jq
-        // field, most often) and would deploy a service with a blank credential.
         self.lines.push(format!(
-            "if [ -z \"${{{var}}}\" ]; then echo 'Secret {name} resolved to an empty value.' >&2; exit 1; fi",
+            "{var}=\"$({read} {name} {id} {filter})\" || exit 1",
             var = var,
-            name = secret.name
+            read = READ_FUNCTION_NAME,
+            name = sh_quote(&secret.name),
+            id = sh_quote(&reference.secret_id),
+            filter = sh_quote(reference.jq.as_deref().unwrap_or_default()),
         ));
         self.lines.push(format!("export {}", var));
     }
@@ -200,6 +196,55 @@ impl FetchScript {
         writeln!(file, "umask 077")?;
         writeln!(file)?;
 
+        // Everything that could otherwise turn into a silently blank credential is
+        // caught here, in one place, before the value reaches a file or a
+        // `kubectl create secret`: a secret id that does not exist or cannot be
+        // read, a secret that carries no string value at all, and a `jq` filter
+        // that points at a key the secret's JSON does not have — which jq would
+        // otherwise happily print as the four characters `null`.
+        writeln!(file, "# Read one secret and print its value. Fails the deploy when the secret does")?;
+        writeln!(file, "# not exist, cannot be read, holds no string value, or — with a jq filter —")?;
+        writeln!(file, "# has no such key, rather than letting a service start on a blank credential.")?;
+        writeln!(file, "{}() {{", READ_FUNCTION_NAME)?;
+        writeln!(file, "  local name=\"$1\" secret_id=\"$2\" filter=\"$3\"")?;
+        writeln!(file, "  local value")?;
+        writeln!(file, "  if ! value=\"$(aws secretsmanager get-secret-value --secret-id \"$secret_id\" \\")?;
+        writeln!(file, "      --query SecretString --output text)\"; then")?;
+        writeln!(file, "    echo \"Secret $name: cannot read '$secret_id' from AWS Secrets Manager (the error above says why).\" >&2")?;
+        writeln!(file, "    echo \"Check that the secret exists in the account and region this machine uses, and that it may read it.\" >&2")?;
+        writeln!(file, "    return 1")?;
+        writeln!(file, "  fi")?;
+        writeln!(file, "  # --query prints the literal None for a secret that holds only binary data,")?;
+        writeln!(file, "  # and nothing at all for an empty string value.")?;
+        writeln!(file, "  if [ -z \"$value\" ] || [ \"$value\" = 'None' ]; then")?;
+        writeln!(file, "    echo \"Secret $name: '$secret_id' has no string value in AWS Secrets Manager.\" >&2")?;
+        writeln!(file, "    return 1")?;
+        writeln!(file, "  fi")?;
+        writeln!(file, "  if [ -n \"$filter\" ]; then")?;
+        writeln!(file, "    local filtered status")?;
+        writeln!(file, "    # -r keeps a JSON string unquoted, -e turns the null that a missing key")?;
+        writeln!(file, "    # selects into a failure. jq's own stderr is dropped: a parse error quotes")?;
+        writeln!(file, "    # the input it choked on, which is the secret.")?;
+        writeln!(file, "    if filtered=\"$(printf '%s' \"$value\" | jq -er \"$filter\" 2>/dev/null)\"; then")?;
+        writeln!(file, "      value=\"$filtered\"")?;
+        writeln!(file, "    else")?;
+        writeln!(file, "      status=$?")?;
+        writeln!(file, "      if [ \"$status\" = 1 ] || [ \"$status\" = 4 ]; then")?;
+        writeln!(file, "        echo \"Secret $name: the jq filter $filter selected no value in '$secret_id' — the key is missing or null.\" >&2")?;
+        writeln!(file, "      else")?;
+        writeln!(file, "        echo \"Secret $name: the jq filter $filter could not be applied to '$secret_id'. Is the filter valid, and is the secret's value JSON?\" >&2")?;
+        writeln!(file, "      fi")?;
+        writeln!(file, "      return 1")?;
+        writeln!(file, "    fi")?;
+        writeln!(file, "  fi")?;
+        writeln!(file, "  if [ -z \"$value\" ]; then")?;
+        writeln!(file, "    echo \"Secret $name: '$secret_id' resolved to an empty value.\" >&2")?;
+        writeln!(file, "    return 1")?;
+        writeln!(file, "  fi")?;
+        writeln!(file, "  printf '%s' \"$value\"")?;
+        writeln!(file, "}}")?;
+        writeln!(file)?;
+
         // A deploy script needs root for Docker, so it is run with sudo. Everything
         // this script writes would then be owned by root, and the unprivileged user
         // that copies the next deployment onto the target could no longer overwrite
@@ -261,9 +306,15 @@ mod tests {
         assert!(out.contains("command -v aws"));
         assert!(!out.contains("command -v jq"));
         assert!(out.contains(
-            "SIMPLED_SECRET_SHOP_DB_PASSWORD=\"$(aws secretsmanager get-secret-value \
-             --secret-id 'prod/shop/db' --query SecretString --output text)\""
+            "SIMPLED_SECRET_SHOP_DB_PASSWORD=\"$(simpled_read_secret \
+             'shop-db_password' 'prod/shop/db' '')\" || exit 1"
         ));
+        // The lookup, and every check that it produced a real value, is the helper's.
+        assert!(out.contains("aws secretsmanager get-secret-value --secret-id \"$secret_id\""));
+        // A secret that does not exist, or that this machine may not read, stops the
+        // deploy instead of leaving a service with a blank credential.
+        assert!(out.contains("cannot read '$secret_id' from AWS Secrets Manager"));
+        assert!(out.contains("has no string value in AWS Secrets Manager"));
         assert!(out.contains("mkdir -p 'secrets'"));
         // A container mounting the file runs as a user of its own, so the value has
         // to be readable by more than the owner the deploy leaves behind.
@@ -287,14 +338,29 @@ mod tests {
         });
 
         assert!(out.contains("command -v jq"));
-        assert!(out.contains("--secret-id 'prod/'\\''; rm -rf /; '\\'''"));
-        assert!(out.contains("jq -r '.pass'\\''word'"));
+        assert!(out.contains("'prod/'\\''; rm -rf /; '\\''' '.pass'\\''word'"));
+    }
+
+    /// A filter that points at a key the secret's JSON does not have makes jq print
+    /// `null`; without `-e` those four characters would be deployed as the credential.
+    #[test]
+    fn a_jq_filter_that_matches_nothing_fails_the_deploy() {
+        let out = script(AwsSecretRef {
+            secret_id: "prod/shop/db".to_string(),
+            jq: Some(".password".to_string()),
+        });
+
+        assert!(out.contains("jq -er \"$filter\" 2>/dev/null"));
+        assert!(out.contains("selected no value in '$secret_id'"));
+        assert!(out.contains("'shop-db_password' 'prod/shop/db' '.password'"));
     }
 }
 
 /// Perform the lookup on this machine. Used for `local` deployments, where the
 /// deploy target is the machine running simpled and there is no deploy script to
-/// defer the work to.
+/// defer the work to. Mirrors the checks the generated script makes: a secret
+/// that is missing, unreadable, valueless or whose filter points at a key the
+/// secret does not have is an error here too, never a blank value.
 pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
     let output = Command::new("aws")
         .args([
@@ -312,7 +378,9 @@ pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
 
     if !output.status.success() {
         return Err(anyhow!(
-            "aws secretsmanager get-secret-value failed for '{}': {}",
+            "Cannot read secret '{}' from AWS Secrets Manager: {}\n\
+             Check that the secret exists in the account and region the AWS CLI is configured for, \
+             and that those credentials may read it.",
             reference.secret_id,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
@@ -323,12 +391,24 @@ pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
     // `--output text` terminates the value with a newline that is not part of it.
     let value = value.trim_end_matches(['\n', '\r']).to_string();
 
+    // `--query SecretString` prints the literal `None` for a secret that holds
+    // only binary data, and nothing at all for an empty string value. Both would
+    // otherwise be handed to a service as its credential.
+    if value.is_empty() || value == "None" {
+        return Err(anyhow!(
+            "Secret '{}' has no string value in AWS Secrets Manager.",
+            reference.secret_id
+        ));
+    }
+
     let Some(filter) = &reference.jq else {
         return Ok(value);
     };
 
     let mut jq = Command::new("jq")
-        .args(["-r", filter])
+        // `-e` reports a filter that selected nothing: without it a key the secret
+        // does not have is printed as the four characters `null` and deployed.
+        .args(["-er", filter])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -343,16 +423,33 @@ pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
 
     let output = jq.wait_with_output().context("Failed to read the output of jq")?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "jq filter '{}' failed for secret '{}': {}",
-            filter,
-            reference.secret_id,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        // jq's own stderr is deliberately left out of these messages: a parse error
+        // quotes the input it choked on, which is the secret value.
+        return Err(match output.status.code() {
+            // 1: the filter selected `null` or `false`; 4: it selected nothing at all.
+            Some(1) | Some(4) => anyhow!(
+                "The jq filter '{}' selected no value in secret '{}' — the key is missing or null.",
+                filter,
+                reference.secret_id
+            ),
+            _ => anyhow!(
+                "The jq filter '{}' could not be applied to secret '{}'. \
+                 Is the filter valid, and is the secret's value JSON?",
+                filter,
+                reference.secret_id
+            ),
+        });
     }
 
     let filtered = String::from_utf8(output.stdout)
         .context("jq returned a value that is not valid UTF-8")?;
-    Ok(filtered.trim_end_matches(['\n', '\r']).to_string())
+    let filtered = filtered.trim_end_matches(['\n', '\r']).to_string();
+    if filtered.is_empty() {
+        return Err(anyhow!(
+            "The jq filter '{}' selected an empty value in secret '{}'.",
+            filter,
+            reference.secret_id
+        ));
+    }
+    Ok(filtered)
 }
-

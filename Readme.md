@@ -676,7 +676,7 @@ Let's deploy a website that contains frontend and headless CMS services.
 
 `deploy.sh` sources that script before it starts anything, so a Docker deploy needs no extra step. For Kubernetes, run `manifests/fetch-secrets.sh` against the target cluster before `kubectl apply -f manifests/`.
 
-The deploy target needs the AWS CLI on `PATH` (credentials, region and profile come from its own environment), plus `jq` when a secret uses the `jq` filter. See [AWS Secrets Manager](docs/reference.md#aws-secrets-manager) for details.
+The deploy target needs the AWS CLI on `PATH` (credentials, region and profile come from its own environment), plus `jq` when a secret uses the `jq` filter. Every secret is read and checked before anything is written: one that does not exist, that the target may not read, that carries no string value, or whose `jq` filter points at a key the secret does not have stops the deploy rather than reaching a service as a blank credential. See [AWS Secrets Manager](docs/reference.md#aws-secrets-manager) for details.
 
 #### `secrets_folder` (local only)
 

@@ -43,12 +43,22 @@ pub fn generate(
     for secret in &deployment.secrets {
         if let Some(reference) = secret.deferred() {
             fetch_script.fetch(secret, reference);
+        }
+    }
+    // Every lookup runs before the first `kubectl apply`, so a secret that does not
+    // resolve leaves none of the others already applied to the cluster.
+    for secret in &deployment.secrets {
+        if secret.deferred().is_some() {
             fetch_script.command(format!(
                 "kubectl create secret generic {name} --from-literal=value=\"${var}\" \
                  --dry-run=client -o yaml | kubectl apply -f -",
                 name = sh_quote(&secret.name),
                 var = secret.shell_var(),
             ));
+        }
+    }
+    for secret in &deployment.secrets {
+        if secret.deferred().is_some() {
             continue;
         }
 
