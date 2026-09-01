@@ -807,6 +807,44 @@ Options:
   --file <PATH>  Load secrets from file
 ```
 
+### `simpled docs`
+
+Prints the documentation embedded in the binary — these guides ship inside `simpled`
+itself, so they are available in any project without checking this repository out.
+
+```
+simpled docs                        List the available topics
+simpled docs <TOPIC>                Print a topic
+simpled docs <TOPIC> --outline      List the topic's section headings and anchors
+simpled docs <TOPIC> --section <S>  Print one section
+simpled docs search <QUERY>         Search every topic
+```
+
+Topics are `agent`, `tutorial`, `reference`, `examples` and `cicd`. An unambiguous
+prefix works, so `simpled docs ref` prints the reference.
+
+`--section` matches either the anchor printed by `--outline` (`secret-mount-options`) or
+any substring of a heading (`secret`), in which case every matching section is printed.
+`search` reports each hit as `topic#anchor`, which can be passed straight back to
+`--section`.
+
+### `simpled init-agent`
+
+Writes `.claude/skills/simpled/SKILL.md` into a project, so a coding agent working there
+discovers `simpled docs` and looks fields up instead of guessing at them.
+
+```
+simpled init-agent [OPTIONS]
+
+Options:
+  --path <PATH>  Project directory to write into (default: current dir)
+  --force        Overwrite an existing skill file
+  --stdout       Print the skill instead of writing it
+```
+
+The generated file is a plain Markdown document; adapt it freely, or pipe `--stdout`
+into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
+
 ---
 
 ## Generated output

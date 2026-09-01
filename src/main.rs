@@ -19,6 +19,7 @@ mod app_bundle;
 mod bundle_repo;
 mod docker_compose;
 mod updater;
+mod docs;
 
 #[derive(Parser)]
 #[command(name = "simpled")]
@@ -64,6 +65,48 @@ enum Commands {
     Local {
         #[command(subcommand)]
         command: LocalCommands,
+    },
+
+    /// Print the documentation embedded in this binary
+    ///
+    /// `simpled docs` lists the topics, `simpled docs <topic>` prints one, and
+    /// `simpled docs search <query>` searches all of them.
+    #[command(long_about = concat!(
+        "Print the documentation embedded in this binary.\n\n",
+        "  simpled docs                        list the available topics\n",
+        "  simpled docs <topic>                print a topic\n",
+        "  simpled docs <topic> --outline      list a topic's section headings\n",
+        "  simpled docs <topic> --section <s>  print one section of a topic\n",
+        "  simpled docs search <query>         search every topic\n\n",
+        "Topics: agent, tutorial, reference, examples, cicd. An unambiguous prefix works.",
+    ))]
+    Docs {
+        /// A topic name, `list`, or `search` followed by a query
+        #[arg(value_name = "TOPIC_OR_SEARCH")]
+        args: Vec<String>,
+
+        /// Print only the section whose heading matches this
+        #[arg(long)]
+        section: Option<String>,
+
+        /// List the topic's section headings instead of its text
+        #[arg(long)]
+        outline: bool,
+    },
+
+    /// Write an agent skill file into a project so coding agents discover these docs
+    InitAgent {
+        /// Project directory to write into (default: current dir)
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Overwrite an existing skill file
+        #[arg(long)]
+        force: bool,
+
+        /// Print the skill to stdout instead of writing it
+        #[arg(long)]
+        stdout: bool,
     },
 
     /// Check for a new release and update the binary
@@ -173,11 +216,38 @@ fn main() -> Result<()> {
         Commands::Local { command } => {
             local(&command)?;
         }
+        Commands::Docs { args, section, outline } => {
+            docs_command(args, section, *outline)?;
+        }
+        Commands::InitAgent { path, force, stdout } => {
+            docs::init_agent(path.as_deref(), *force, *stdout)?;
+        }
         Commands::Update { check } => {
             updater::check_and_update(*check)?;
         }
     }
     Ok(())
+}
+
+fn docs_command(args: &[String], section: &Option<String>, outline: bool) -> Result<()> {
+    match args.split_first() {
+        None => {
+            docs::list();
+            Ok(())
+        }
+        Some((first, rest)) if first == "list" && rest.is_empty() => {
+            docs::list();
+            Ok(())
+        }
+        Some((first, rest)) if first == "search" => docs::search(&rest.join(" ")),
+        Some((topic, rest)) if rest.is_empty() => docs::show(topic, section.as_deref(), outline),
+        Some((topic, rest)) => bail!(
+            "Unexpected arguments after the topic '{}': {}. Did you mean `simpled docs search {}`?",
+            topic,
+            rest.join(" "),
+            rest.join(" ")
+        ),
+    }
 }
 
 fn verify_command() -> Result<()> {

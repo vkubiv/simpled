@@ -14,6 +14,30 @@ It also borrows the app bundle concept from mobile development.
 - [Examples](docs/examples.md) — annotated real-world configurations covering common patterns
 - [Reference](docs/reference.md) — every field in `appspec.yaml` and `envspec.yaml`, plus CLI flags and generated output
 - [CI/CD Integration](docs/cicd.md) — automating builds and deployments with GitHub Actions
+- [For AI coding agents](docs/agent.md) — condensed manual: the mental model, the rules that break builds, and an error-to-fix table
+
+All of it is embedded in the binary, so you never have to leave the shell to look a field up:
+
+```bash
+simpled docs                                  # list the topics
+simpled docs reference --outline              # section headings of one topic
+simpled docs reference --section secrets      # just that section
+simpled docs search "working_dir"             # search every topic
+```
+
+### Working with a coding agent
+
+`simpled init-agent` writes a skill file into a project so Claude Code (and other agents
+that read `.claude/skills/`) find these docs on their own:
+
+```bash
+cd my-project
+simpled init-agent          # writes .claude/skills/simpled/SKILL.md
+```
+
+The agent then looks fields up with `simpled docs` instead of guessing at them. Run
+`simpled docs agent` yourself to see what it reads, or `simpled init-agent --stdout` to
+print the skill without writing it.
 
 ## Core concepts
 
