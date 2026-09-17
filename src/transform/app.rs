@@ -120,7 +120,6 @@ fn convert_environment(yaml: AppEnvironmentYaml) -> Result<AppEnvironment> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // TODO: check if optional variable is not defined in external
     let optional = yaml
         .optional
         .unwrap_or_default()
@@ -136,6 +135,17 @@ fn convert_environment(yaml: AppEnvironmentYaml) -> Result<AppEnvironment> {
             Ok(OptionalEnvVariable { name: desc.name })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // A name in both lists would be required and optional at once; the
+    // external entry would win and the optional one would be a silent no-op.
+    for opt in &optional {
+        if external.iter().any(|e| e.name == opt.name) {
+            return Err(anyhow!(
+                "Env variable {} is declared both as external and optional; declare it in one list only",
+                opt.name
+            ));
+        }
+    }
 
     let relative = yaml
         .relative
@@ -339,4 +349,50 @@ fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSe
         }
     }
     Ok(secrets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convert(raw: &str) -> Result<AppSpec> {
+        let yaml: AppSpecYaml = serde_yaml::from_str(raw).unwrap();
+        convert_app_spec(yaml, None)
+    }
+
+    #[test]
+    fn a_variable_cannot_be_both_external_and_optional() {
+        let err = convert(
+            r#"
+name: app
+version: 1.0.0
+environment:
+  external:
+    - LIVEKIT_URL
+  optional:
+    - LIVEKIT_URL
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("both as external and optional"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn distinct_external_and_optional_variables_are_accepted() {
+        let spec = convert(
+            r#"
+name: app
+version: 1.0.0
+environment:
+  external:
+    - DB_URL
+  optional:
+    - LIVEKIT_URL
+"#,
+        )
+        .unwrap();
+        assert_eq!(spec.environment.external[0].name, "DB_URL");
+        assert_eq!(spec.environment.optional[0].name, "LIVEKIT_URL");
+    }
 }

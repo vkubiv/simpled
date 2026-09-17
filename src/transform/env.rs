@@ -419,9 +419,16 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         (None, DeploymentEnvTypeYaml::Local) => None,
         (None, _) => return Err(anyhow!("Ingress TLS configuration is required for non-local environments. If you want to disable TLS explicitly set 'disable: true' in tls section")),
         (Some(t), _) => {
-            // TODO: if this local env and tls is enabled rise error.
             if t.disable == Some(true) {
                 None
+            } else if matches!(env_type, DeploymentEnvTypeYaml::Local) {
+                // The local gateway serves plain HTTP. Accepting a tls block here
+                // would make every relative URL `https://` and point services at
+                // a scheme nothing answers on.
+                return Err(anyhow!(
+                    "TLS cannot be enabled for a local environment: the local gateway serves plain HTTP. \
+                     Remove the 'tls' section or set 'disable: true'"
+                ));
             } else {
                 let letsencrypt = t.letsencrypt.map(|le| LetsEncryptSpec {
                     server: le.server,
@@ -1398,6 +1405,33 @@ deployments:
             }
             other => panic!("unexpected source: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tls_enabled_on_a_local_environment_is_rejected() {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+  tls:
+    letsencrypt:
+      email: ops@example.com
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    services:
+      web:
+        host: web
+        ports:
+          - "8080:80"
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
+        assert!(err.contains("local environment"), "unexpected error: {err}");
     }
 
     #[test]
