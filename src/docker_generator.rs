@@ -507,6 +507,18 @@ fn generate_swarm(
         network_name
     )?;
 
+    // Disk is reclaimed *before* the rollout, not after it. At this point the
+    // release currently serving traffic is running, so `prune -a` cannot remove
+    // its image, and nothing prunes after the new release is pulled. The node
+    // therefore always keeps the previous release next to the current one, and a
+    // rollback never has to wait on the registry. Pruning is housekeeping, so a
+    // failure here is reported but does not stop the deploy.
+    writeln!(deploy_sh, "echo 'Pruning images no container uses...'")?;
+    writeln!(
+        deploy_sh,
+        "docker image prune -af || echo 'Warning: image prune failed, continuing.' >&2"
+    )?;
+
     // Bind-mounted volume directories are not created automatically on the node
     // during the first deployment, which makes `docker stack deploy` fail. Collect
     // every host directory the stack binds and ensure it exists (mkdir -p is a
@@ -554,8 +566,7 @@ fn generate_swarm(
         // deployed is the complete stack file.
         // --detach=false blocks until every task is running (and healthy, when
         // the service declares a healthcheck), so a rollout that fails to
-        // converge fails the deploy, and the image prune below cannot run while
-        // a task is still pulling its image.
+        // converge fails the deploy instead of being reported as a success.
         writeln!(
             deploy_sh,
             "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune --detach=false",
@@ -630,14 +641,6 @@ fn generate_swarm(
             )?;
         }
     }
-
-    // After a successful deploy, reclaim disk space by removing images that are no
-    // longer used by any container/service (e.g. the previous versions replaced by
-    // this rollout). `set -e` above guarantees this only runs when the deploy
-    // succeeded, and every stack deploy above ran with --detach=false, so by now
-    // each task has its image and nothing still being pulled can be removed.
-    writeln!(deploy_sh, "echo 'Pruning unused images...'")?;
-    writeln!(deploy_sh, "docker image prune -af")?;
 
     Ok(())
 }
@@ -1712,6 +1715,19 @@ mod tests {
         assert!(!script.contains("Phase 1/3"));
         assert!(!script.contains("run_job"));
         assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
+    }
+
+    /// Pruned before the rollout, the image of the release that is still
+    /// running survives; pruned after it, that rollback image would be gone.
+    #[test]
+    fn swarm_prunes_images_before_anything_is_deployed() {
+        let spec = spec(vec![service("api", ServiceType::Public, &[])]);
+        let (_dir, script) = generate_swarm_to_temp(&spec);
+
+        let prune = script.find("docker image prune -af").unwrap();
+        let first_deploy = script.find("docker stack deploy").unwrap();
+        assert!(prune < first_deploy, "{}", script);
+        assert_eq!(script.matches("docker image prune").count(), 1, "{}", script);
     }
 
     #[test]
