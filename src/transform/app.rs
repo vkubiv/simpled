@@ -395,4 +395,113 @@ environment:
         assert_eq!(spec.environment.external[0].name, "DB_URL");
         assert_eq!(spec.environment.optional[0].name, "LIVEKIT_URL");
     }
+
+    fn convert_err(raw: &str) -> String {
+        convert(raw).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn a_service_needs_exactly_one_of_image_and_variants() {
+        let both = "name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n    variants:\n      arm:\n        image: b\n";
+        assert!(convert_err(both).contains("cannot have both 'image' and 'variants'"));
+        let neither = "name: app\nversion: 1.0.0\napp_services:\n  api:\n    type: public\n";
+        assert!(convert_err(neither).contains("must specify either 'image' or 'variants'"));
+    }
+
+    #[test]
+    fn a_named_volume_must_be_declared_at_the_top_level() {
+        let raw = "name: app\nversion: 1.0.0\napp_services:\n  db:\n    image: postgres:16\n    volumes:\n      - pgdata:/var/lib/postgresql\n";
+        assert!(convert_err(raw).contains("named volume 'pgdata' which is not declared"));
+
+        let spec = convert(&format!("{raw}volumes:\n  - pgdata\n")).unwrap();
+        assert!(matches!(&spec.app_services[0].volumes[0].name, ServiceVolumeType::Named(n) if n == "pgdata"));
+        // Host paths need no declaration.
+        let host = "name: app\nversion: 1.0.0\napp_services:\n  db:\n    image: postgres:16\n    volumes:\n      - ./data:/data\n";
+        assert!(
+            matches!(&convert(host).unwrap().app_services[0].volumes[0].name, ServiceVolumeType::Path(p) if p == "./data")
+        );
+    }
+
+    #[test]
+    fn a_healthcheck_needs_a_test_unless_it_is_disabled() {
+        let raw =
+            "name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n    healthcheck:\n      interval: 5s\n";
+        assert!(convert_err(raw).contains("healthcheck requires a 'test'"));
+
+        let disabled =
+            "name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n    healthcheck:\n      disable: true\n";
+        let spec = convert(disabled).unwrap();
+        assert!(spec.app_services[0].healthcheck.as_ref().unwrap().is_disabled());
+    }
+
+    #[test]
+    fn a_service_cannot_depend_on_itself() {
+        let raw = "name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n    depends_on:\n      - api\n";
+        assert!(convert_err(raw).contains("cannot depend on itself"));
+    }
+
+    #[test]
+    fn service_environment_entries_take_three_forms() {
+        let raw = "name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n    environment:\n      - $all\n      - PLAIN\n      - NAME = value with spaces \n";
+        let spec = convert(raw).unwrap();
+        let env = &spec.app_services[0].environment;
+        assert!(matches!(env[0], ServiceEnvOption::All));
+        assert!(matches!(&env[1], ServiceEnvOption::Simple(n) if n == "PLAIN"));
+        assert!(matches!(&env[2], ServiceEnvOption::WithValue(k, v) if k == "NAME" && v == "value with spaces"));
+    }
+
+    #[test]
+    fn service_secrets_default_to_a_file_under_secrets() {
+        let raw = "name: app\nversion: 1.0.0\nsecrets:\n  - a\n  - b\napp_services:\n  api:\n    image: a\n    secrets:\n      - a\n      - b:\n          variable: B\n";
+        let spec = convert(raw).unwrap();
+        let secrets = &spec.app_services[0].secrets;
+        assert!(matches!(&secrets[0].mount, SecretMount::FilePath(p) if p == "/secrets/a"));
+        assert!(matches!(&secrets[1].mount, SecretMount::EnvVariable(v) if v == "B"));
+    }
+
+    #[test]
+    fn relative_and_internal_variables_are_checked_for_shape() {
+        let bad_relative = "name: app\nversion: 1.0.0\nenvironment:\n  relative:\n    - API_URL=api\n";
+        assert!(convert_err(bad_relative).contains("must start with /"));
+        let no_value = "name: app\nversion: 1.0.0\nenvironment:\n  internal:\n    - QUEUE\n";
+        assert!(convert_err(no_value).contains("must have a value"));
+        let optional_default = "name: app\nversion: 1.0.0\nenvironment:\n  optional:\n    - FLAG=1\n";
+        assert!(convert_err(optional_default).contains("cannot have a default value"));
+    }
+
+    /// `application.extra` files add to every part of the app spec for one
+    /// deployment, without the app repository knowing about them.
+    #[test]
+    fn extra_files_extend_the_app_spec_for_the_deployment() {
+        use crate::test_support::env_spec;
+        use std::fs;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("extra.yaml"),
+            "extra_services:\n  cache:\n    image: redis:7\n    volumes:\n      - redisdata:/data\nenvironment:\n  external:\n    - CACHE_URL\nconfigs:\n  cache:\n    - redis.conf\nsecrets:\n  - cache_password\nvolumes:\n  - redisdata\n",
+        )
+        .unwrap();
+        let env = env_spec(
+            "type: k8s\ngateway:\n  hosts:\n    web: shop.example.com\n  tls:\n    disable: true\ndeployments:\n  prod:\n    primary_host: web\n    application:\n      name: app\n      extra:\n        - extra.yaml\n",
+            root.path(),
+        );
+
+        let yaml: AppSpecYaml =
+            serde_yaml::from_str("name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n").unwrap();
+        let spec = convert_app_spec(yaml, Some(&env)).unwrap();
+
+        assert_eq!(spec.extra_services[0].name, "cache");
+        assert!(!spec.extra_services[0].is_app_service);
+        assert_eq!(spec.environment.external[0].name, "CACHE_URL");
+        assert_eq!(spec.configs[0].name, "cache");
+        assert_eq!(spec.secrets[0].secret_name, "cache_password");
+        assert_eq!(spec.volumes, vec!["redisdata"]);
+
+        // A deployment for another application does not pull the file in.
+        let yaml: AppSpecYaml =
+            serde_yaml::from_str("name: other\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n").unwrap();
+        let spec = convert_app_spec(yaml, Some(&env)).unwrap();
+        assert!(spec.extra_services.is_empty());
+    }
 }
