@@ -552,9 +552,13 @@ fn generate_swarm(
         // but are no longer in the stack file, i.e. services deleted from the
         // spec since the last deploy. Only ever passed when the file being
         // deployed is the complete stack file.
+        // --detach=false blocks until every task is running (and healthy, when
+        // the service declares a healthcheck), so a rollout that fails to
+        // converge fails the deploy, and the image prune below cannot run while
+        // a task is still pulling its image.
         writeln!(
             deploy_sh,
-            "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune",
+            "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune --detach=false",
             deployment.name, deployment.name
         )?;
     } else {
@@ -615,7 +619,7 @@ fn generate_swarm(
         } else if deps_only || prerequisites.is_empty() {
             writeln!(
                 deploy_sh,
-                "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune",
+                "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune --detach=false",
                 deployment.name, deployment.name
             )?;
         } else {
@@ -630,14 +634,8 @@ fn generate_swarm(
     // After a successful deploy, reclaim disk space by removing images that are no
     // longer used by any container/service (e.g. the previous versions replaced by
     // this rollout). `set -e` above guarantees this only runs when the deploy
-    // succeeded.
-    //
-    // `docker stack deploy` returns before the rollout has converged, so the new
-    // tasks may still be pulling/starting their images. Wait 3 minutes to give the
-    // rollout time to settle before pruning, otherwise we could remove an image a
-    // task still depends on.
-    writeln!(deploy_sh, "echo 'Waiting for rollout to settle before pruning...'")?;
-    writeln!(deploy_sh, "sleep 180")?;
+    // succeeded, and every stack deploy above ran with --detach=false, so by now
+    // each task has its image and nothing still being pulled can be removed.
     writeln!(deploy_sh, "echo 'Pruning unused images...'")?;
     writeln!(deploy_sh, "docker image prune -af")?;
 
@@ -1708,7 +1706,9 @@ mod tests {
         let spec = spec(vec![service("api", ServiceType::Public, &[])]);
         let (dir, script) = generate_swarm_to_temp(&spec);
 
-        assert!(script.contains("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune\n"));
+        assert!(script.contains(
+            "docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false\n"
+        ));
         assert!(!script.contains("Phase 1/3"));
         assert!(!script.contains("run_job"));
         assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
@@ -1732,7 +1732,7 @@ mod tests {
         assert!(!script.contains("docker-compose.deps.yaml prod --with-registry-auth --prune"));
         let job = script.find("run_job 'prod_migrate'").unwrap();
         let phase3 = script
-            .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune\n")
+            .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false\n")
             .unwrap();
         assert!(
             phase1 < job && job < phase3,
