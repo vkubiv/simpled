@@ -2,13 +2,17 @@ use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use semver::Version;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::env;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use tar::Archive;
 
 const GITHUB_REPO: &str = "vkubiv/simpled";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Release asset listing the SHA-256 of every other asset, written by the
+/// release workflow with `sha256sum`.
+const CHECKSUMS_ASSET: &str = "sha256sums.txt";
 
 #[derive(Deserialize)]
 struct Asset {
@@ -128,40 +132,54 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
     }
 
     let asset_name = platform_asset_name()?;
-    let asset = release
+    let asset = release.assets.iter().find(|a| a.name == asset_name).with_context(|| {
+        format!(
+            "No binary found for this platform in release {} (expected asset '{}')",
+            release.tag_name, asset_name
+        )
+    })?;
+    // Without the digest list nothing vouches for the download, so the update
+    // is refused rather than installed unverified.
+    let checksums_asset = release
         .assets
-        .into_iter()
-        .find(|a| a.name == asset_name)
+        .iter()
+        .find(|a| a.name == CHECKSUMS_ASSET)
         .with_context(|| {
             format!(
-                "No binary found for this platform in release {} (expected asset '{}')",
-                release.tag_name, asset_name
+                "Release {} carries no {}, so the downloaded binary cannot be verified; refusing to install it",
+                release.tag_name, CHECKSUMS_ASSET
             )
         })?;
 
     let current_exe = resolve_current_exe()?;
     ensure_writable(&current_exe)?;
 
+    let checksums = String::from_utf8(download_asset(&checksums_asset.url)?)
+        .with_context(|| format!("{} is not valid UTF-8", CHECKSUMS_ASSET))?;
+    let expected = expected_sha256(&checksums, &asset_name).with_context(|| {
+        format!(
+            "{} of release {} has no entry for {}",
+            CHECKSUMS_ASSET, release.tag_name, asset_name
+        )
+    })?;
+
     println!("Downloading {}...", asset_name);
+    let archive_bytes = download_asset(&asset.url)?;
 
-    let mut builder = reqwest::blocking::Client::new()
-        .get(&asset.url)
-        .header("User-Agent", "simpled")
-        .header("Accept", "application/octet-stream");
-
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        builder = builder.header("Authorization", format!("Bearer {}", token));
+    let actual = sha256_hex(&archive_bytes);
+    if actual != expected {
+        bail!(
+            "Checksum mismatch for {}: expected {} but downloaded {}. The download is corrupt or has been tampered with; nothing was installed.",
+            asset_name,
+            expected,
+            actual
+        );
     }
-
-    let response = builder.send().context("Failed to download update")?;
-
-    if !response.status().is_success() {
-        bail!("Download failed with status {}", response.status());
-    }
+    println!("Checksum verified.");
 
     let tmp_path = current_exe.with_extension("update_tmp");
 
-    let gz = GzDecoder::new(response);
+    let gz = GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = Archive::new(gz);
 
     let binary_name = if cfg!(windows) { "simpled.exe" } else { "simpled" };
@@ -202,6 +220,39 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// Fetch one release asset in full. Assets are small (a compressed binary), so
+/// holding it in memory lets the digest be checked before anything is extracted.
+fn download_asset(url: &str) -> Result<Vec<u8>> {
+    let mut builder = reqwest::blocking::Client::new()
+        .get(url)
+        .header("User-Agent", "simpled")
+        .header("Accept", "application/octet-stream");
+
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        builder = builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let response = builder.send().with_context(|| format!("Failed to download {}", url))?;
+    if !response.status().is_success() {
+        bail!("Download of {} failed with status {}", url, response.status());
+    }
+    Ok(response.bytes().context("Failed to read download")?.to_vec())
+}
+
+/// The digest `sha256sum` recorded for `asset_name`, from its `<hex>  <name>`
+/// lines. `<hex> *<name>` (binary mode) is accepted too.
+fn expected_sha256(checksums: &str, asset_name: &str) -> Option<String> {
+    checksums.lines().find_map(|line| {
+        let (hex, name) = line.trim().split_once(char::is_whitespace)?;
+        let name = name.trim_start().trim_start_matches('*');
+        (name == asset_name).then(|| hex.to_ascii_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 #[cfg(windows)]
 fn replace_exe(current: &std::path::Path, new: &std::path::Path) -> Result<()> {
     // Windows won't let you overwrite a running exe, but allows renaming it.
@@ -217,4 +268,36 @@ fn replace_exe(current: &std::path::Path, new: &std::path::Path) -> Result<()> {
 fn replace_exe(current: &std::path::Path, new: &std::path::Path) -> Result<()> {
     std::fs::rename(new, current).context("Failed to replace executable")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUMS: &str = "\
+0123abcd  simpled_linux_amd64.tar.gz
+ABCD0123 *simpled_windows_amd64.tar.gz
+";
+
+    #[test]
+    fn the_digest_of_an_asset_is_looked_up_by_name() {
+        assert_eq!(
+            expected_sha256(SUMS, "simpled_linux_amd64.tar.gz").as_deref(),
+            Some("0123abcd")
+        );
+        // Binary-mode marker and upper-case hex are normalized.
+        assert_eq!(
+            expected_sha256(SUMS, "simpled_windows_amd64.tar.gz").as_deref(),
+            Some("abcd0123")
+        );
+        assert_eq!(expected_sha256(SUMS, "simpled_macos_arm64.tar.gz"), None);
+    }
+
+    #[test]
+    fn sha256_matches_the_known_digest_of_abc() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

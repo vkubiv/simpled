@@ -12,6 +12,7 @@ semver = "1.0.27"
 tar = "0.4"
 flate2 = "1.0"
 base64 = "0.22"
+sha2 = "0.10"
 axum-reverse-proxy = { version = "1.0", features = [] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "net"] }
 axum = "0.8.8"

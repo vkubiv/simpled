@@ -200,6 +200,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Write checksums
+        # `simpled update` refuses to install a binary whose digest is not listed
+        # here, so this file has to ship with every release.
+        run: |
+          cd artifacts
+          sha256sum * > sha256sums.txt
+          cat sha256sums.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
