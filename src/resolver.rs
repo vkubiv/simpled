@@ -1063,4 +1063,247 @@ mod tests {
         let err = resolve_secret_refs("$secret(api_key)", &secrets(), &deferred).unwrap_err();
         assert!(err.to_string().contains("'aws' source"));
     }
+
+    mod full_resolve {
+        //! `resolve` on specs written as YAML: the happy path once, then every
+        //! way a spec can be rejected during resolution.
+        use super::*;
+        use crate::test_support::{app_spec, env_spec};
+
+        const APP: &str = r#"
+name: shop
+version: 1.2.3
+environment:
+  external:
+    - LOG_LEVEL=info
+  relative:
+    - PUBLIC_URL=/
+app_services:
+  api:
+    type: public
+    image: myorg/api
+    environment:
+      - $all
+    ports:
+      - "80:8080"
+extra_services:
+  primary-db:
+    type: internal
+    image: postgres:16
+"#;
+
+        fn env(env_type: &str, registry: &str, prod_services: &str, extra_deployments: &str) -> String {
+            format!(
+                r#"
+type: {env_type}
+gateway:
+  hosts:
+    web: shop.example.com
+    admin: admin.example.com
+  tls:
+    disable: true
+{registry}
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    services:
+{prod_services}
+{extra_deployments}
+"#
+            )
+        }
+
+        const REGISTRY: &str = "registry:\n  myorg: registry.example.com";
+        const API_ROUTED: &str = "      api:\n        host: web\n        prefix: /";
+
+        fn resolve_yaml(app: &str, env_yaml: &str) -> Result<EnvironmentResolvedSpec> {
+            let root = tempfile::tempdir().unwrap();
+            resolve(&env_spec(env_yaml, root.path()), &app_spec(app), "prod")
+        }
+
+        fn error(app: &str, env_yaml: &str) -> String {
+            resolve_yaml(app, env_yaml).unwrap_err().to_string()
+        }
+
+        #[test]
+        fn a_kubernetes_deployment_resolves_images_and_environment() {
+            let spec = resolve_yaml(APP, &env("k8s", REGISTRY, API_ROUTED, "")).unwrap();
+            let api = spec
+                .current_deployment
+                .services
+                .iter()
+                .find(|s| s.full_name == "api")
+                .unwrap();
+            let db = spec
+                .current_deployment
+                .services
+                .iter()
+                .find(|s| s.full_name == "primary-db")
+                .unwrap();
+
+            // App images get the version and the registry; extra images are untouched.
+            assert_eq!(api.image, "registry.example.com/myorg/api:1.2.3");
+            assert_eq!(db.image, "postgres:16");
+
+            let value = |name: &str| {
+                api.environment_variables
+                    .iter()
+                    .find(|v| v.name == name)
+                    .map(|v| v.value.as_str())
+            };
+            assert_eq!(value("LOG_LEVEL"), Some("info"));
+            // No TLS, so relative URLs are http on the service's host.
+            assert_eq!(value("PUBLIC_URL"), Some("http://shop.example.com/"));
+
+            assert_eq!(spec.ingress.rules.len(), 1);
+            assert_eq!(spec.ingress.rules[0].domain_name, "shop.example.com");
+            assert_eq!(spec.ingress.rules[0].services[0].service_name, "api");
+        }
+
+        #[test]
+        fn a_local_deployment_uses_the_latest_local_image() {
+            let local = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    services:
+      api:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+"#;
+            let spec = resolve_yaml(APP, local).unwrap();
+            let api = spec
+                .current_deployment
+                .services
+                .iter()
+                .find(|s| s.full_name == "api")
+                .unwrap();
+            assert_eq!(api.image, "myorg/api:latest");
+        }
+
+        #[test]
+        fn a_missing_registry_namespace_is_rejected() {
+            let err = error(APP, &env("k8s", "registry:\n  other: r.example.com", API_ROUTED, ""));
+            assert!(err.contains("namespace 'myorg' not found"), "{err}");
+
+            let err = error(APP, &env("k8s", "", API_ROUTED, ""));
+            assert!(err.contains("Registry mapping is required"), "{err}");
+        }
+
+        #[test]
+        fn an_unknown_image_variant_is_rejected() {
+            let app = APP.replace(
+                "    image: myorg/api\n",
+                "    variants:\n      arm:\n        image: myorg/api-arm\n",
+            );
+            let services = "      api:\n        host: web\n        prefix: /\n        variant: x86";
+            let err = error(&app, &env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("Image variant 'x86' not found for service 'api'"), "{err}");
+        }
+
+        #[test]
+        fn an_unknown_host_is_rejected() {
+            let services = "      api:\n        host: nope\n        prefix: /";
+            let err = error(APP, &env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("Host nope not found in ingress spec"), "{err}");
+        }
+
+        #[test]
+        fn a_public_service_without_a_prefix_is_rejected() {
+            let services = "      api:\n        host: web";
+            let err = error(APP, &env("k8s", REGISTRY, services, ""));
+            assert!(
+                err.contains("Public service 'api'") && err.contains("no prefixes"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn two_public_services_cannot_share_a_host_and_prefix() {
+            let app = format!("{APP}  admin:\n    type: public\n    image: myorg/admin\n");
+            let services =
+                "      api:\n        host: web\n        prefix: /\n      admin:\n        host: web\n        prefix: /";
+            let err = error(&app, &env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("Duplicate host+prefix"), "{err}");
+        }
+
+        #[test]
+        fn two_deployments_cannot_route_the_same_domain_and_path() {
+            let staging = "  staging:\n    primary_host: web\n    application:\n      name: shop\n    services:\n      api:\n        host: web\n        prefix: /";
+            let err = error(APP, &env("k8s", REGISTRY, API_ROUTED, staging));
+            assert!(err.contains("maps path '/' to multiple services"), "{err}");
+        }
+
+        #[test]
+        fn a_deployment_volume_must_be_declared_by_the_app() {
+            let services =
+                "      api:\n        host: web\n        prefix: /\n        volumes:\n          - cache:/cache";
+            let err = error(APP, &env("k8s", REGISTRY, services, ""));
+            assert!(
+                err.contains("named volume 'cache'") && err.contains("not declared"),
+                "{err}"
+            );
+
+            let app = format!("{APP}volumes:\n  - cache\n");
+            let spec = resolve_yaml(&app, &env("k8s", REGISTRY, services, "")).unwrap();
+            let api = spec
+                .current_deployment
+                .services
+                .iter()
+                .find(|s| s.full_name == "api")
+                .unwrap();
+            assert_eq!(api.volumes.len(), 1);
+        }
+
+        #[test]
+        fn a_secret_from_an_unset_or_empty_environment_variable_is_rejected() {
+            let app = format!("{APP}secrets:\n  - db_password\n");
+            let secrets = |var: &str| {
+                format!("      api:\n        host: web\n        prefix: /\n    secrets:\n      db_password:\n        env: {var}")
+            };
+            // `services:` is closed by the `secrets:` key at deployment level.
+            let err = error(&app, &env("k8s", REGISTRY, &secrets("SIMPLED_TEST_UNSET_SECRET"), ""));
+            assert!(err.contains("SIMPLED_TEST_UNSET_SECRET not set"), "{err}");
+
+            std::env::set_var("SIMPLED_TEST_EMPTY_SECRET", "");
+            let err = error(&app, &env("k8s", REGISTRY, &secrets("SIMPLED_TEST_EMPTY_SECRET"), ""));
+            assert!(err.contains("SIMPLED_TEST_EMPTY_SECRET is empty"), "{err}");
+        }
+
+        #[test]
+        fn a_secret_reference_to_a_deferred_secret_is_rejected() {
+            let app = format!("{APP}secrets:\n  - db_password\n");
+            let services = "      api:\n        host: web\n        prefix: /\n    environment:\n      - DB_URL=postgres://u:$secret(db_password)@db\n    secrets:\n      db_password:\n        aws: prod/shop/db";
+            let err = error(&app, &env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("$secret(db_password) cannot be used"), "{err}");
+        }
+
+        #[test]
+        fn a_literal_secret_can_be_referenced_from_the_environment() {
+            let app = APP.replace("    - LOG_LEVEL=info\n", "    - LOG_LEVEL=info\n    - DB_URL\n")
+                + "secrets:\n  - db_password\n";
+            let services = "      api:\n        host: web\n        prefix: /\n    environment:\n      - DB_URL=postgres://u:$secret(db_password)@db\n    secrets:\n      db_password: s3cr3t";
+            let spec = resolve_yaml(&app, &env("k8s", REGISTRY, services, "")).unwrap();
+            let api = spec
+                .current_deployment
+                .services
+                .iter()
+                .find(|s| s.full_name == "api")
+                .unwrap();
+            let db_url = api.environment_variables.iter().find(|v| v.name == "DB_URL").unwrap();
+            assert_eq!(db_url.value, "postgres://u:s3cr3t@db");
+            assert_eq!(spec.current_deployment.secrets[0].name, "shop-db_password");
+            assert_eq!(spec.current_deployment.secrets[0].literal(), Some("s3cr3t"));
+        }
+    }
 }
