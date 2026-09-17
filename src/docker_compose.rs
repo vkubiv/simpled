@@ -467,4 +467,236 @@ mod tests {
         assert_eq!(local_project_name("_leading"), "leading_local");
         assert_eq!(local_project_name("***"), "local");
     }
+
+    mod prepare {
+        use super::*;
+        use crate::resolved_spec::{ConfigResolvedFile, ConfigResolvedSpec, SecretResolvedSpec, SecretResolvedValue};
+        use crate::spec::{AwsSecretRef, DeploymentEnvType, ServiceConfigOption, ServiceSecret, ServiceType};
+        use crate::test_support::{resolved_deployment, resolved_env, resolved_service};
+
+        fn config(name: &str, files: &[(&str, &str)]) -> ConfigResolvedSpec {
+            ConfigResolvedSpec {
+                name: name.to_string(),
+                files: files
+                    .iter()
+                    .map(|(n, c)| ConfigResolvedFile {
+                        name: n.to_string(),
+                        content: c.as_bytes().to_vec(),
+                    })
+                    .collect(),
+            }
+        }
+
+        fn swarm() -> DeploymentEnvType {
+            DeploymentEnvType::Docker(crate::spec::DockerSpecificSpec {
+                ingress_type: crate::spec::DockerIngressType::Nginx,
+                swarm_mode: true,
+            })
+        }
+
+        #[test]
+        fn a_single_file_config_is_mounted_as_a_file_and_a_group_as_a_directory() {
+            let mut api = resolved_service("api", ServiceType::Public, &[]);
+            api.configs = vec![
+                ServiceConfigOption {
+                    config_name: "shop-settings".to_string(),
+                    mount_path: "/etc/app/settings.json".to_string(),
+                },
+                ServiceConfigOption {
+                    config_name: "shop-data".to_string(),
+                    mount_path: "/data".to_string(),
+                },
+            ];
+            let mut deployment = resolved_deployment(vec![]);
+            deployment.configs = vec![
+                config("shop-settings", &[("settings.json", "{}")]),
+                config("shop-data", &[("a.json", "1"), ("b.json", "2")]),
+            ];
+            let spec = resolved_env(swarm(), deployment);
+
+            let out = tempfile::tempdir().unwrap();
+            let service = prepare_service(&api, &spec, out.path()).unwrap();
+
+            // The mount path names the file itself, so it is a file mount.
+            assert!(
+                service
+                    .volumes
+                    .contains(&"./api/etc/app/settings.json:/etc/app/settings.json".to_string()),
+                "{:?}",
+                service.volumes
+            );
+            assert_eq!(
+                fs::read_to_string(out.path().join("api/etc/app/settings.json")).unwrap(),
+                "{}"
+            );
+            // Several files: the directory is mounted whole.
+            assert!(
+                service.volumes.contains(&"./api/data:/data".to_string()),
+                "{:?}",
+                service.volumes
+            );
+            assert_eq!(fs::read_to_string(out.path().join("api/data/b.json")).unwrap(), "2");
+            assert_eq!(service.env_file, vec!["./api/.env"]);
+        }
+
+        #[test]
+        fn literal_secrets_are_written_and_deferred_ones_referenced() {
+            let mut api = resolved_service("api", ServiceType::Public, &[]);
+            api.secrets = vec![
+                ServiceSecret {
+                    name: "shop-api_key".to_string(),
+                    mount: SecretMount::EnvVariable("API_KEY".to_string()),
+                },
+                ServiceSecret {
+                    name: "shop-db_password".to_string(),
+                    mount: SecretMount::EnvVariable("DB_PASSWORD".to_string()),
+                },
+                ServiceSecret {
+                    name: "shop-tls_key".to_string(),
+                    mount: SecretMount::FilePath("/run/secrets/tls.key".to_string()),
+                },
+                ServiceSecret {
+                    name: "shop-tls_cert".to_string(),
+                    mount: SecretMount::FilePath("/run/secrets/tls.crt".to_string()),
+                },
+            ];
+            let mut deployment = resolved_deployment(vec![]);
+            let deferred = |name: &str| SecretResolvedSpec {
+                name: name.to_string(),
+                value: SecretResolvedValue::Deferred(AwsSecretRef {
+                    secret_id: "prod/x".to_string(),
+                    jq: None,
+                }),
+            };
+            let literal = |name: &str, value: &str| SecretResolvedSpec {
+                name: name.to_string(),
+                value: SecretResolvedValue::Literal(value.to_string()),
+            };
+            deployment.secrets = vec![
+                literal("shop-api_key", "k3y"),
+                deferred("shop-db_password"),
+                deferred("shop-tls_key"),
+                literal("shop-tls_cert", "pem"),
+            ];
+            let spec = resolved_env(swarm(), deployment);
+
+            let out = tempfile::tempdir().unwrap();
+            let service = prepare_service(&api, &spec, out.path()).unwrap();
+
+            assert_eq!(service.environment["API_KEY"], "k3y");
+            assert_eq!(service.environment["DB_PASSWORD"], "${SIMPLED_SECRET_SHOP_DB_PASSWORD}");
+            // Both file secrets are mounted; only the literal one exists yet.
+            assert!(service
+                .volumes
+                .contains(&"./api/run/secrets/tls.key:/run/secrets/tls.key".to_string()));
+            assert!(service
+                .volumes
+                .contains(&"./api/run/secrets/tls.crt:/run/secrets/tls.crt".to_string()));
+            assert!(!out.path().join("api/run/secrets/tls.key").exists());
+            assert_eq!(
+                fs::read_to_string(out.path().join("api/run/secrets/tls.crt")).unwrap(),
+                "pem"
+            );
+        }
+
+        #[test]
+        fn a_job_disables_restarts_and_a_service_carries_its_replicas() {
+            let mut api = resolved_service("api", ServiceType::Public, &[]);
+            api.resources.replicas = 3;
+            let job = resolved_service("migrate", ServiceType::Job, &[]);
+            let spec = resolved_env(swarm(), resolved_deployment(vec![]));
+            let out = tempfile::tempdir().unwrap();
+
+            let api = prepare_service(&api, &spec, out.path()).unwrap();
+            assert_eq!(api.deploy.as_ref().unwrap().replicas, Some(3));
+            assert!(api.deploy.as_ref().unwrap().restart_policy.is_none());
+            assert!(api.container_name.is_none());
+
+            let job = prepare_service(&job, &spec, out.path()).unwrap();
+            assert_eq!(
+                job.deploy.as_ref().unwrap().restart_policy.as_ref().unwrap().condition,
+                "none"
+            );
+            assert!(job.deploy.as_ref().unwrap().replicas.is_none());
+        }
+
+        #[test]
+        fn a_local_service_is_named_and_gets_its_undockerized_file() {
+            let mut api = resolved_service("api", ServiceType::Public, &[]);
+            api.undockerized_environment_variables = vec![EnvVariable {
+                name: "DB_HOST".to_string(),
+                value: "localhost".to_string(),
+            }];
+            let spec = resolved_env(DeploymentEnvType::Local, resolved_deployment(vec![]));
+            let out = tempfile::tempdir().unwrap();
+
+            let service = prepare_service(&api, &spec, out.path()).unwrap();
+            assert_eq!(service.container_name.as_deref(), Some("api"));
+            assert!(service.deploy.is_none());
+            assert_eq!(
+                fs::read_to_string(out.path().join("api/undockerized.env")).unwrap(),
+                "DB_HOST=localhost"
+            );
+        }
+
+        #[test]
+        fn a_working_dir_receives_the_env_and_the_secrets_it_can_have() {
+            let root = tempfile::tempdir().unwrap();
+            let mut worker = resolved_service("worker", ServiceType::Internal, &[]);
+            worker.working_dir = Some(root.path().join("worker-src").to_string_lossy().into_owned());
+            worker.undockerized_environment_variables = vec![EnvVariable {
+                name: "DB_HOST".to_string(),
+                value: "localhost".to_string(),
+            }];
+            worker.secrets = vec![
+                ServiceSecret {
+                    name: "shop-db_password".to_string(),
+                    mount: SecretMount::EnvVariable("DB_PASSWORD".to_string()),
+                },
+                ServiceSecret {
+                    name: "shop-tls_key".to_string(),
+                    mount: SecretMount::FilePath("/run/secrets/tls.key".to_string()),
+                },
+                ServiceSecret {
+                    name: "shop-remote".to_string(),
+                    mount: SecretMount::EnvVariable("REMOTE".to_string()),
+                },
+            ];
+            let mut deployment = resolved_deployment(vec![]);
+            deployment.secrets = vec![
+                SecretResolvedSpec {
+                    name: "shop-db_password".to_string(),
+                    value: SecretResolvedValue::Literal("pw".to_string()),
+                },
+                SecretResolvedSpec {
+                    name: "shop-tls_key".to_string(),
+                    value: SecretResolvedValue::Literal("pem".to_string()),
+                },
+                SecretResolvedSpec {
+                    name: "shop-remote".to_string(),
+                    value: SecretResolvedValue::Deferred(AwsSecretRef {
+                        secret_id: "x".to_string(),
+                        jq: None,
+                    }),
+                },
+            ];
+            let spec = resolved_env(DeploymentEnvType::Local, deployment);
+
+            write_working_dir(&worker, &spec).unwrap();
+
+            let env = fs::read_to_string(root.path().join("worker-src/.env")).unwrap();
+            assert!(env.contains("DB_HOST=localhost"), "{env}");
+            assert!(env.contains("DB_PASSWORD=pw"), "{env}");
+            // A secret without a value here is skipped rather than written blank.
+            assert!(!env.contains("REMOTE"), "{env}");
+            assert_eq!(
+                fs::read_to_string(root.path().join("worker-src/run/secrets/tls.key")).unwrap(),
+                "pem"
+            );
+
+            // No working_dir, nothing written.
+            let plain = resolved_service("api", ServiceType::Public, &[]);
+            write_working_dir(&plain, &spec).unwrap();
+        }
+    }
 }
