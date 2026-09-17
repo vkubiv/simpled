@@ -322,4 +322,149 @@ mod tests {
         ]);
         assert_eq!(find_depends_on_cycle(&spec), None);
     }
+
+    mod full_spec {
+        //! `validate` on specs written as YAML, one rule per test.
+        use super::*;
+        use crate::test_support::{app_spec, env_spec};
+        use std::fs;
+
+        const APP: &str = r#"
+name: shop
+version: 1.2.3
+environment:
+  external:
+    - LOG_LEVEL=info
+app_services:
+  api:
+    type: public
+    image: myorg/api
+    ports:
+      - "80:8080"
+"#;
+
+        /// A k8s env spec whose `prod` deployment gets `body` appended (already
+        /// indented four spaces).
+        fn k8s_env(body: &str) -> String {
+            format!(
+                r#"
+type: k8s
+gateway:
+  hosts:
+    web: shop.example.com
+  tls:
+    disable: true
+registry:
+  myorg: registry.example.com
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+{body}
+    services:
+      api:
+        host: web
+        prefix: /
+"#
+            )
+        }
+
+        fn check(app: &str, env_body: &str) -> Result<()> {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(&k8s_env(env_body), root.path());
+            validate(&env, &app_spec(app), "prod")
+        }
+
+        #[test]
+        fn a_matching_pair_validates() {
+            check(APP, "").unwrap();
+        }
+
+        #[test]
+        fn the_application_name_must_match() {
+            let err = check(&APP.replace("name: shop", "name: other"), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("expects application shop, but appspec is for other"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn the_version_requirement_must_be_satisfied() {
+            let err = check(APP, "      version: \"^2.0\"").unwrap_err().to_string();
+            assert!(
+                err.contains("1.2.3 does not satisfy deployment requirement ^2.0"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn an_external_variable_without_default_must_be_provided() {
+            let app = APP.replace("    - LOG_LEVEL=info", "    - DB_URL");
+            let err = check(&app, "").unwrap_err().to_string();
+            assert!(
+                err.contains("[\"DB_URL\"] required by application are not provided"),
+                "{err}"
+            );
+
+            check(&app, "    environment:\n      - DB_URL=postgres://db").unwrap();
+        }
+
+        #[test]
+        fn a_declared_secret_must_be_provided() {
+            let app = format!("{APP}secrets:\n  - db_password\n");
+            let err = check(&app, "").unwrap_err().to_string();
+            assert!(err.contains("Secret db_password required by application"), "{err}");
+
+            check(&app, "    secrets:\n      db_password: literal").unwrap();
+        }
+
+        #[test]
+        fn a_config_group_and_each_of_its_files_must_be_provided() {
+            let app = format!("{APP}configs:\n  data:\n    - settings.json\n");
+            let err = check(&app, "").unwrap_err().to_string();
+            assert!(err.contains("Config data required by application"), "{err}");
+
+            // The group exists but holds the wrong file.
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join("data")).unwrap();
+            fs::write(root.path().join("data").join("other.json"), "{}").unwrap();
+            let env = env_spec(&k8s_env("    configs:\n      data: ./data"), root.path());
+            let err = validate(&env, &app_spec(&app), "prod").unwrap_err().to_string();
+            assert!(err.contains("Config data requires file settings.json"), "{err}");
+
+            fs::write(root.path().join("data").join("settings.json"), "{}").unwrap();
+            let env = env_spec(&k8s_env("    configs:\n      data: ./data"), root.path());
+            validate(&env, &app_spec(&app), "prod").unwrap();
+        }
+
+        #[test]
+        fn a_deployment_cannot_configure_a_service_the_app_lacks() {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(
+                &k8s_env("").replace("    services:\n", "    services:\n      ghost:\n        host: web\n"),
+                root.path(),
+            );
+            let err = validate(&env, &app_spec(APP), "prod").unwrap_err().to_string();
+            assert!(err.contains("configures service ghost which is not defined"), "{err}");
+        }
+
+        #[test]
+        fn depends_on_must_name_a_known_service() {
+            let app = format!("{APP}    depends_on:\n      - nope\n");
+            let err = check(&app, "").unwrap_err().to_string();
+            assert!(err.contains("api depends on nope which is not defined"), "{err}");
+        }
+
+        #[test]
+        fn an_unknown_deployment_is_reported_with_the_known_ones() {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(&k8s_env(""), root.path());
+            let err = validate(&env, &app_spec(APP), "staging").unwrap_err().to_string();
+            assert!(err.contains("'staging' not found") && err.contains("prod"), "{err}");
+        }
+    }
 }

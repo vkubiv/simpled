@@ -17,6 +17,8 @@ mod secret_fetch;
 mod spec;
 mod spec_loader;
 mod spec_yaml;
+#[cfg(test)]
+mod test_support;
 mod transform;
 mod updater;
 mod validator;
