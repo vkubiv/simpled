@@ -15,7 +15,62 @@ pub fn resolve(
 ) -> Result<EnvironmentResolvedSpec> {
     let deployment = env_spec.deployment(deployment_name)?;
 
-    // 1. Resolve Configs
+    if env_spec.env_type != DeploymentEnvType::Local && env_spec.registry.is_empty() {
+        return Err(anyhow!("Registry mapping is required for non-local deployments"));
+    }
+
+    let configs = resolve_configs(deployment, app_spec)?;
+    let secrets = resolve_secrets(env_spec, deployment, app_spec)?;
+
+    // Deployment-level env values may reference secrets via `$secret(name)`.
+    // Expand those references once before the values feed into service resolution.
+    let deployment_environment = substitute_secret_refs(&deployment.environment, &secrets.values, &secrets.deferred)?;
+    let deployment_undockerized_environment =
+        substitute_secret_refs(&deployment.undockerized_environment, &secrets.values, &secrets.deferred)?;
+    // The undockerized environment is the deployment environment with the
+    // undockerized overrides applied on top.
+    let mut undockerized_values = deployment_environment.clone();
+    for override_var in &deployment_undockerized_environment {
+        add_unique_var(&mut undockerized_values, override_var.clone());
+    }
+
+    let mut services = ServiceResolver {
+        env_spec,
+        app_spec,
+        deployment,
+        configs: &configs,
+        secrets: &secrets.specs,
+        deployment_environment: &deployment_environment,
+        undockerized_values: &undockerized_values,
+        env_by_host: HashMap::new(),
+        public_routes: HashSet::new(),
+    };
+    let resolved_services = app_spec
+        .all_services()
+        .map(|app_service| services.resolve_service(app_service))
+        .collect::<Result<Vec<_>>>()?;
+
+    check_public_services_are_routed(deployment, app_spec)?;
+
+    let current_deployment = DeploymentResolvedSpec {
+        name: deployment.name.clone(),
+        application_name: deployment.application.name.clone(),
+        configs,
+        secrets: secrets.specs,
+        services: resolved_services,
+        volumes: app_spec.volumes.clone(),
+    };
+
+    Ok(EnvironmentResolvedSpec {
+        ingress: resolve_ingress(env_spec)?,
+        current_deployment,
+        env_type: env_spec.env_type.clone(),
+    })
+}
+
+/// Reads every config file the deployment provides. Names are prefixed with the
+/// application name, which is how services refer to them from here on.
+fn resolve_configs(deployment: &DeploymentSpec, app_spec: &AppSpec) -> Result<Vec<ConfigResolvedSpec>> {
     let mut resolved_configs = Vec::new();
     for config_spec in &deployment.configs {
         let mut resolved_files = Vec::new();
@@ -26,18 +81,13 @@ pub fn resolve(
             }
             if path.is_dir() {
                 for entry in fs::read_dir(path)? {
-                    let entry = entry?;
-                    let path = entry.path();
+                    let path = entry?.path();
                     if path.is_file() {
-                        let content = fs::read(&path).context(format!("Failed to read config file {:?}", path))?;
-                        let name = path.file_name().unwrap().to_string_lossy().to_string();
-                        resolved_files.push(ConfigResolvedFile { name, content });
+                        resolved_files.push(read_config_file(&path)?);
                     }
                 }
             } else {
-                let content = fs::read(path).context(format!("Failed to read config file {:?}", path))?;
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                resolved_files.push(ConfigResolvedFile { name, content });
+                resolved_files.push(read_config_file(path)?);
             }
         }
         resolved_configs.push(ConfigResolvedSpec {
@@ -45,15 +95,39 @@ pub fn resolve(
             files: resolved_files,
         });
     }
+    Ok(resolved_configs)
+}
 
-    // 2. Resolve Secrets
-    let mut resolved_secrets = Vec::new();
-    // Keyed by the secret's original (unprefixed) name so deployment env values
-    // can reference them via `$secret(name)`.
-    let mut secret_values: HashMap<String, String> = HashMap::new();
-    // Names of the secrets that are only read on the deploy target, kept so a
-    // `$secret(name)` reference to one can be rejected with a useful message.
-    let mut deferred_secrets: HashSet<String> = HashSet::new();
+fn read_config_file(path: &Path) -> Result<ConfigResolvedFile> {
+    let content = fs::read(path).context(format!("Failed to read config file {:?}", path))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow!("Config path {:?} has no file name", path))?;
+    Ok(ConfigResolvedFile { name, content })
+}
+
+/// The deployment's secrets, plus the two views service resolution needs of them.
+struct ResolvedSecrets {
+    specs: Vec<SecretResolvedSpec>,
+    /// Keyed by the secret's original (unprefixed) name so deployment env values
+    /// can reference them via `$secret(name)`.
+    values: HashMap<String, String>,
+    /// Names of the secrets that are only read on the deploy target, kept so a
+    /// `$secret(name)` reference to one can be rejected with a useful message.
+    deferred: HashSet<String>,
+}
+
+fn resolve_secrets(
+    env_spec: &DeploymentEnvironmentSpec,
+    deployment: &DeploymentSpec,
+    app_spec: &AppSpec,
+) -> Result<ResolvedSecrets> {
+    let mut secrets = ResolvedSecrets {
+        specs: Vec::new(),
+        values: HashMap::new(),
+        deferred: HashSet::new(),
+    };
     for secret_spec in &deployment.secrets {
         let value = match &secret_spec.source {
             DeploymentSecretSource::EnvVariable(var_name) => {
@@ -87,57 +161,55 @@ pub fn resolve(
         };
         match &value {
             SecretResolvedValue::Literal(literal) => {
-                secret_values.insert(secret_spec.secret_name.clone(), literal.clone());
+                secrets.values.insert(secret_spec.secret_name.clone(), literal.clone());
             }
             SecretResolvedValue::Deferred(_) => {
-                deferred_secrets.insert(secret_spec.secret_name.clone());
+                secrets.deferred.insert(secret_spec.secret_name.clone());
             }
         }
-        resolved_secrets.push(SecretResolvedSpec {
+        secrets.specs.push(SecretResolvedSpec {
             name: format!("{}-{}", app_spec.name, secret_spec.secret_name),
             value,
         });
     }
+    Ok(secrets)
+}
 
-    // Deployment-level env values may reference secrets via `$secret(name)`.
-    // Expand those references once before the values feed into service resolution.
-    let deployment_environment = substitute_secret_refs(&deployment.environment, &secret_values, &deferred_secrets)?;
-    let deployment_undockerized_environment =
-        substitute_secret_refs(&deployment.undockerized_environment, &secret_values, &deferred_secrets)?;
+/// Everything `resolve_service` needs from its surroundings, plus the state
+/// shared between the services of one deployment.
+struct ServiceResolver<'a> {
+    env_spec: &'a DeploymentEnvironmentSpec,
+    app_spec: &'a AppSpec,
+    deployment: &'a DeploymentSpec,
+    configs: &'a [ConfigResolvedSpec],
+    secrets: &'a [SecretResolvedSpec],
+    deployment_environment: &'a [EnvVariable],
+    undockerized_values: &'a [EnvVariable],
+    /// (environment, undockerized environment) resolved per host domain. The
+    /// full set depends only on the host a service is served from, so it is
+    /// computed once per host and every service then picks the entries it asks for.
+    env_by_host: HashMap<String, (Vec<EnvVariable>, Vec<EnvVariable>)>,
+    /// (host, prefix) pairs claimed by public services so far.
+    public_routes: HashSet<(String, String)>,
+}
 
-    // 3. Resolve Services
-    let mut resolved_services = Vec::new();
-    let use_tls = env_spec.ingress.tls.is_some();
-    // The undockerized environment is the deployment environment with the
-    // undockerized overrides applied on top.
-    let mut undockerized_values = deployment_environment.clone();
-    for override_var in &deployment_undockerized_environment {
-        add_unique_var(&mut undockerized_values, override_var.clone());
-    }
-    // (environment, undockerized environment) resolved per host domain.
-    let mut env_by_host: HashMap<String, (Vec<EnvVariable>, Vec<EnvVariable>)> = HashMap::new();
-    let mut public_host_prefix_combinations = HashSet::new();
-
-    let primary_host = &deployment.primary_host;
-
-    for app_service in app_spec.all_services() {
-        let deployment_service_opt = deployment.services.as_ref().and_then(|s| s.get(&app_service.name));
-
-        let defaults = &deployment.defaults;
+impl ServiceResolver<'_> {
+    fn resolve_service(&mut self, app_service: &ServiceSpec) -> Result<ServiceResolvedSpec> {
+        let deployment = self.deployment;
+        let app_spec = self.app_spec;
+        let deployment_service = deployment.services.as_ref().and_then(|s| s.get(&app_service.name));
 
         let empty_prefixes = Vec::new();
-        let (variant_name, prefixes, resources) = if let Some(ds) = deployment_service_opt {
-            (ds.variant.as_deref().unwrap_or("default"), &ds.prefixes, &ds.resources)
-        } else {
-            ("default", &empty_prefixes, defaults)
+        let (variant_name, prefixes, resources) = match deployment_service {
+            Some(ds) => (ds.variant.as_deref().unwrap_or("default"), &ds.prefixes, &ds.resources),
+            None => ("default", &empty_prefixes, &deployment.defaults),
         };
 
-        let mut host_name = primary_host.clone();
-        if let Some(deployment_service) = deployment_service_opt {
-            host_name = deployment_service.host.clone().unwrap_or(primary_host.clone());
-        }
-
-        let host_domain_name: &String = env_spec
+        let host_name = deployment_service
+            .and_then(|ds| ds.host.clone())
+            .unwrap_or_else(|| deployment.primary_host.clone());
+        let host_domain_name = self
+            .env_spec
             .ingress
             .hosts
             .iter()
@@ -145,47 +217,13 @@ pub fn resolve(
             .and_then(|h| h.domain_names.first())
             .ok_or_else(|| anyhow!("Host {} not found in ingress spec", host_name))?;
 
-        let is_app_service = app_service.is_app_service;
-
-        // Resolve Image
-        let mut raw_image = match &app_service.image {
-            ImageSpec::Exact(img) => img.clone(),
-            ImageSpec::Variants(variants) => variants
-                .iter()
-                .find(|v| v.variant_name == variant_name)
-                .map(|v| v.image.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Image variant '{}' not found for service '{}'",
-                        variant_name,
-                        app_service.name
-                    )
-                })?,
-        };
-
-        if is_app_service {
-            if let DeploymentEnvType::Local = env_spec.env_type {
-                raw_image = format!("{}:latest", raw_image);
-            } else {
-                raw_image = format!("{}:{}", raw_image, version_to_tag(&app_spec.version.to_string()));
-            }
-        }
-
-        if env_spec.env_type != DeploymentEnvType::Local && env_spec.registry.is_empty() {
-            return Err(anyhow!("Registry mapping is required for non-local deployments"));
-        }
-
-        let image = if is_app_service {
-            resolve_app_service_image(env_spec, raw_image)?
-        } else {
-            raw_image
-        };
+        let image = self.resolve_image(app_service, variant_name)?;
 
         // Check Public Service uniqueness
         if let ServiceType::Public = app_service.service_type {
             for prefix in prefixes {
                 let key = (host_name.to_string(), prefix.prefix.clone());
-                if !public_host_prefix_combinations.insert(key) {
+                if !self.public_routes.insert(key) {
                     return Err(anyhow!(
                         "Duplicate host+prefix combination for public service {}: {}{}",
                         app_service.name,
@@ -196,21 +234,17 @@ pub fn resolve(
             }
         }
 
-        // Resolve Environment Variables. The full set depends only on the host
-        // a service is served from, so it is computed once per host and every
-        // service then picks the entries it asks for.
-        let (environment_variables, undockerized_variables) = match env_by_host.get(host_domain_name) {
-            Some(resolved) => resolved,
-            None => {
-                let environment =
-                    resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
-                let undockerized =
-                    resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
-                env_by_host
-                    .entry(host_domain_name.clone())
-                    .or_insert((environment, undockerized))
-            }
-        };
+        // Resolve Environment Variables
+        let use_tls = self.env_spec.ingress.tls.is_some();
+        if !self.env_by_host.contains_key(host_domain_name) {
+            let environment =
+                resolve_app_env_vars(app_spec, self.deployment_environment, Some(host_domain_name), use_tls)?;
+            let undockerized =
+                resolve_app_env_vars(app_spec, self.undockerized_values, Some(host_domain_name), use_tls)?;
+            self.env_by_host
+                .insert(host_domain_name.clone(), (environment, undockerized));
+        }
+        let (environment_variables, undockerized_variables) = &self.env_by_host[host_domain_name];
         let final_service_env_vars = filter_service_env_vars(app_service, app_spec, environment_variables)?;
         let final_undockerized_service_env_vars =
             filter_service_env_vars(app_service, app_spec, undockerized_variables)?;
@@ -219,7 +253,7 @@ pub fn resolve(
         let mut service_configs = Vec::new();
         for sc_opt in &app_service.configs {
             let config_name = format!("{}-{}", app_spec.name, sc_opt.config_name);
-            if !resolved_configs.iter().any(|c| c.name == config_name) {
+            if !self.configs.iter().any(|c| c.name == config_name) {
                 return Err(anyhow!(
                     "Service {} references undefined config {}",
                     app_service.name,
@@ -236,7 +270,7 @@ pub fn resolve(
         let mut service_secrets = Vec::new();
         for sec in &app_service.secrets {
             let secret_name = format!("{}-{}", app_spec.name, sec.name);
-            if !resolved_secrets.iter().any(|s| s.name == secret_name) {
+            if !self.secrets.iter().any(|s| s.name == secret_name) {
                 return Err(anyhow!(
                     "Service {} references undefined secret {}",
                     app_service.name,
@@ -255,8 +289,8 @@ pub fn resolve(
         // A named volume still has to be declared in the app spec's top-level
         // `volumes:`, the same rule app-spec-declared mounts obey.
         let mut service_volumes = app_service.volumes.clone();
-        if let Some(deployment_service) = deployment_service_opt {
-            for volume in &deployment_service.volumes {
+        if let Some(ds) = deployment_service {
+            for volume in &ds.volumes {
                 if let ServiceVolumeType::Named(vol_name) = &volume.name {
                     if !app_spec.volumes.contains(vol_name) {
                         return Err(anyhow!(
@@ -269,10 +303,10 @@ pub fn resolve(
             }
         }
 
-        resolved_services.push(ServiceResolvedSpec {
+        Ok(ServiceResolvedSpec {
             full_name: app_service.name.to_string(),
             service_type: app_service.service_type.clone(),
-            is_app_service,
+            is_app_service: app_service.is_app_service,
             image,
             environment_variables: final_service_env_vars,
             undockerized_environment_variables: final_undockerized_service_env_vars,
@@ -280,10 +314,10 @@ pub fn resolve(
             secrets: service_secrets,
             volumes: service_volumes,
             expose: app_service.expose.clone(),
-            command: deployment_service_opt
+            command: deployment_service
                 .and_then(|s| s.command.clone())
                 .or_else(|| app_service.command.clone()),
-            entrypoint: deployment_service_opt
+            entrypoint: deployment_service
                 .and_then(|s| s.entrypoint.clone())
                 .or_else(|| app_service.entrypoint.clone()),
             healthcheck: app_service.healthcheck.clone(),
@@ -291,137 +325,86 @@ pub fn resolve(
             resources: resources.clone(),
             // A deployment entry that only sets routing (host, prefix, replicas)
             // must not wipe the ports the app spec declares.
-            ports: deployment_service_opt
+            ports: deployment_service
                 .map(|s| s.ports.clone())
                 .filter(|ports| !ports.is_empty())
                 .unwrap_or_else(|| app_service.ports.clone()),
-            working_dir: deployment_service_opt.and_then(|s| s.working_dir.clone()),
-        });
+            working_dir: deployment_service.and_then(|s| s.working_dir.clone()),
+        })
     }
 
-    let current_deployment = DeploymentResolvedSpec {
-        name: deployment.name.clone(),
-        application_name: deployment.application.name.clone(),
-        configs: resolved_configs,
-        secrets: resolved_secrets,
-        services: resolved_services,
-        volumes: app_spec.volumes.clone(),
-    };
+    /// The image a service runs: the selected variant, tagged with the app
+    /// version for app services (`latest` locally), and mapped through the
+    /// registry table.
+    fn resolve_image(&self, app_service: &ServiceSpec, variant_name: &str) -> Result<String> {
+        let mut raw_image = match &app_service.image {
+            ImageSpec::Exact(img) => img.clone(),
+            ImageSpec::Variants(variants) => variants
+                .iter()
+                .find(|v| v.variant_name == variant_name)
+                .map(|v| v.image.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Image variant '{}' not found for service '{}'",
+                        variant_name,
+                        app_service.name
+                    )
+                })?,
+        };
 
-    // Validate that every Public service configured in the current deployment has at least one ingress rule.
-    // A Public service with no prefixes is likely a configuration mistake.
-    if let Some(dep_services) = &deployment.services {
-        for app_service in app_spec.all_services() {
-            if let ServiceType::Public = app_service.service_type {
-                if let Some(ds) = dep_services.get(&app_service.name) {
-                    if ds.prefixes.is_empty() {
-                        return Err(anyhow!(
-                            "Public service '{}' in deployment '{}' has no prefixes configured and will not be reachable via ingress.",
-                            app_service.name,
-                            deployment.name
-                        ));
-                    }
-                }
-            }
+        if !app_service.is_app_service {
+            return Ok(raw_image);
         }
-    }
 
-    let mut ingress_rules = Vec::new();
-    for host_spec in &env_spec.ingress.hosts {
-        for domain in &host_spec.domain_names {
-            let mut service_rules = Vec::new();
-
-            for dep in &env_spec.deployments {
-                let dep_primary_host = &dep.primary_host;
-                // Services live in a HashMap, so sort by name to keep the
-                // generated ingress configuration byte-identical across runs.
-                let mut dep_services: Vec<_> = dep.services.clone().unwrap_or_default().into_iter().collect();
-                dep_services.sort_by(|a, b| a.0.cmp(&b.0));
-                for (service_name, ds) in dep_services {
-                    let h = ds.host.clone().unwrap_or(dep_primary_host.clone());
-                    if h == host_spec.name {
-                        let full_name = service_name.to_string();
-                        // Determine port
-                        let port = if ds.ports.iter().find(|p| p.external == 80).is_some() {
-                            80
-                        } else if let Some(p) = ds.ports.first() {
-                            p.external
-                        } else {
-                            80 // Default
-                        };
-
-                        // A service's own limit wins over the gateway-wide
-                        // default; resolving it here means every generator
-                        // sees one effective number per route.
-                        let body_limit = ds.body_limit.or(env_spec.ingress.body_limit);
-
-                        for prefix in &ds.prefixes {
-                            service_rules.push(IngressToServiceRule {
-                                service_name: full_name.clone(),
-                                deployment_name: dep.name.clone(),
-                                port,
-                                prefix: prefix.prefix.clone(),
-                                strip_prefix: prefix.strip,
-                                body_limit,
-                            });
-                        }
-                    }
-                }
-            }
-
-            if !service_rules.is_empty() {
-                ingress_rules.push(IngressRule {
-                    domain_name: domain.clone(),
-                    services: service_rules,
-                });
-            }
-        }
-    }
-
-    // Guard against ambiguous ingress routing: within a single domain, two
-    // services mapping to the same path prefix cannot be disambiguated by a
-    // host-based ingress (nginx/traefik/k8s) or the local gateway, so one route
-    // would silently shadow the other. The same domain can be spread across
-    // several rules (declared under multiple host groups), so aggregate the
-    // prefixes by domain across all rules. Prefixes are normalized so that "",
-    // "/", and a trailing-slash variant all compare equal.
-    let normalize_prefix = |prefix: &str| -> String {
-        if prefix.is_empty() || prefix == "/" {
-            "/".to_string()
+        if let DeploymentEnvType::Local = self.env_spec.env_type {
+            raw_image = format!("{}:latest", raw_image);
         } else {
-            prefix.trim_end_matches('/').to_string()
+            raw_image = format!("{}:{}", raw_image, version_to_tag(&self.app_spec.version.to_string()));
         }
+        resolve_app_service_image(self.env_spec, raw_image)
+    }
+}
+
+/// A public service the deployment configures but gives no prefix would never
+/// be reachable through the gateway, which is almost certainly a mistake.
+fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppSpec) -> Result<()> {
+    let Some(dep_services) = &deployment.services else {
+        return Ok(());
     };
-    let mut seen_prefixes: HashMap<&str, HashMap<String, (&str, &str)>> = HashMap::new();
-    for rule in &ingress_rules {
-        let domain_prefixes = seen_prefixes.entry(rule.domain_name.as_str()).or_default();
-        for svc in &rule.services {
-            let normalized = normalize_prefix(&svc.prefix);
-            if let Some((prev_dep, prev_svc)) = domain_prefixes.get(&normalized) {
+    for app_service in app_spec.all_services() {
+        if !matches!(app_service.service_type, ServiceType::Public) {
+            continue;
+        }
+        if let Some(ds) = dep_services.get(&app_service.name) {
+            if ds.prefixes.is_empty() {
                 return Err(anyhow!(
-                    "Ingress misconfiguration: domain '{}' maps path '{}' to multiple services ('{}/{}' and '{}/{}'); each domain and path must route to exactly one service",
-                    rule.domain_name, normalized, prev_dep, prev_svc, svc.deployment_name, svc.service_name
+                    "Public service '{}' in deployment '{}' has no prefixes configured and will not be reachable via ingress.",
+                    app_service.name,
+                    deployment.name
                 ));
             }
-            domain_prefixes.insert(normalized, (svc.deployment_name.as_str(), svc.service_name.as_str()));
         }
     }
+    Ok(())
+}
 
-    let tls = if let Some(tls_spec) = &env_spec.ingress.tls {
-        let le_resolved = tls_spec.letsencrypt.as_ref().map(|le| LetsEncryptResolvedSpec {
+/// The gateway as every generator sees it: one rule per served domain, the
+/// redirects, the TLS settings and the full list of domains a certificate has to
+/// cover.
+fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolvedSpec> {
+    let rules = build_ingress_rules(env_spec);
+    check_route_conflicts(&rules)?;
+
+    let tls = env_spec.ingress.tls.as_ref().map(|tls_spec| IngressTlsResolvedSpec {
+        secret: tls_spec.secret.clone(),
+        letsencrypt: tls_spec.letsencrypt.as_ref().map(|le| LetsEncryptResolvedSpec {
             server: le
                 .server
                 .clone()
                 .unwrap_or("https://acme-v02.api.letsencrypt.org/directory".to_string()),
             email: le.email.clone(),
-        });
-        Some(IngressTlsResolvedSpec {
-            secret: tls_spec.secret.clone(),
-            letsencrypt: le_resolved,
-        })
-    } else {
-        None
-    };
+        }),
+    });
 
     let redirects = resolve_redirects(&env_spec.ingress)?;
 
@@ -436,19 +419,101 @@ pub fn resolve(
         .collect();
     domains.extend(redirects.iter().map(|r| r.from_domain.clone()));
 
-    let ingress_resolved = IngressResolvedSpec {
+    Ok(IngressResolvedSpec {
         name: env_spec.ingress.name.clone(),
         domains,
-        rules: ingress_rules,
+        rules,
         redirects,
         tls,
-    };
-
-    Ok(EnvironmentResolvedSpec {
-        ingress: ingress_resolved,
-        current_deployment,
-        env_type: env_spec.env_type.clone(),
     })
+}
+
+/// One rule per served domain, listing every (deployment, service, prefix)
+/// routed to it. Every deployment of the env spec takes part: they are deployed
+/// side by side and share the gateway.
+fn build_ingress_rules(env_spec: &DeploymentEnvironmentSpec) -> Vec<IngressRule> {
+    let mut ingress_rules = Vec::new();
+    for host_spec in &env_spec.ingress.hosts {
+        for domain in &host_spec.domain_names {
+            let mut service_rules = Vec::new();
+
+            for dep in &env_spec.deployments {
+                // Services live in a HashMap, so sort by name to keep the
+                // generated ingress configuration byte-identical across runs.
+                let mut dep_services: Vec<_> = dep.services.iter().flatten().collect();
+                dep_services.sort_by(|a, b| a.0.cmp(b.0));
+                for (service_name, ds) in dep_services {
+                    let host = ds.host.as_deref().unwrap_or(&dep.primary_host);
+                    if host != host_spec.name {
+                        continue;
+                    }
+                    // Port 80 when the service publishes it, otherwise its
+                    // first port, otherwise 80.
+                    let port = if ds.ports.iter().any(|p| p.external == 80) {
+                        80
+                    } else {
+                        ds.ports.first().map(|p| p.external).unwrap_or(80)
+                    };
+
+                    // A service's own limit wins over the gateway-wide
+                    // default; resolving it here means every generator
+                    // sees one effective number per route.
+                    let body_limit = ds.body_limit.or(env_spec.ingress.body_limit);
+
+                    for prefix in &ds.prefixes {
+                        service_rules.push(IngressToServiceRule {
+                            service_name: service_name.clone(),
+                            deployment_name: dep.name.clone(),
+                            port,
+                            prefix: prefix.prefix.clone(),
+                            strip_prefix: prefix.strip,
+                            body_limit,
+                        });
+                    }
+                }
+            }
+
+            if !service_rules.is_empty() {
+                ingress_rules.push(IngressRule {
+                    domain_name: domain.clone(),
+                    services: service_rules,
+                });
+            }
+        }
+    }
+    ingress_rules
+}
+
+/// Guard against ambiguous ingress routing: within a single domain, two
+/// services mapping to the same path prefix cannot be disambiguated by a
+/// host-based ingress (nginx/traefik/k8s) or the local gateway, so one route
+/// would silently shadow the other. The same domain can be spread across
+/// several rules (declared under multiple host groups), so aggregate the
+/// prefixes by domain across all rules. Prefixes are normalized so that "",
+/// "/", and a trailing-slash variant all compare equal.
+fn check_route_conflicts(rules: &[IngressRule]) -> Result<()> {
+    let normalize_prefix = |prefix: &str| -> String {
+        if prefix.is_empty() || prefix == "/" {
+            "/".to_string()
+        } else {
+            prefix.trim_end_matches('/').to_string()
+        }
+    };
+    let mut seen_prefixes: HashMap<&str, HashMap<String, (&str, &str)>> = HashMap::new();
+    for rule in rules {
+        let domain_prefixes = seen_prefixes.entry(rule.domain_name.as_str()).or_default();
+        for svc in &rule.services {
+            let normalized = normalize_prefix(&svc.prefix);
+            if let Some((prev_dep, prev_svc)) = domain_prefixes.get(&normalized) {
+                return Err(anyhow!(
+                    "Ingress misconfiguration: domain '{}' maps path '{}' to multiple services ('{}/{}' and '{}/{}'); each domain and path must route to exactly one service",
+                    rule.domain_name, normalized, prev_dep, prev_svc, svc.deployment_name, svc.service_name
+                ));
+            }
+            domain_prefixes.insert(normalized, (svc.deployment_name.as_str(), svc.service_name.as_str()));
+        }
+    }
+    Ok(())
 }
 
 /// Flattens `gateway.redirects` into one rule per source domain.
