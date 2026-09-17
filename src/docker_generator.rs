@@ -1417,8 +1417,42 @@ mod tests {
             entrypoint: None,
             healthcheck: None,
             depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            resources: ResourcesSpec {
+                replicas: 1,
+                requests: ResourceLimits {
+                    memory: "128Mi".to_string(),
+                    cpu: "100m".to_string(),
+                },
+                limits: ResourceLimits {
+                    memory: "256Mi".to_string(),
+                    cpu: "200m".to_string(),
+                },
+            },
             working_dir: None,
         }
+    }
+
+    #[test]
+    fn swarm_stack_scales_a_service_to_its_replicas() {
+        let mut api = service("api", ServiceType::Public, &[]);
+        api.resources.replicas = 3;
+        let spec = spec(vec![api, service("worker", ServiceType::Internal, &[])]);
+        let (dir, _script) = generate_swarm_to_temp(&spec);
+
+        let stack = fs::read_to_string(dir.path().join("prod").join("docker-compose.yaml")).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
+        assert_eq!(
+            parsed["services"]["api"]["deploy"]["replicas"].as_u64(),
+            Some(3),
+            "{}",
+            stack
+        );
+        assert_eq!(
+            parsed["services"]["worker"]["deploy"]["replicas"].as_u64(),
+            Some(1),
+            "{}",
+            stack
+        );
     }
 
     fn with_secrets(mut service: ServiceResolvedSpec, secrets: &[(&str, SecretMount)]) -> ServiceResolvedSpec {
@@ -1472,17 +1506,6 @@ mod tests {
                 application_name: "shop".to_string(),
                 configs: vec![],
                 secrets: vec![],
-                defaults: ResourcesSpec {
-                    replicas: 1,
-                    requests: ResourceLimits {
-                        memory: "128Mi".to_string(),
-                        cpu: "100m".to_string(),
-                    },
-                    limits: ResourceLimits {
-                        memory: "256Mi".to_string(),
-                        cpu: "200m".to_string(),
-                    },
-                },
                 services,
                 volumes: vec![],
             },

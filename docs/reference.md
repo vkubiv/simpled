@@ -614,8 +614,8 @@ DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=myapp
 | `prefixes` | map | Multiple prefix rules, each with optional `strip: bool`. Mutually exclusive with `prefix`. |
 | `strip_prefix` | bool | Whether to strip the prefix before forwarding to upstream. Default `true`. |
 | `variant` | string | Image variant to use (must be declared in `appspec.yaml`). |
-| `replicas` | int | Number of pod/container replicas. Overrides `defaults.replicas`. |
-| `resources` | object | CPU/memory requests and limits. Overrides `defaults.resources`. |
+| `replicas` | int | Number of pod/container replicas. Overrides `defaults.replicas`. Applied on Kubernetes and Swarm; standalone Docker and local runs always start one container. |
+| `resources` | object | CPU/memory requests and limits. Overrides `defaults.resources`. Kubernetes only; Docker targets do not constrain containers. |
 | `working_dir` | string | Local only. Directory of a host-run (non-dockerized) service. See [working_dir](#working_dir). |
 
 #### working_dir

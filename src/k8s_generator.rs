@@ -1,4 +1,4 @@
-use crate::resolved_spec::{DeploymentResolvedSpec, ServiceResolvedSpec};
+use crate::resolved_spec::ServiceResolvedSpec;
 use crate::resolved_spec::{
     EnvironmentResolvedSpec, IngressResolvedSpec, IngressToServiceRule, LetsEncryptResolvedSpec,
 };
@@ -90,7 +90,7 @@ pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> R
         .unwrap_or_default()
         .as_secs();
     for service in &deployment.services {
-        write_workload(output_dir, deployment, service, deploy_date)?;
+        write_workload(output_dir, service, deploy_date)?;
         write_service(output_dir, service)?;
     }
 
@@ -150,12 +150,7 @@ fn yaml_quote(value: &str) -> String {
 /// gets a Job of its own, named after the deploy date and garbage-collected a day
 /// after it finishes. Kubernetes applies the whole directory at once, so unlike
 /// the Docker targets nothing waits for the job: `depends_on` is not enforced.
-fn write_workload(
-    output_dir: &Path,
-    deployment: &DeploymentResolvedSpec,
-    service: &ServiceResolvedSpec,
-    deploy_date: u64,
-) -> Result<()> {
+fn write_workload(output_dir: &Path, service: &ServiceResolvedSpec, deploy_date: u64) -> Result<()> {
     let name = k8s_name(&service.full_name);
     let is_job = matches!(service.service_type, ServiceType::Job);
 
@@ -190,7 +185,7 @@ fn write_workload(
         writeln!(file, "metadata:")?;
         writeln!(file, "  name: {}", name)?;
         writeln!(file, "spec:")?;
-        writeln!(file, "  replicas: {}", deployment.defaults.replicas)?;
+        writeln!(file, "  replicas: {}", service.resources.replicas)?;
         writeln!(file, "  selector:")?;
         writeln!(file, "    matchLabels:")?;
         writeln!(file, "      app: {}", name)?;
@@ -231,11 +226,11 @@ fn write_workload(
     }
     writeln!(file, "        resources:")?;
     writeln!(file, "          requests:")?;
-    writeln!(file, "            memory: {}", deployment.defaults.requests.memory)?;
-    writeln!(file, "            cpu: {}", deployment.defaults.requests.cpu)?;
+    writeln!(file, "            memory: {}", service.resources.requests.memory)?;
+    writeln!(file, "            cpu: {}", service.resources.requests.cpu)?;
     writeln!(file, "          limits:")?;
-    writeln!(file, "            memory: {}", deployment.defaults.limits.memory)?;
-    writeln!(file, "            cpu: {}", deployment.defaults.limits.cpu)?;
+    writeln!(file, "            memory: {}", service.resources.limits.memory)?;
+    writeln!(file, "            cpu: {}", service.resources.limits.cpu)?;
 
     writeln!(file, "        env:")?;
     writeln!(file, "        - name: DEPLOY_DATE")?;
@@ -678,17 +673,6 @@ mod tests {
                 application_name: "shop".to_string(),
                 configs: vec![],
                 secrets: vec![],
-                defaults: crate::spec::ResourcesSpec {
-                    replicas: 1,
-                    requests: crate::spec::ResourceLimits {
-                        memory: "1".to_string(),
-                        cpu: "1".to_string(),
-                    },
-                    limits: crate::spec::ResourceLimits {
-                        memory: "1".to_string(),
-                        cpu: "1".to_string(),
-                    },
-                },
                 services: vec![],
                 volumes: vec![],
             },
@@ -862,8 +846,33 @@ mod tests {
             entrypoint: None,
             healthcheck: None,
             depends_on: vec![],
+            resources: crate::spec::ResourcesSpec {
+                replicas: 1,
+                requests: crate::spec::ResourceLimits {
+                    memory: "128Mi".to_string(),
+                    cpu: "100m".to_string(),
+                },
+                limits: crate::spec::ResourceLimits {
+                    memory: "256Mi".to_string(),
+                    cpu: "200m".to_string(),
+                },
+            },
             working_dir: None,
         }
+    }
+
+    #[test]
+    fn a_service_override_sets_its_own_replicas_and_resources() {
+        let mut api = workload("api", ServiceType::Public);
+        api.resources.replicas = 3;
+        api.resources.limits.memory = "1Gi".to_string();
+        let dir = generate_to_temp(vec![api]);
+
+        let deployment = fs::read_to_string(dir.path().join("deployment-api.yaml")).unwrap();
+        assert!(deployment.contains("  replicas: 3\n"), "{}", deployment);
+        assert!(deployment.contains("            memory: 1Gi\n"), "{}", deployment);
+        // The deployment defaults in the spec (1 replica, 1/1) are not what is written.
+        assert!(!deployment.contains("  replicas: 1\n"), "{}", deployment);
     }
 
     fn generate_to_temp(services: Vec<ServiceResolvedSpec>) -> tempfile::TempDir {

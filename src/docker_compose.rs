@@ -85,8 +85,10 @@ pub struct DependsOnCondition {
     pub condition: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct DeployConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<RestartPolicy>,
 }
@@ -255,11 +257,21 @@ pub fn prepare_service(
     // Job services run to completion and must not be restarted by Swarm.
     // Swarm's default restart policy is `condition: any`, which would keep
     // re-running a job after it exits, so disable restarts explicitly.
+    //
+    // Replicas are only written for Swarm. A local compose file names every
+    // container, and compose refuses `container_name` next to `replicas`; a job
+    // is created by the deploy script rather than the stack file.
+    let is_local = spec.env_type == spec::DeploymentEnvType::Local;
     let deploy = match service.service_type {
         ServiceType::Job => Some(DeployConfig {
             restart_policy: Some(RestartPolicy {
                 condition: "none".to_string(),
             }),
+            ..DeployConfig::default()
+        }),
+        _ if !is_local => Some(DeployConfig {
+            replicas: Some(service.resources.replicas),
+            ..DeployConfig::default()
         }),
         _ => None,
     };

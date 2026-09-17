@@ -133,6 +133,10 @@ pub struct ServiceResolvedSpec {
     // full_names of the services that must be running before this one starts.
     pub depends_on: Vec<String>,
 
+    // Replicas and CPU/memory for this service: the deployment's per-service
+    // override when there is one, otherwise the deployment defaults.
+    pub resources: ResourcesSpec,
+
     // local-only: working directory of a host-run (non-dockerized) service.
     // When set, undockerized env is written there as `.env` and secrets copied alongside.
     pub working_dir: Option<String>,
@@ -201,7 +205,6 @@ pub struct DeploymentResolvedSpec {
     pub application_name: String,
     pub configs: Vec<ConfigResolvedSpec>,
     pub secrets: Vec<SecretResolvedSpec>,
-    pub defaults: ResourcesSpec,
     pub services: Vec<ServiceResolvedSpec>,
     pub volumes: Vec<String>,
 }

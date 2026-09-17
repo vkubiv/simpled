@@ -121,7 +121,7 @@ pub fn resolve(
         let defaults = &deployment.defaults;
 
         let empty_prefixes = Vec::new();
-        let (variant_name, prefixes, _resources) = if let Some(ds) = deployment_service_opt {
+        let (variant_name, prefixes, resources) = if let Some(ds) = deployment_service_opt {
             (ds.variant.as_deref().unwrap_or("default"), &ds.prefixes, &ds.resources)
         } else {
             ("default", &empty_prefixes, defaults)
@@ -280,6 +280,7 @@ pub fn resolve(
                 .or_else(|| app_service.entrypoint.clone()),
             healthcheck: app_service.healthcheck.clone(),
             depends_on: app_service.depends_on.clone(),
+            resources: resources.clone(),
             ports: deployment_service_opt
                 .map(|s| s.ports.clone())
                 .unwrap_or(app_service.ports.clone()),
@@ -292,7 +293,6 @@ pub fn resolve(
         application_name: deployment.application.name.clone(),
         configs: resolved_configs,
         secrets: resolved_secrets,
-        defaults: deployment.defaults.clone(),
         services: resolved_services,
         volumes: app_spec.volumes.clone(),
     };
