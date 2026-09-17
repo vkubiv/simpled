@@ -61,6 +61,6 @@ into `--section`.
 
 ## Do not
 
-- Do not hand-edit anything under `k8s/`, `docker-deploy/`, or `local_env/` — those are
+- Do not hand-edit anything under `manifests/`, `docker-deploy/`, or `local_env/` — those are
   generated and overwritten on the next run. Change the spec instead.
 - Do not commit resolved secret values. Use `env:`, `file:`, or `aws:` sources.

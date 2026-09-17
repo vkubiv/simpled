@@ -827,7 +827,7 @@ Then run:
 
 And apply generated manifests:
 
-`kubectl apply -f k8s/`
+`kubectl apply -f manifests/`
 
 If you use a `simpled` compatible artifact storage, there is no need to manually download:
 
@@ -848,6 +848,6 @@ simpled prepare-deployment myapp_prod \
 
 And apply generated manifests:
 
-`kubectl apply -f k8s/`
+`kubectl apply -f manifests/`
 
 If all application requirements are met in a given environment, the app will be deployed.

@@ -803,17 +803,6 @@ Options:
                        spec defines more than one deployment.
 ```
 
-### `simpled secrets set`
-
-Manages secrets for a named environment.
-
-```
-simpled secrets set <ENV_NAME> [OPTIONS]
-
-Options:
-  --file <PATH>  Load secrets from file
-```
-
 ### `simpled docs`
 
 Prints the documentation embedded in the binary — these guides ship inside `simpled`
@@ -858,7 +847,7 @@ into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
 
 ### Kubernetes (`type: k8s`)
 
-Output directory: `k8s/`
+Output directory: `manifests/`
 
 | File | Description |
 |------|-------------|

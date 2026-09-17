@@ -22,7 +22,7 @@ mod updater;
 mod validator;
 
 #[derive(Parser)]
-#[command(name = "simpled")]
+#[command(name = "simpled", version)]
 #[command(about = "A CLI tool for simplified k8s manifest generation", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -35,11 +35,6 @@ enum Commands {
     AppBundle {
         #[command(subcommand)]
         command: AppBundleCommands,
-    },
-    /// Secrets management
-    Secrets {
-        #[command(subcommand)]
-        command: SecretsCommands,
     },
     /// Prepare deployment (e.g. generate k8s manifests)
     PrepareDeployment {
@@ -179,16 +174,6 @@ enum AppBundleCommands {
     },
 }
 
-#[derive(Subcommand)]
-enum SecretsCommands {
-    Set {
-        env_name: String,
-        path: Option<String>,
-        #[arg(short = 'f', long)]
-        file: Vec<String>,
-    },
-}
-
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -221,11 +206,6 @@ fn main() -> Result<()> {
                     github_tag_prefix,
                     version_suffix,
                 )?;
-            }
-        },
-        Commands::Secrets { command } => match command {
-            SecretsCommands::Set { env_name, path, file } => {
-                println!("Set secrets for {}, path={:?}, args={:?}", env_name, path, file);
             }
         },
         Commands::PrepareDeployment {

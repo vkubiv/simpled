@@ -123,8 +123,7 @@ pub fn upload(repo: &str, ver: &str, filename: &str, tag_prefix: Option<&str>) -
         if !response.status().is_success() {
             bail!("Failed to create release: {}", response.status());
         }
-        let text = response.text()?;
-        serde_yaml::from_str(&text).context("Failed to parse created release info")?
+        response.json().context("Failed to parse created release info")?
     } else {
         bail!("Failed to get release info: {}", response.status());
     };

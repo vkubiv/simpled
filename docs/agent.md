@@ -20,7 +20,7 @@ yourself putting a domain name, a connection string, or a replica count in
 list or a secret *name*.
 
 `simpled prepare-deployment` combines the two halves and generates plain manifests
-(`k8s/`, `docker-deploy/`, or `local_env/`). It is a generator, not a controller —
+(`manifests/`, `docker-deploy/`, or `local_env/`). It is a generator, not a controller —
 nothing runs in the background, and the generated files are the whole output.
 
 ## The rules that break builds
@@ -159,7 +159,7 @@ simpled app-bundle create --registry myorg=registry.myorg.com --push-images \
 # In the deploy repo (must contain envspec.yaml)
 simpled prepare-deployment prod \
   --download-bundle-from github-release --github-repo myorg/myapp --app-version 1.0.0
-# -> k8s/  or  docker-deploy/   then: kubectl apply -f k8s/   or   ./docker-deploy/deploy.sh
+# -> manifests/  or  docker-deploy/   then: kubectl apply -f manifests/   or   ./docker-deploy/deploy.sh
 
 # Local development (dir containing localenv.yaml)
 simpled local run                            # generate compose + start gateway

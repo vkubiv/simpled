@@ -331,10 +331,10 @@ simpled prepare-deployment backend_prod \
   --github-repo mycompany/backend
 ```
 
-Both produce a `k8s/` directory. Apply it:
+Both produce a `manifests/` directory. Apply it:
 
 ```bash
-kubectl apply -f k8s/
+kubectl apply -f manifests/
 ```
 
 simpled generates:

@@ -220,7 +220,7 @@ jobs:
 
       - name: Apply manifests
         working-directory: environments/${{ inputs.environment }}
-        run: kubectl apply -f k8s/
+        run: kubectl apply -f manifests/
 ```
 
 ### Deploy to Docker Swarm
@@ -457,5 +457,5 @@ jobs:
 
       - name: Apply manifests
         working-directory: environments/prod
-        run: kubectl apply -f k8s/
+        run: kubectl apply -f manifests/
 ```
