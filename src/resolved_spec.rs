@@ -330,3 +330,98 @@ pub struct ConfigResolvedFile {
     pub name: String,
     pub content: Vec<u8>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::AwsSecretRef;
+    use crate::test_support::{resolved_deployment, resolved_service};
+
+    fn names<'a>(services: &[&'a ServiceResolvedSpec]) -> Vec<&'a str> {
+        services.iter().map(|s| s.full_name.as_str()).collect()
+    }
+
+    #[test]
+    fn jobs_run_after_the_jobs_they_depend_on_and_otherwise_by_name() {
+        let deployment = resolved_deployment(vec![
+            resolved_service("seed", ServiceType::Job, &["migrate"]),
+            resolved_service("migrate", ServiceType::Job, &["primary-db"]),
+            resolved_service("aaa-report", ServiceType::Job, &[]),
+            resolved_service("primary-db", ServiceType::Internal, &[]),
+        ]);
+        assert_eq!(
+            names(&deployment.jobs_in_order()),
+            vec!["aaa-report", "migrate", "seed"]
+        );
+    }
+
+    #[test]
+    fn a_dependency_cycle_between_jobs_still_terminates() {
+        // The validator rejects this; the generator must not hang on it anyway.
+        let deployment = resolved_deployment(vec![
+            resolved_service("a", ServiceType::Job, &["b"]),
+            resolved_service("b", ServiceType::Job, &["a"]),
+        ]);
+        let ordered = deployment.jobs_in_order();
+        assert_eq!(ordered.len(), 2);
+    }
+
+    #[test]
+    fn job_prerequisites_are_the_transitive_long_running_dependencies() {
+        let deployment = resolved_deployment(vec![
+            resolved_service("api", ServiceType::Public, &["primary-db"]),
+            resolved_service("migrate", ServiceType::Job, &["primary-db"]),
+            resolved_service("primary-db", ServiceType::Internal, &["storage"]),
+            resolved_service("storage", ServiceType::Internal, &[]),
+            resolved_service("worker", ServiceType::Internal, &[]),
+        ]);
+        // storage is reached through primary-db; api and worker are not needed.
+        assert_eq!(names(&deployment.job_prerequisites()), vec!["primary-db", "storage"]);
+        assert_eq!(
+            names(&deployment.long_running_services()),
+            vec!["api", "primary-db", "storage", "worker"]
+        );
+    }
+
+    #[test]
+    fn a_job_without_dependencies_needs_every_long_running_service() {
+        let deployment = resolved_deployment(vec![
+            resolved_service("api", ServiceType::Public, &[]),
+            resolved_service("migrate", ServiceType::Job, &[]),
+            resolved_service("primary-db", ServiceType::Internal, &[]),
+        ]);
+        assert_eq!(names(&deployment.job_prerequisites()), vec!["api", "primary-db"]);
+    }
+
+    #[test]
+    fn no_jobs_means_no_prerequisites() {
+        let deployment = resolved_deployment(vec![resolved_service("api", ServiceType::Public, &[])]);
+        assert!(deployment.job_prerequisites().is_empty());
+        assert!(deployment.jobs_in_order().is_empty());
+    }
+
+    #[test]
+    fn only_deferred_secrets_are_listed_for_fetching() {
+        let mut deployment = resolved_deployment(vec![]);
+        deployment.secrets = vec![
+            SecretResolvedSpec {
+                name: "shop-api_key".to_string(),
+                value: SecretResolvedValue::Literal("k".to_string()),
+            },
+            SecretResolvedSpec {
+                name: "shop-db_password".to_string(),
+                value: SecretResolvedValue::Deferred(AwsSecretRef {
+                    secret_id: "prod/db".to_string(),
+                    jq: None,
+                }),
+            },
+        ];
+        let deferred = deployment.deferred_secrets();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].0.name, "shop-db_password");
+        assert_eq!(deferred[0].1.secret_id, "prod/db");
+        assert_eq!(deferred[0].0.shell_var(), "SIMPLED_SECRET_SHOP_DB_PASSWORD");
+        assert_eq!(deployment.secrets[0].literal(), Some("k"));
+        assert!(deployment.secrets[1].literal().is_none());
+    }
+}
