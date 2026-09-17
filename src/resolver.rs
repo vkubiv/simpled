@@ -289,9 +289,12 @@ pub fn resolve(
             healthcheck: app_service.healthcheck.clone(),
             depends_on: app_service.depends_on.clone(),
             resources: resources.clone(),
+            // A deployment entry that only sets routing (host, prefix, replicas)
+            // must not wipe the ports the app spec declares.
             ports: deployment_service_opt
                 .map(|s| s.ports.clone())
-                .unwrap_or(app_service.ports.clone()),
+                .filter(|ports| !ports.is_empty())
+                .unwrap_or_else(|| app_service.ports.clone()),
             working_dir: deployment_service_opt.and_then(|s| s.working_dir.clone()),
         });
     }
