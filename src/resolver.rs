@@ -197,7 +197,7 @@ impl ServiceResolver<'_> {
     fn resolve_service(&mut self, app_service: &ServiceSpec) -> Result<ServiceResolvedSpec> {
         let deployment = self.deployment;
         let app_spec = self.app_spec;
-        let deployment_service = deployment.services.as_ref().and_then(|s| s.get(&app_service.name));
+        let deployment_service = deployment.services.get(&app_service.name);
 
         let empty_prefixes = Vec::new();
         let (variant_name, prefixes, resources) = match deployment_service {
@@ -368,14 +368,11 @@ impl ServiceResolver<'_> {
 /// A public service the deployment configures but gives no prefix would never
 /// be reachable through the gateway, which is almost certainly a mistake.
 fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppSpec) -> Result<()> {
-    let Some(dep_services) = &deployment.services else {
-        return Ok(());
-    };
     for app_service in app_spec.all_services() {
         if !matches!(app_service.service_type, ServiceType::Public) {
             continue;
         }
-        if let Some(ds) = dep_services.get(&app_service.name) {
+        if let Some(ds) = deployment.services.get(&app_service.name) {
             if ds.prefixes.is_empty() {
                 return Err(anyhow!(
                     "Public service '{}' in deployment '{}' has no prefixes configured and will not be reachable via ingress.",
@@ -440,7 +437,7 @@ fn build_ingress_rules(env_spec: &DeploymentEnvironmentSpec) -> Vec<IngressRule>
             for dep in &env_spec.deployments {
                 // Services live in a HashMap, so sort by name to keep the
                 // generated ingress configuration byte-identical across runs.
-                let mut dep_services: Vec<_> = dep.services.iter().flatten().collect();
+                let mut dep_services: Vec<_> = dep.services.iter().collect();
                 dep_services.sort_by(|a, b| a.0.cmp(b.0));
                 for (service_name, ds) in dep_services {
                     let host = ds.host.as_deref().unwrap_or(&dep.primary_host);

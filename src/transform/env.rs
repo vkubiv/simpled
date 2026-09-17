@@ -130,41 +130,40 @@ pub fn convert_env_spec(
             for dep in &deployments {
                 let mut ports_seen = HashSet::new();
                 let mut working_dirs_seen: HashMap<PathBuf, &str> = HashMap::new();
-                if let Some(services) = &dep.services {
-                    let mut svc_names: Vec<&String> = services.keys().collect();
-                    svc_names.sort();
-                    for svc_name in svc_names {
-                        let svc_spec = &services[svc_name];
-                        if svc_spec.ports.is_empty() {
+                let services = &dep.services;
+                let mut svc_names: Vec<&String> = services.keys().collect();
+                svc_names.sort();
+                for svc_name in svc_names {
+                    let svc_spec = &services[svc_name];
+                    if svc_spec.ports.is_empty() {
+                        return Err(anyhow!(
+                            "In Local environment, service {} must have at least one port",
+                            svc_name
+                        ));
+                    }
+                    for port in &svc_spec.ports {
+                        if !ports_seen.insert(port.external) {
                             return Err(anyhow!(
-                                "In Local environment, service {} must have at least one port",
-                                svc_name
+                                "Duplicate external port {} in deployment {}",
+                                port.external,
+                                dep.name
                             ));
                         }
-                        for port in &svc_spec.ports {
-                            if !ports_seen.insert(port.external) {
-                                return Err(anyhow!(
-                                    "Duplicate external port {} in deployment {}",
-                                    port.external,
-                                    dep.name
-                                ));
-                            }
-                        }
-                        // A host-run service writes its `.env` and secret files straight
-                        // into `working_dir`, so two services pointing at the same
-                        // directory would silently overwrite each other's files.
-                        if let Some(dir) = &svc_spec.working_dir {
-                            if let Some(other) = working_dirs_seen.insert(normalize_working_dir(dir), svc_name) {
-                                return Err(anyhow!(
-                                    "Services '{}' and '{}' in deployment '{}' share working_dir '{}'. \
-                                     Each host-run service needs its own directory: its .env file and \
-                                     secrets are written there and would overwrite each other.",
-                                    other,
-                                    svc_name,
-                                    dep.name,
-                                    dir
-                                ));
-                            }
+                    }
+                    // A host-run service writes its `.env` and secret files straight
+                    // into `working_dir`, so two services pointing at the same
+                    // directory would silently overwrite each other's files.
+                    if let Some(dir) = &svc_spec.working_dir {
+                        if let Some(other) = working_dirs_seen.insert(normalize_working_dir(dir), svc_name) {
+                            return Err(anyhow!(
+                                "Services '{}' and '{}' in deployment '{}' share working_dir '{}'. \
+                                 Each host-run service needs its own directory: its .env file and \
+                                 secrets are written there and would overwrite each other.",
+                                other,
+                                svc_name,
+                                dep.name,
+                                dir
+                            ));
                         }
                     }
                 }
@@ -661,15 +660,10 @@ fn convert_deployment(
         }
     };
 
-    let services = if let Some(svcs) = &yaml.services {
-        let mut map = HashMap::new();
-        for (k, v) in svcs {
-            map.insert(k.clone(), convert_deployment_service(v, k, &defaults)?);
-        }
-        Some(map)
-    } else {
-        None
-    };
+    let mut services = HashMap::new();
+    for (k, v) in yaml.services.iter().flatten() {
+        services.insert(k.clone(), convert_deployment_service(v, k, &defaults)?);
+    }
 
     Ok(DeploymentSpec {
         primary_host,
@@ -976,7 +970,7 @@ deployments:
             None,
         )
         .unwrap();
-        let services = spec.deployments[0].services.as_ref().unwrap();
+        let services = &spec.deployments[0].services;
         assert_eq!(services["api"].working_dir.as_deref(), Some("./backend/api"));
         assert_eq!(services["worker"].working_dir.as_deref(), Some("./backend/worker"));
     }
@@ -1284,7 +1278,7 @@ deployments:
     }
 
     fn service<'a>(spec: &'a DeploymentEnvironmentSpec, name: &str) -> &'a DeploymentServiceSpec {
-        spec.deployments[0].services.as_ref().unwrap().get(name).unwrap()
+        spec.deployments[0].services.get(name).unwrap()
     }
 
     #[test]

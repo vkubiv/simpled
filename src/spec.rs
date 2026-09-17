@@ -421,7 +421,9 @@ pub struct DeploymentSpec {
     pub configs: Vec<ConfigSpec>,
     pub secrets: Vec<DeploymentSecretSpec>,
     pub defaults: ResourcesSpec,
-    pub services: Option<HashMap<String, DeploymentServiceSpec>>,
+    /// Per-service overrides, keyed by service name. Empty when the deployment
+    /// sets none.
+    pub services: HashMap<String, DeploymentServiceSpec>,
 }
 
 #[derive(Debug, Clone)]

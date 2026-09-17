@@ -111,14 +111,13 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         available_services.insert(&svc.name);
     }
 
-    if let Some(services) = &deployment.services {
-        for svc_name in services.keys() {
-            if !available_services.contains(svc_name) {
-                return Err(anyhow!(
-                    "Deployment configures service {} which is not defined in application",
-                    svc_name
-                ));
-            }
+    let services = &deployment.services;
+    for svc_name in services.keys() {
+        if !available_services.contains(svc_name) {
+            return Err(anyhow!(
+                "Deployment configures service {} which is not defined in application",
+                svc_name
+            ));
         }
     }
 
