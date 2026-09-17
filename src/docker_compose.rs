@@ -52,7 +52,10 @@ pub fn local_project_name(application_name: &str) -> String {
 #[derive(Serialize, Clone)]
 pub struct DockerService {
     pub image: String,
-    pub container_name: String,
+    // Only for the local compose file. `docker stack deploy` names containers
+    // itself and ignores this key, so the stack file does not carry it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<ServiceCommand>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,7 +293,7 @@ pub fn prepare_service(
 
     Ok(DockerService {
         image: service.image.clone(),
-        container_name: service.full_name.clone(),
+        container_name: is_local.then(|| service.full_name.clone()),
         entrypoint: service.entrypoint.clone(),
         command: service.command.clone(),
         healthcheck: service.healthcheck.clone(),

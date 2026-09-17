@@ -1457,6 +1457,8 @@ mod tests {
             "{}",
             stack
         );
+        // Swarm names containers itself; the key is only meaningful to compose.
+        assert!(parsed["services"]["api"]["container_name"].is_null(), "{}", stack);
     }
 
     fn with_secrets(mut service: ServiceResolvedSpec, secrets: &[(&str, SecretMount)]) -> ServiceResolvedSpec {
