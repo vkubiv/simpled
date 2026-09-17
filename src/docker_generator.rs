@@ -242,10 +242,13 @@ fn generate_standalone(
         // job exits non-zero, before any service that depends on its result
         // (e.g. a migrated schema) is started.
         let detach = if is_job { "" } else { "-d " };
+        // The Traefik configuration addresses a service as `<deployment>_<service>`,
+        // the name Swarm gives it. A standalone container only answers to its own
+        // name, so it is given that alias too and both ingress types resolve it.
         write!(
             deploy_sh,
-            "docker run {}--name {} --network {}",
-            detach, service.full_name, network_name
+            "docker run {}--name {} --network {} --network-alias {}_{}",
+            detach, service.full_name, network_name, deployment.name, service.full_name
         )?;
 
         for port in &service.ports {
@@ -1948,5 +1951,31 @@ mod tests {
         // A secret that was resolvable here is still written out as before.
         let literal = fs::read_to_string(dir.path().join("secrets").join("shop-api_key")).unwrap();
         assert_eq!(literal, "k3y");
+    }
+
+    /// Traefik targets `<deployment>_<service>`, the DNS name a Swarm service gets.
+    /// A standalone container is only reachable by its own name unless it is
+    /// given that alias, so without it every route returned a bad gateway.
+    #[test]
+    fn standalone_containers_carry_the_name_traefik_targets() {
+        let mut spec = spec(vec![service("api", ServiceType::Public, &[])]);
+        spec.ingress = ingress_with_limits(&[("api", "/", None)]);
+        let docker_spec = DockerSpecificSpec {
+            ingress_type: DockerIngressType::Traefik,
+            swarm_mode: false,
+        };
+        spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, &docker_spec, dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
+        let traefik = fs::read_to_string(dir.path().join("traefik").join("dynamic_conf.yml")).unwrap();
+
+        assert!(traefik.contains("url: \"http://prod_api:80/\""), "{}", traefik);
+        assert!(
+            script.contains("docker run -d --name api --network common_network --network-alias prod_api"),
+            "{}",
+            script
+        );
     }
 }
