@@ -265,7 +265,8 @@ fn generate_standalone(
 
         for secret in &service.secrets {
             if let SecretMount::EnvVariable(var_name) = &secret.mount {
-                write!(deploy_sh, " -e {}=$(cat ./secrets/{})", var_name, secret.name)?;
+                // Quoted so a value with spaces or line breaks reaches the container whole.
+                write!(deploy_sh, " -e {}=\"$(cat ./secrets/{})\"", var_name, secret.name)?;
             }
         }
 
@@ -287,7 +288,7 @@ fn generate_standalone(
                 write!(deploy_sh, " --no-healthcheck")?;
             } else {
                 if let Some(cmd) = hc.health_cmd_string() {
-                    write!(deploy_sh, " --health-cmd '{}'", cmd.replace('\'', "'\\''"))?;
+                    write!(deploy_sh, " --health-cmd {}", sh_quote(&cmd))?;
                 }
                 if let Some(v) = &hc.interval {
                     write!(deploy_sh, " --health-interval {}", v)?;
@@ -312,7 +313,7 @@ fn generate_standalone(
         if let Some(entrypoint) = &service.entrypoint {
             let mut args = entrypoint.to_args();
             if !args.is_empty() {
-                write!(deploy_sh, " --entrypoint {}", args.remove(0))?;
+                write!(deploy_sh, " --entrypoint {}", sh_quote(&args.remove(0)))?;
                 trailing_args.extend(args);
             }
         }
@@ -320,9 +321,11 @@ fn generate_standalone(
             trailing_args.extend(command.to_args());
         }
 
-        write!(deploy_sh, " {}", service.image)?;
+        // Quoted like the Swarm job invocation, so an argument with spaces or shell
+        // metacharacters is passed to the container as one word.
+        write!(deploy_sh, " {}", sh_quote(&service.image))?;
         for arg in trailing_args {
-            write!(deploy_sh, " {}", arg)?;
+            write!(deploy_sh, " {}", sh_quote(&arg))?;
         }
         writeln!(deploy_sh)?;
     }
@@ -1966,7 +1969,7 @@ mod tests {
         assert!(script.contains(". ./fetch-secrets.sh"));
         // Both kinds are read back the same way; only where the file comes from
         // differs, so the names have to line up with what the resolver produced.
-        assert!(script.contains("-e DB_PASSWORD=$(cat ./secrets/shop-db_password)"));
+        assert!(script.contains("-e DB_PASSWORD=\"$(cat ./secrets/shop-db_password)\""));
         let fetch = fs::read_to_string(dir.path().join("fetch-secrets.sh")).unwrap();
         assert!(fetch.contains("printf '%s' \"$SIMPLED_SECRET_SHOP_DB_PASSWORD\" > 'secrets/shop-db_password'"));
         assert!(!dir.path().join("secrets").join("shop-db_password").exists());
@@ -1974,6 +1977,37 @@ mod tests {
         // A secret that was resolvable here is still written out as before.
         let literal = fs::read_to_string(dir.path().join("secrets").join("shop-api_key")).unwrap();
         assert_eq!(literal, "k3y");
+    }
+
+    #[test]
+    fn standalone_quotes_the_image_entrypoint_and_arguments() {
+        let mut api = service("api", ServiceType::Public, &[]);
+        api.entrypoint = Some(crate::spec::ServiceCommand::Exec(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+        ]));
+        api.command = Some(crate::spec::ServiceCommand::Exec(vec![
+            "echo it's alive && sleep 1".to_string()
+        ]));
+        let mut spec = spec(vec![api]);
+        let docker_spec = DockerSpecificSpec {
+            ingress_type: DockerIngressType::Nginx,
+            swarm_mode: false,
+        };
+        spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, &docker_spec, dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
+
+        // entrypoint ++ command, each token one shell word.
+        assert!(
+            script.contains(
+                "--entrypoint '/bin/sh' 'registry.example.com/api:1.0.0' '-c' 'echo it'\\''s alive && sleep 1'"
+            ),
+            "{}",
+            script
+        );
     }
 
     /// Traefik targets `<deployment>_<service>`, the DNS name a Swarm service gets.
