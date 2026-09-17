@@ -23,7 +23,7 @@ pub struct ExtraAppSpecYaml {
     pub environment: Option<AppEnvironmentYaml>,
     pub configs: Option<HashMap<String, Vec<String>>>,
     pub secrets: Option<AppSecretsYaml>,
-    pub volumes: Option<Vec<String>>,   
+    pub volumes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

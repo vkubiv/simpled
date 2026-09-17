@@ -1,14 +1,13 @@
-use crate::spec::*;
-use crate::spec_yaml::*;
 use crate::env_loader::parse_env_string;
 use crate::spec;
-use anyhow::{Context, Result, anyhow};
+use crate::spec::*;
+use crate::spec_yaml::*;
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::fs;
 
 pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnvironmentSpec>) -> Result<AppSpec> {
-    let version = semver::Version::parse(&yaml.version)
-        .context("Failed to parse app version")?;
+    let version = semver::Version::parse(&yaml.version).context("Failed to parse app version")?;
 
     let mut environment = if let Some(env) = yaml.environment {
         convert_environment(env)?
@@ -28,10 +27,9 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
     };
 
     let mut configs: Vec<ConfigSpec> = if let Some(conf) = yaml.configs {
-        conf.into_iter().map(|(k, v)| ConfigSpec {
-            name: k,
-            files: v,
-        }).collect()
+        conf.into_iter()
+            .map(|(k, v)| ConfigSpec { name: k, files: v })
+            .collect()
     } else {
         vec![]
     };
@@ -88,7 +86,8 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
                 if !volumes.contains(vol_name) {
                     return Err(anyhow!(
                         "Service '{}' references named volume '{}' which is not declared in app volumes",
-                        svc.name, vol_name
+                        svc.name,
+                        vol_name
                     ));
                 }
             }
@@ -108,50 +107,71 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
 }
 
 fn convert_environment(yaml: AppEnvironmentYaml) -> Result<AppEnvironment> {
-    let external = yaml.external.unwrap_or_default().into_iter().map(|s| {
-        let desc = parse_env_string(&s)?;
-        Ok(ExternalEnvVariable {
-            name: desc.name,
-            default: desc.default,
+    let external = yaml
+        .external
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let desc = parse_env_string(&s)?;
+            Ok(ExternalEnvVariable {
+                name: desc.name,
+                default: desc.default,
+            })
         })
-    }).collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     // TODO: check if optional variable is not defined in external
-    let optional = yaml.optional.unwrap_or_default().into_iter().map(|s| {
-        let desc = parse_env_string(&s)?;
-        if desc.default.is_some() {
-            return Err(anyhow!("Optional env variable {} cannot have a default value", desc.name));
-        }
-        Ok(OptionalEnvVariable {
-            name: desc.name,
+    let optional = yaml
+        .optional
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let desc = parse_env_string(&s)?;
+            if desc.default.is_some() {
+                return Err(anyhow!(
+                    "Optional env variable {} cannot have a default value",
+                    desc.name
+                ));
+            }
+            Ok(OptionalEnvVariable { name: desc.name })
         })
-    }).collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
-    let relative = yaml.relative.unwrap_or_default().into_iter().map(|s| {
-        let desc = parse_env_string(&s)
-            .map_err(|_| anyhow!("Invalid relative env variable format: {}", s))?;
-        let val = desc.default.ok_or_else(|| anyhow!("Invalid relative env variable format (no value): {}", s))?;
-        if !val.starts_with('/') {
-            return Err(anyhow!("Relative URL for {} must start with /", desc.name));
-        }
-        Ok(RelativeEnvVariable {
-            name: desc.name,
-            relative_value: val,
-        })
-    }).collect::<Result<Vec<_>>>()?;
-
-    let internal = yaml.internal.unwrap_or_default().into_iter().map(|s| {
-        let desc = parse_env_string(&s)
-            .map_err(|_| anyhow!("Invalid internal env variable format: {}", s))?;
-        if let Some(val) = desc.default {
-            Ok(InternalEnvVariable {
+    let relative = yaml
+        .relative
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let desc = parse_env_string(&s).map_err(|_| anyhow!("Invalid relative env variable format: {}", s))?;
+            let val = desc
+                .default
+                .ok_or_else(|| anyhow!("Invalid relative env variable format (no value): {}", s))?;
+            if !val.starts_with('/') {
+                return Err(anyhow!("Relative URL for {} must start with /", desc.name));
+            }
+            Ok(RelativeEnvVariable {
                 name: desc.name,
-                value: val,
+                relative_value: val,
             })
-        } else {
-            Err(anyhow!("Internal env variable {} must have a value", desc.name))
-        }
-    }).collect::<Result<Vec<_>>>()?;
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let internal = yaml
+        .internal
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let desc = parse_env_string(&s).map_err(|_| anyhow!("Invalid internal env variable format: {}", s))?;
+            if let Some(val) = desc.default {
+                Ok(InternalEnvVariable {
+                    name: desc.name,
+                    value: val,
+                })
+            } else {
+                Err(anyhow!("Internal env variable {} must have a value", desc.name))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(AppEnvironment {
         external,
@@ -163,12 +183,8 @@ fn convert_environment(yaml: AppEnvironmentYaml) -> Result<AppEnvironment> {
 
 fn convert_secrets(yaml: AppSecretsYaml) -> Result<Vec<AppSecretOption>> {
     match yaml {
-        AppSecretsYaml::Simple(list) => {
-            Ok(list.into_iter().map(|s| AppSecretOption { secret_name: s }).collect())
-        }
-        AppSecretsYaml::Detailed(map) => {
-            Ok(map.into_iter().map(|(k, _)| AppSecretOption { secret_name: k }).collect())
-        }
+        AppSecretsYaml::Simple(list) => Ok(list.into_iter().map(|s| AppSecretOption { secret_name: s }).collect()),
+        AppSecretsYaml::Detailed(map) => Ok(map.into_keys().map(|k| AppSecretOption { secret_name: k }).collect()),
     }
 }
 
@@ -189,31 +205,44 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
     let image = match (yaml.image, yaml.variants) {
         (Some(img), None) => ImageSpec::Exact(img),
         (None, Some(variants)) => ImageSpec::Variants(
-            variants.into_iter().map(|(variant_name, v)| ImageVariant {
-                variant_name,
-                image: v.image,
-            }).collect()
+            variants
+                .into_iter()
+                .map(|(variant_name, v)| ImageVariant {
+                    variant_name,
+                    image: v.image,
+                })
+                .collect(),
         ),
         (Some(_), Some(_)) => return Err(anyhow!("Service '{}' cannot have both 'image' and 'variants'", name)),
         (None, None) => return Err(anyhow!("Service '{}' must specify either 'image' or 'variants'", name)),
     };
 
-    let environment = yaml.environment.unwrap_or_default().into_iter().map(|s| {
-        if s == "$all" {
-            ServiceEnvOption::All
-        } else if let Some((k, v)) = s.split_once('=') {
-            ServiceEnvOption::WithValue(k.trim().to_string(), v.trim().to_string())
-        } else {
-            ServiceEnvOption::Simple(s)
-        }
-    }).collect();
-
-    let configs = yaml.configs.unwrap_or_default().into_iter().flat_map(|map| {
-        map.into_iter().map(|(k, v)| ServiceConfigOption {
-            config_name: k,
-            mount_path: v,
+    let environment = yaml
+        .environment
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            if s == "$all" {
+                ServiceEnvOption::All
+            } else if let Some((k, v)) = s.split_once('=') {
+                ServiceEnvOption::WithValue(k.trim().to_string(), v.trim().to_string())
+            } else {
+                ServiceEnvOption::Simple(s)
+            }
         })
-    }).collect();
+        .collect();
+
+    let configs = yaml
+        .configs
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|map| {
+            map.into_iter().map(|(k, v)| ServiceConfigOption {
+                config_name: k,
+                mount_path: v,
+            })
+        })
+        .collect();
 
     let secrets = if let Some(secs) = yaml.secrets {
         convert_service_secrets(secs)?
@@ -225,13 +254,16 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
 
     let expose = yaml.expose.unwrap_or_default();
 
-    let volumes = yaml.volumes.unwrap_or_default().into_iter()
+    let volumes = yaml
+        .volumes
+        .unwrap_or_default()
+        .into_iter()
         .map(|s| super::parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
 
-     let command = yaml.command.map(super::convert_service_command);
-     let entrypoint = yaml.entrypoint.map(super::convert_service_command);
-     let healthcheck = yaml.healthcheck.map(convert_healthcheck).transpose()?;
+    let command = yaml.command.map(super::convert_service_command);
+    let entrypoint = yaml.entrypoint.map(super::convert_service_command);
+    let healthcheck = yaml.healthcheck.map(convert_healthcheck).transpose()?;
 
     let depends_on = yaml.depends_on.unwrap_or_default();
     if depends_on.iter().any(|d| d == &name) {
@@ -282,7 +314,7 @@ fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSe
             ServiceSecretYaml::Simple(name) => {
                 secrets.push(ServiceSecret {
                     name: name.clone(),
-                    mount: SecretMount::FilePath(format!("/secrets/{}", name))
+                    mount: SecretMount::FilePath(format!("/secrets/{}", name)),
                 });
             }
             ServiceSecretYaml::Detailed(map) => {
@@ -293,7 +325,10 @@ fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSe
                         } else if let Some(e) = c.variable {
                             SecretMount::EnvVariable(e)
                         } else {
-                            return Err(anyhow!("Secret {} must have either path: or variable: specified, or neigher", name));
+                            return Err(anyhow!(
+                                "Secret {} must have either path: or variable: specified, or neigher",
+                                name
+                            ));
                         }
                     } else {
                         return Err(anyhow!("Secret {} configuration is missing", name));
@@ -305,4 +340,3 @@ fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSe
     }
     Ok(secrets)
 }
-

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Renders a version for the places that cannot carry a `+`.
 ///
@@ -15,7 +15,7 @@ pub fn version_to_tag(version: &str) -> String {
 pub struct AppSpec {
     pub name: String,
     pub version: semver::Version,
-    pub environment: AppEnvironment,    
+    pub environment: AppEnvironment,
     pub app_services: Vec<ServiceSpec>,
     pub extra_services: Vec<ServiceSpec>,
     pub configs: Vec<ConfigSpec>,
@@ -275,7 +275,7 @@ pub fn parse_duration_secs(input: &str) -> Option<u64> {
         return None;
     }
     // Round up to the next whole second so a non-zero duration never becomes 0.
-    Some(((total_ms + 999) / 1000) as u64)
+    Some(total_ms.div_ceil(1000) as u64)
 }
 
 #[derive(Debug, Clone)]
@@ -290,7 +290,6 @@ pub struct ServiceConfigOption {
     pub config_name: String,
     pub mount_path: String,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct ImageVariant {
@@ -312,7 +311,7 @@ pub enum ServiceType {
 }
 
 #[derive(Debug, Clone)]
-pub struct  ServiceSecret {
+pub struct ServiceSecret {
     pub name: String,
     pub mount: SecretMount,
 }
@@ -331,7 +330,7 @@ pub enum DeploymentEnvType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum  DockerIngressType {
+pub enum DockerIngressType {
     Nginx,
     Traefik,
 }
@@ -533,35 +532,64 @@ mod tests {
     fn healthcheck_probe_argv_maps_test_forms() {
         let shell = Healthcheck {
             test: HealthcheckTest::Shell("curl -f localhost".into()),
-            interval: None, timeout: None, retries: None, start_period: None, disable: false,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+            disable: false,
         };
-        assert_eq!(shell.probe_argv(), Some(vec!["/bin/sh".into(), "-c".into(), "curl -f localhost".into()]));
+        assert_eq!(
+            shell.probe_argv(),
+            Some(vec!["/bin/sh".into(), "-c".into(), "curl -f localhost".into()])
+        );
 
         let cmd = Healthcheck {
             test: HealthcheckTest::Exec(vec!["CMD".into(), "curl".into(), "-f".into(), "localhost".into()]),
-            interval: None, timeout: None, retries: None, start_period: None, disable: false,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+            disable: false,
         };
-        assert_eq!(cmd.probe_argv(), Some(vec!["curl".into(), "-f".into(), "localhost".into()]));
+        assert_eq!(
+            cmd.probe_argv(),
+            Some(vec!["curl".into(), "-f".into(), "localhost".into()])
+        );
 
         let cmd_shell = Healthcheck {
             test: HealthcheckTest::Exec(vec!["CMD-SHELL".into(), "curl -f localhost".into()]),
-            interval: None, timeout: None, retries: None, start_period: None, disable: false,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+            disable: false,
         };
-        assert_eq!(cmd_shell.probe_argv(), Some(vec!["/bin/sh".into(), "-c".into(), "curl -f localhost".into()]));
+        assert_eq!(
+            cmd_shell.probe_argv(),
+            Some(vec!["/bin/sh".into(), "-c".into(), "curl -f localhost".into()])
+        );
     }
 
     #[test]
     fn disabled_healthcheck_has_no_probe() {
         let by_flag = Healthcheck {
             test: HealthcheckTest::Shell("x".into()),
-            interval: None, timeout: None, retries: None, start_period: None, disable: true,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+            disable: true,
         };
         assert!(by_flag.is_disabled());
         assert_eq!(by_flag.probe_argv(), None);
 
         let by_none = Healthcheck {
             test: HealthcheckTest::Exec(vec!["NONE".into()]),
-            interval: None, timeout: None, retries: None, start_period: None, disable: false,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+            disable: false,
         };
         assert!(by_none.is_disabled());
         assert_eq!(by_none.probe_argv(), None);

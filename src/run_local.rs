@@ -1,13 +1,10 @@
-use crate::resolved_spec::*;
 use crate::docker_compose::*;
-use anyhow::{Result, Context, anyhow};
+use crate::resolved_spec::*;
+use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::collections::HashMap;
-use serde::Serialize;
-
-
 
 pub fn run(spec: &EnvironmentResolvedSpec, exclude: &[String]) -> Result<()> {
     run_filtered(spec, |s| !exclude.iter().any(|e| e == &s.full_name))
@@ -32,7 +29,7 @@ where
 
     let status = Command::new("docker")
         .current_dir(output_dir)
-        .args(&["compose", "up", "--remove-orphans"])
+        .args(["compose", "up", "--remove-orphans"])
         .status()
         .context("Failed to run docker compose")?;
 
@@ -80,8 +77,9 @@ where
             if !included.contains(dep) {
                 continue;
             }
-            let Some(dep_service) = spec.current_deployment.services.iter()
-                .find(|s| &s.full_name == dep) else { continue };
+            let Some(dep_service) = spec.current_deployment.services.iter().find(|s| &s.full_name == dep) else {
+                continue;
+            };
             // Waiting for `service_healthy` is only possible when the dependency
             // declares a healthcheck; otherwise compose can only order the start.
             let condition = if dep_service.healthcheck.as_ref().is_some_and(|hc| !hc.is_disabled()) {
@@ -89,7 +87,12 @@ where
             } else {
                 "service_started"
             };
-            depends_on.insert(dep.clone(), DependsOnCondition { condition: condition.to_string() });
+            depends_on.insert(
+                dep.clone(),
+                DependsOnCondition {
+                    condition: condition.to_string(),
+                },
+            );
         }
         if let Some(docker_service) = services_map.get_mut(&service.full_name) {
             docker_service.depends_on = depends_on;
@@ -110,4 +113,3 @@ where
 
     Ok(())
 }
-

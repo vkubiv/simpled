@@ -1,20 +1,19 @@
-use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, IngressToServiceRule, LetsEncryptResolvedSpec};
+use crate::resolved_spec::{
+    EnvironmentResolvedSpec, IngressResolvedSpec, IngressToServiceRule, LetsEncryptResolvedSpec,
+};
 use crate::secret_fetch::{self, sh_quote, FetchScript};
 use crate::spec::{parse_duration_secs, Healthcheck, SecretMount};
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use base64::{Engine as _, engine::general_purpose};
 
 const LETSENCRYPT_ISSUER: &str = "letsencrypt-prod";
 
-pub fn generate(
-    resolved_spec: &EnvironmentResolvedSpec,
-    output_dir: &Path,
-) -> Result<()> {
+pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> Result<()> {
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
@@ -31,8 +30,8 @@ pub fn generate(
         writeln!(file, "  name: {}", config.name)?;
         writeln!(file, "binaryData:")?;
         for cfg_file in &config.files {
-             let encoded = general_purpose::STANDARD.encode(&cfg_file.content);
-             writeln!(file, "  {}: {}", cfg_file.name, encoded)?;
+            let encoded = general_purpose::STANDARD.encode(&cfg_file.content);
+            writeln!(file, "  {}: {}", cfg_file.name, encoded)?;
         }
     }
 
@@ -71,7 +70,7 @@ pub fn generate(
         writeln!(file, "type: Opaque")?;
         writeln!(file, "data:")?;
         let encoded = general_purpose::STANDARD.encode(secret.literal().unwrap_or_default());
-        writeln!(file, "  {}: {}", "value", encoded)?;
+        writeln!(file, "  value: {}", encoded)?;
     }
 
     if !fetch_script.is_empty() {
@@ -86,14 +85,14 @@ pub fn generate(
     for service in &deployment.services {
         let file_name = output_dir.join(format!("deployment-{}.yaml", service.full_name));
         let mut file = File::create(file_name)?;
-        
+
         // Deployment
         writeln!(file, "apiVersion: apps/v1")?;
         writeln!(file, "kind: Deployment")?;
         writeln!(file, "metadata:")?;
         writeln!(file, "  name: {}", service.full_name)?;
         writeln!(file, "spec:")?;
-        writeln!(file, "  replicas: {}", deployment.defaults.replicas)?; 
+        writeln!(file, "  replicas: {}", deployment.defaults.replicas)?;
         writeln!(file, "  selector:")?;
         writeln!(file, "    matchLabels:")?;
         writeln!(file, "      app: {}", service.full_name)?;
@@ -147,51 +146,55 @@ pub fn generate(
             writeln!(file, "          value: \"{}\"", env.value)?;
         }
         for secret in &service.secrets {
-             if let SecretMount::EnvVariable(var_name) = &secret.mount {
-                 writeln!(file, "        - name: {}", var_name)?;
-                 writeln!(file, "          valueFrom:")?;
-                 writeln!(file, "            secretKeyRef:")?;
-                 writeln!(file, "              name: {}", secret.name)?;
-                 writeln!(file, "              key: value")?;
-             }
+            if let SecretMount::EnvVariable(var_name) = &secret.mount {
+                writeln!(file, "        - name: {}", var_name)?;
+                writeln!(file, "          valueFrom:")?;
+                writeln!(file, "            secretKeyRef:")?;
+                writeln!(file, "              name: {}", secret.name)?;
+                writeln!(file, "              key: value")?;
+            }
         }
-        
+
         // Volume Mounts (Configs & Secrets)
-        let has_volume_mounts = !service.configs.is_empty() || service.secrets.iter().any(|s| !matches!(s.mount, SecretMount::EnvVariable(_)));
-        
+        let has_volume_mounts = !service.configs.is_empty()
+            || service
+                .secrets
+                .iter()
+                .any(|s| !matches!(s.mount, SecretMount::EnvVariable(_)));
+
         if has_volume_mounts {
-             writeln!(file, "        volumeMounts:")?;
-             for config in &service.configs {
-                 writeln!(file, "        - name: config-{}", config.config_name)?;
-                 writeln!(file, "          mountPath: {}", config.mount_path)?;
-             }
-             for secret in &service.secrets {
-                 match &secret.mount {
-                     SecretMount::FilePath(path) => {
-                         writeln!(file, "        - name: secret-{}", secret.name)?;
-                         writeln!(file, "          mountPath: {}", path)?;
-                     }
-                     SecretMount::EnvVariable(_) => {}
-                 }
-             }
+            writeln!(file, "        volumeMounts:")?;
+            for config in &service.configs {
+                writeln!(file, "        - name: config-{}", config.config_name)?;
+                writeln!(file, "          mountPath: {}", config.mount_path)?;
+            }
+            for secret in &service.secrets {
+                match &secret.mount {
+                    SecretMount::FilePath(path) => {
+                        writeln!(file, "        - name: secret-{}", secret.name)?;
+                        writeln!(file, "          mountPath: {}", path)?;
+                    }
+                    SecretMount::EnvVariable(_) => {}
+                }
+            }
         }
-        
+
         if has_volume_mounts {
             writeln!(file, "      volumes:")?;
             for config in &service.configs {
-                 writeln!(file, "      - name: config-{}", config.config_name)?;
-                 writeln!(file, "        configMap:")?;
-                 writeln!(file, "          name: {}", config.config_name)?;
+                writeln!(file, "      - name: config-{}", config.config_name)?;
+                writeln!(file, "        configMap:")?;
+                writeln!(file, "          name: {}", config.config_name)?;
             }
             for secret in &service.secrets {
-                 if !matches!(secret.mount, SecretMount::EnvVariable(_)) {
-                     writeln!(file, "      - name: secret-{}", secret.name)?;
-                     writeln!(file, "        secret:")?;
-                     writeln!(file, "          secretName: {}", secret.name)?;
-                 }
+                if !matches!(secret.mount, SecretMount::EnvVariable(_)) {
+                    writeln!(file, "      - name: secret-{}", secret.name)?;
+                    writeln!(file, "        secret:")?;
+                    writeln!(file, "          secretName: {}", secret.name)?;
+                }
             }
         }
-        
+
         // Service
         let svc_file_name = output_dir.join(format!("service-{}.yaml", service.full_name));
         let mut svc_file = File::create(svc_file_name)?;
@@ -215,7 +218,7 @@ pub fn generate(
     // 5. ClusterIssuer (if needed)
     if let Some(tls) = &resolved_spec.ingress.tls {
         if let Some(le) = &tls.letsencrypt {
-             generate_cluster_issuer(output_dir, le)?;
+            generate_cluster_issuer(output_dir, le)?;
         }
     }
 
@@ -249,10 +252,7 @@ fn write_probe(file: &mut File, name: &str, argv: &[String], hc: &Healthcheck) -
     Ok(())
 }
 
-fn generate_ingress(
-    resolved_spec: &EnvironmentResolvedSpec,
-    output_dir: &Path
-) -> Result<()> {
+fn generate_ingress(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> Result<()> {
     let file_name = output_dir.join("ingress.yaml");
     let mut file = File::create(file_name)?;
     let ingress = &resolved_spec.ingress;
@@ -262,14 +262,16 @@ fn generate_ingress(
     // share one object. Group them by limit and emit an Ingress per group; with
     // a single limit (the usual case) that is still just one object.
     let mut limits: Vec<Option<u64>> = Vec::new();
-    let mut services_by_limit: HashMap<Option<u64>, Vec<(&String, &IngressToServiceRule)>> =
-        HashMap::new();
+    let mut services_by_limit: HashMap<Option<u64>, Vec<(&String, &IngressToServiceRule)>> = HashMap::new();
     for rule in &ingress.rules {
         for svc in &rule.services {
             if !services_by_limit.contains_key(&svc.body_limit) {
                 limits.push(svc.body_limit);
             }
-            services_by_limit.entry(svc.body_limit).or_default().push((&rule.domain_name, svc));
+            services_by_limit
+                .entry(svc.body_limit)
+                .or_default()
+                .push((&rule.domain_name, svc));
         }
     }
     // A gateway with no routes at all still emits its (empty) Ingress, as before.
@@ -337,9 +339,9 @@ fn generate_ingress(
                     writeln!(file, "    - {}", domain)?;
                 }
                 if let Some(secret) = &tls.secret {
-                     writeln!(file, "    secretName: {}", secret)?;
+                    writeln!(file, "    secretName: {}", secret)?;
                 } else if tls.letsencrypt.is_some() {
-                     writeln!(file, "    secretName: {}--tls", ingress.name)?;
+                    writeln!(file, "    secretName: {}--tls", ingress.name)?;
                 }
             }
         }
@@ -364,21 +366,25 @@ fn generate_ingress(
             writeln!(file, "      paths:")?;
 
             for svc_rule in &services_by_domain[domain] {
-                 let path = if svc_rule.strip_prefix {
-                     let trimmed = svc_rule.prefix.trim_end_matches('/');
-                     format!("{}(/|$)(.*)", trimmed)
-                 } else {
-                     svc_rule.prefix.clone()
-                 };
+                let path = if svc_rule.strip_prefix {
+                    let trimmed = svc_rule.prefix.trim_end_matches('/');
+                    format!("{}(/|$)(.*)", trimmed)
+                } else {
+                    svc_rule.prefix.clone()
+                };
 
-                 let path_type = if svc_rule.strip_prefix { "ImplementationSpecific" } else { "Prefix" };
-                 writeln!(file, "      - path: {}", path)?;
-                 writeln!(file, "        pathType: {}", path_type)?;
-                 writeln!(file, "        backend:")?;
-                 writeln!(file, "          service:")?;
-                 writeln!(file, "            name: {}", svc_rule.service_name)?;
-                 writeln!(file, "            port:")?;
-                 writeln!(file, "              number: {}", svc_rule.port)?;
+                let path_type = if svc_rule.strip_prefix {
+                    "ImplementationSpecific"
+                } else {
+                    "Prefix"
+                };
+                writeln!(file, "      - path: {}", path)?;
+                writeln!(file, "        pathType: {}", path_type)?;
+                writeln!(file, "        backend:")?;
+                writeln!(file, "          service:")?;
+                writeln!(file, "            name: {}", svc_rule.service_name)?;
+                writeln!(file, "            port:")?;
+                writeln!(file, "              number: {}", svc_rule.port)?;
             }
         }
     }
@@ -427,14 +433,17 @@ fn generate_redirect_ingresses(ingress: &IngressResolvedSpec, file: &mut File) -
     // Referencing that secret here (without the issuer annotation) avoids a
     // second Certificate racing the first one for the same secret.
     let tls_secret = ingress.tls.as_ref().and_then(|tls| {
-        tls.secret.clone()
+        tls.secret
+            .clone()
             .or_else(|| tls.letsencrypt.as_ref().map(|_| format!("{}--tls", ingress.name)))
     });
 
     for (index, key) in targets.iter().enumerate() {
         let (to, permanent) = *key;
         let sources = &sources_by_target[key];
-        let target_url = ingress.redirects.iter()
+        let target_url = ingress
+            .redirects
+            .iter()
             .find(|r| r.to == to && r.permanent == permanent)
             .map(|r| r.target_url(has_tls))
             .unwrap_or_else(|| to.to_string());
@@ -445,7 +454,11 @@ fn generate_redirect_ingresses(ingress: &IngressResolvedSpec, file: &mut File) -
         writeln!(file, "metadata:")?;
         writeln!(file, "  name: {}--redirect-{}", ingress.name, index)?;
         writeln!(file, "  annotations:")?;
-        let annotation = if permanent { "permanent-redirect" } else { "temporal-redirect" };
+        let annotation = if permanent {
+            "permanent-redirect"
+        } else {
+            "temporal-redirect"
+        };
         writeln!(file, "    nginx.ingress.kubernetes.io/{}: {}", annotation, target_url)?;
         writeln!(file, "spec:")?;
         writeln!(file, "  ingressClassName: nginx")?;
@@ -478,7 +491,7 @@ fn generate_redirect_ingresses(ingress: &IngressResolvedSpec, file: &mut File) -
 fn generate_cluster_issuer(output_dir: &Path, le_spec: &LetsEncryptResolvedSpec) -> Result<()> {
     let file_name = output_dir.join("cluster-issuer.yaml");
     let mut file = File::create(file_name)?;
-    
+
     writeln!(file, "apiVersion: cert-manager.io/v1")?;
     writeln!(file, "kind: ClusterIssuer")?;
     writeln!(file, "metadata:")?;
@@ -493,7 +506,7 @@ fn generate_cluster_issuer(output_dir: &Path, le_spec: &LetsEncryptResolvedSpec)
     writeln!(file, "    - http01:")?;
     writeln!(file, "        ingress:")?;
     writeln!(file, "          class: nginx")?;
-    
+
     Ok(())
 }
 
@@ -546,18 +559,24 @@ mod tests {
             env_type: crate::spec::DeploymentEnvType::K8S,
             ingress: IngressResolvedSpec {
                 name: "gateway".to_string(),
-                tls: Some(IngressTlsResolvedSpec { secret: Some("tls".to_string()), letsencrypt: None }),
+                tls: Some(IngressTlsResolvedSpec {
+                    secret: Some("tls".to_string()),
+                    letsencrypt: None,
+                }),
                 domains: vec!["somesite.com".to_string()],
                 rules: vec![IngressRule {
                     domain_name: "somesite.com".to_string(),
-                    services: limits.iter().map(|(name, prefix, limit)| IngressToServiceRule {
-                        service_name: name.to_string(),
-                        deployment_name: "prod".to_string(),
-                        port: 80,
-                        prefix: prefix.to_string(),
-                        strip_prefix: false,
-                        body_limit: *limit,
-                    }).collect(),
+                    services: limits
+                        .iter()
+                        .map(|(name, prefix, limit)| IngressToServiceRule {
+                            service_name: name.to_string(),
+                            deployment_name: "prod".to_string(),
+                            port: 80,
+                            prefix: prefix.to_string(),
+                            strip_prefix: false,
+                            body_limit: *limit,
+                        })
+                        .collect(),
                 }],
                 redirects: vec![],
             },
@@ -568,8 +587,14 @@ mod tests {
                 secrets: vec![],
                 defaults: crate::spec::ResourcesSpec {
                     replicas: 1,
-                    requests: crate::spec::ResourceLimits { memory: "1".to_string(), cpu: "1".to_string() },
-                    limits: crate::spec::ResourceLimits { memory: "1".to_string(), cpu: "1".to_string() },
+                    requests: crate::spec::ResourceLimits {
+                        memory: "1".to_string(),
+                        cpu: "1".to_string(),
+                    },
+                    limits: crate::spec::ResourceLimits {
+                        memory: "1".to_string(),
+                        cpu: "1".to_string(),
+                    },
                 },
                 services: vec![],
                 volumes: vec![],
@@ -591,7 +616,11 @@ mod tests {
         ]));
 
         assert_eq!(yaml.matches("kind: Ingress").count(), 1, "{}", yaml);
-        assert!(yaml.contains("nginx.ingress.kubernetes.io/proxy-body-size: \"2048\""), "{}", yaml);
+        assert!(
+            yaml.contains("nginx.ingress.kubernetes.io/proxy-body-size: \"2048\""),
+            "{}",
+            yaml
+        );
     }
 
     #[test]
@@ -604,10 +633,20 @@ mod tests {
         // proxy-body-size is a per-Ingress annotation, so the routes cannot share
         // one object.
         assert_eq!(yaml.matches("kind: Ingress").count(), 2, "{}", yaml);
-        assert!(yaml.contains("  name: gateway
-"), "{}", yaml);
+        assert!(
+            yaml.contains(
+                "  name: gateway
+"
+            ),
+            "{}",
+            yaml
+        );
         assert!(yaml.contains("  name: gateway--limit-10485760"), "{}", yaml);
-        assert!(yaml.contains("nginx.ingress.kubernetes.io/proxy-body-size: \"10485760\""), "{}", yaml);
+        assert!(
+            yaml.contains("nginx.ingress.kubernetes.io/proxy-body-size: \"10485760\""),
+            "{}",
+            yaml
+        );
 
         // Only the primary owns the certificate; the second just adds paths to a
         // host the first already serves.
@@ -615,16 +654,19 @@ mod tests {
 
         let second = yaml.split("--limit-10485760").nth(1).unwrap();
         assert!(second.contains("      - path: /upload"), "{}", yaml);
-        assert!(!second.contains("      - path: /
-"), "{}", yaml);
+        assert!(
+            !second.contains(
+                "      - path: /
+"
+            ),
+            "{}",
+            yaml
+        );
     }
 
     #[test]
     fn rewrite_target_follows_the_group_that_needs_it() {
-        let mut spec = spec_with_limits(&[
-            ("web", "/", None),
-            ("upload", "/upload", Some(2048)),
-        ]);
+        let mut spec = spec_with_limits(&[("web", "/", None), ("upload", "/upload", Some(2048))]);
         spec.ingress.rules[0].services[1].strip_prefix = true;
         let yaml = render_ingress(&spec);
 
@@ -644,12 +686,25 @@ mod tests {
                 email: "ops@somesite.com".to_string(),
             }),
         };
-        let yaml = render(&ingress(vec![redirect("somesite.com", "www.somesite.com", true)], Some(tls)));
+        let yaml = render(&ingress(
+            vec![redirect("somesite.com", "www.somesite.com", true)],
+            Some(tls),
+        ));
 
-        assert!(yaml.starts_with("---
-"), "{}", yaml);
+        assert!(
+            yaml.starts_with(
+                "---
+"
+            ),
+            "{}",
+            yaml
+        );
         assert!(yaml.contains("  name: gateway--redirect-0"), "{}", yaml);
-        assert!(yaml.contains("nginx.ingress.kubernetes.io/permanent-redirect: https://www.somesite.com"), "{}", yaml);
+        assert!(
+            yaml.contains("nginx.ingress.kubernetes.io/permanent-redirect: https://www.somesite.com"),
+            "{}",
+            yaml
+        );
         assert!(yaml.contains("  - host: somesite.com"), "{}", yaml);
         // The redirect answers before the backend is reached, but a path still
         // has to name one, so it borrows a service that actually exists.
@@ -674,7 +729,11 @@ mod tests {
         assert_eq!(yaml.matches("kind: Ingress").count(), 2, "{}", yaml);
         assert!(yaml.contains("  - host: somesite.com"), "{}", yaml);
         assert!(yaml.contains("  - host: somesite.net"), "{}", yaml);
-        assert!(yaml.contains("nginx.ingress.kubernetes.io/temporal-redirect: http://www.somesite.com"), "{}", yaml);
+        assert!(
+            yaml.contains("nginx.ingress.kubernetes.io/temporal-redirect: http://www.somesite.com"),
+            "{}",
+            yaml
+        );
         // No TLS configured, so no tls block to attach.
         assert!(!yaml.contains("secretName"), "{}", yaml);
     }

@@ -1,15 +1,15 @@
-use std::collections::HashMap;
+use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, DockerService, ServiceNetwork};
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
 use crate::secret_fetch::{self, sh_quote, FetchScript};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, DockerService, ServiceNetwork};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOCKER_NETWORK: &str = "common_network";
 const NGINX_IMAGE: &str = "nginx:alpine";
@@ -107,7 +107,7 @@ pub fn generate(
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
-    
+
     if docker_spec.swarm_mode {
         generate_swarm(resolved_spec, docker_spec, output_dir)
     } else {
@@ -131,12 +131,12 @@ fn generate_standalone(
     // below mount back out of `./configs/` and `./secrets/`, so the names are used
     // verbatim here rather than prefixed a second time.
     for config in &deployment.configs {
-         let cfg_dir = configs_dir.join(&config.name);
-         fs::create_dir_all(&cfg_dir)?;
-         for cfg_file in &config.files {
-             let path = cfg_dir.join(&cfg_file.name);
-             fs::write(&path, &cfg_file.content)?;
-         }
+        let cfg_dir = configs_dir.join(&config.name);
+        fs::create_dir_all(&cfg_dir)?;
+        for cfg_file in &config.files {
+            let path = cfg_dir.join(&cfg_file.name);
+            fs::write(&path, &cfg_file.content)?;
+        }
     }
 
     // 2. Secrets. Ones with an `aws` source have no value yet — `fetch-secrets.sh`
@@ -170,7 +170,7 @@ fn generate_standalone(
 
     // 4. Script
     let mut deploy_sh = File::create(output_dir.join("deploy.sh"))?;
-    
+
     #[cfg(unix)]
     {
         let mut perms = deploy_sh.metadata()?.permissions();
@@ -201,125 +201,142 @@ fn generate_standalone(
     }
 
     if !jobs.is_empty() {
-        writeln!(deploy_sh, "HEALTH_TIMEOUT=\"${{HEALTH_TIMEOUT:-{}}}\"", HEALTH_TIMEOUT_SECONDS)?;
+        writeln!(
+            deploy_sh,
+            "HEALTH_TIMEOUT=\"${{HEALTH_TIMEOUT:-{}}}\"",
+            HEALTH_TIMEOUT_SECONDS
+        )?;
         write!(deploy_sh, "{}", WAIT_HEALTHY_FUNCTION)?;
         writeln!(deploy_sh)?;
     }
 
     let mut jobs_started = false;
     for service in start_order {
-         let is_job = matches!(service.service_type, crate::spec::ServiceType::Job);
+        let is_job = matches!(service.service_type, crate::spec::ServiceType::Job);
 
-         // Give the job dependencies a chance to become usable before the first
-         // job starts. `docker run` returns as soon as the container is created,
-         // so a declared healthcheck is the only readiness signal available.
-         if is_job && !jobs_started {
-             jobs_started = true;
-             for dependency in &prerequisites {
-                 if dependency.healthcheck.as_ref().is_some_and(|hc| !hc.is_disabled()) {
-                     writeln!(deploy_sh, "wait_healthy {}", dependency.full_name)?;
-                 }
-             }
-         }
+        // Give the job dependencies a chance to become usable before the first
+        // job starts. `docker run` returns as soon as the container is created,
+        // so a declared healthcheck is the only readiness signal available.
+        if is_job && !jobs_started {
+            jobs_started = true;
+            for dependency in &prerequisites {
+                if dependency.healthcheck.as_ref().is_some_and(|hc| !hc.is_disabled()) {
+                    writeln!(deploy_sh, "wait_healthy {}", dependency.full_name)?;
+                }
+            }
+        }
 
-         writeln!(deploy_sh, "echo 'Starting {}...'", service.full_name)?;
-         writeln!(deploy_sh, "docker rm -f {} || true", service.full_name)?;
+        writeln!(deploy_sh, "echo 'Starting {}...'", service.full_name)?;
+        writeln!(deploy_sh, "docker rm -f {} || true", service.full_name)?;
 
-         // Create env file
-         let env_file_name = format!("{}.env", service.full_name);
-         let env_path = envs_dir.join(&env_file_name);
-         let mut env_file = File::create(&env_path)?;
+        // Create env file
+        let env_file_name = format!("{}.env", service.full_name);
+        let env_path = envs_dir.join(&env_file_name);
+        let mut env_file = File::create(&env_path)?;
 
-         for env in &service.environment_variables {
-             writeln!(env_file, "{}={}", env.name, env.value)?;
-         }
+        for env in &service.environment_variables {
+            writeln!(env_file, "{}={}", env.name, env.value)?;
+        }
 
-         // A job runs in the foreground: `set -e` then aborts the deploy when the
-         // job exits non-zero, before any service that depends on its result
-         // (e.g. a migrated schema) is started.
-         let detach = if is_job { "" } else { "-d " };
-         write!(deploy_sh, "docker run {}--name {} --network {}", detach, service.full_name, network_name)?;
+        // A job runs in the foreground: `set -e` then aborts the deploy when the
+        // job exits non-zero, before any service that depends on its result
+        // (e.g. a migrated schema) is started.
+        let detach = if is_job { "" } else { "-d " };
+        write!(
+            deploy_sh,
+            "docker run {}--name {} --network {}",
+            detach, service.full_name, network_name
+        )?;
 
-         for port in &service.ports {
-             write!(deploy_sh, " -p {}:{}", port.external, port.internal)?;
-         }
+        for port in &service.ports {
+            write!(deploy_sh, " -p {}:{}", port.external, port.internal)?;
+        }
 
-         // `expose` declares internal-only ports (reachable by other containers
-         // on the network but not published to the host).
-         for port in &service.expose {
-             write!(deploy_sh, " --expose {}", port)?;
-         }
+        // `expose` declares internal-only ports (reachable by other containers
+        // on the network but not published to the host).
+        for port in &service.expose {
+            write!(deploy_sh, " --expose {}", port)?;
+        }
 
-         write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
-         
-         for secret in &service.secrets {
-              if let SecretMount::EnvVariable(var_name) = &secret.mount {
-                   write!(deploy_sh, " -e {}=$(cat ./secrets/{})", var_name, secret.name)?;
-              }
-         }
-         
-         for config in &service.configs {
-              let local_path = format!("$(pwd)/configs/{}", config.config_name);
-              write!(deploy_sh, " -v {}:{}", local_path, config.mount_path)?;
-         }
-         
-         for secret in &service.secrets {
-             if let SecretMount::FilePath(path) = &secret.mount {
-                  let local_path = format!("$(pwd)/secrets/{}", secret.name);
-                  write!(deploy_sh, " -v {}:{}", local_path, path)?;
-             }
-         }
-         
-         // Healthcheck: map docker-compose `healthcheck` onto `docker run` flags.
-         if let Some(hc) = &service.healthcheck {
-             if hc.is_disabled() {
-                 write!(deploy_sh, " --no-healthcheck")?;
-             } else {
-                 if let Some(cmd) = hc.health_cmd_string() {
-                     write!(deploy_sh, " --health-cmd '{}'", cmd.replace('\'', "'\\''"))?;
-                 }
-                 if let Some(v) = &hc.interval { write!(deploy_sh, " --health-interval {}", v)?; }
-                 if let Some(v) = &hc.timeout { write!(deploy_sh, " --health-timeout {}", v)?; }
-                 if let Some(v) = hc.retries { write!(deploy_sh, " --health-retries {}", v)?; }
-                 if let Some(v) = &hc.start_period { write!(deploy_sh, " --health-start-period {}", v)?; }
-             }
-         }
+        write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
 
-         // `docker run --entrypoint` overrides only the executable, so the first
-         // entrypoint token goes there and any remaining entrypoint tokens are
-         // prepended to the container args after the image. The effective process
-         // is therefore entrypoint ++ command, matching docker-compose.
-         let mut trailing_args: Vec<String> = Vec::new();
-         if let Some(entrypoint) = &service.entrypoint {
-             let mut args = entrypoint.to_args();
-             if !args.is_empty() {
-                 write!(deploy_sh, " --entrypoint {}", args.remove(0))?;
-                 trailing_args.extend(args);
-             }
-         }
-         if let Some(command) = &service.command {
-             trailing_args.extend(command.to_args());
-         }
+        for secret in &service.secrets {
+            if let SecretMount::EnvVariable(var_name) = &secret.mount {
+                write!(deploy_sh, " -e {}=$(cat ./secrets/{})", var_name, secret.name)?;
+            }
+        }
 
-         write!(deploy_sh, " {}", service.image)?;
-         for arg in trailing_args {
-             write!(deploy_sh, " {}", arg)?;
-         }
-         writeln!(deploy_sh)?;
+        for config in &service.configs {
+            let local_path = format!("$(pwd)/configs/{}", config.config_name);
+            write!(deploy_sh, " -v {}:{}", local_path, config.mount_path)?;
+        }
+
+        for secret in &service.secrets {
+            if let SecretMount::FilePath(path) = &secret.mount {
+                let local_path = format!("$(pwd)/secrets/{}", secret.name);
+                write!(deploy_sh, " -v {}:{}", local_path, path)?;
+            }
+        }
+
+        // Healthcheck: map docker-compose `healthcheck` onto `docker run` flags.
+        if let Some(hc) = &service.healthcheck {
+            if hc.is_disabled() {
+                write!(deploy_sh, " --no-healthcheck")?;
+            } else {
+                if let Some(cmd) = hc.health_cmd_string() {
+                    write!(deploy_sh, " --health-cmd '{}'", cmd.replace('\'', "'\\''"))?;
+                }
+                if let Some(v) = &hc.interval {
+                    write!(deploy_sh, " --health-interval {}", v)?;
+                }
+                if let Some(v) = &hc.timeout {
+                    write!(deploy_sh, " --health-timeout {}", v)?;
+                }
+                if let Some(v) = hc.retries {
+                    write!(deploy_sh, " --health-retries {}", v)?;
+                }
+                if let Some(v) = &hc.start_period {
+                    write!(deploy_sh, " --health-start-period {}", v)?;
+                }
+            }
+        }
+
+        // `docker run --entrypoint` overrides only the executable, so the first
+        // entrypoint token goes there and any remaining entrypoint tokens are
+        // prepended to the container args after the image. The effective process
+        // is therefore entrypoint ++ command, matching docker-compose.
+        let mut trailing_args: Vec<String> = Vec::new();
+        if let Some(entrypoint) = &service.entrypoint {
+            let mut args = entrypoint.to_args();
+            if !args.is_empty() {
+                write!(deploy_sh, " --entrypoint {}", args.remove(0))?;
+                trailing_args.extend(args);
+            }
+        }
+        if let Some(command) = &service.command {
+            trailing_args.extend(command.to_args());
+        }
+
+        write!(deploy_sh, " {}", service.image)?;
+        for arg in trailing_args {
+            write!(deploy_sh, " {}", arg)?;
+        }
+        writeln!(deploy_sh)?;
     }
-    
+
     // Ingress Container
     if !resolved_spec.ingress.rules.is_empty() {
         match docker_spec.ingress_type {
-            DockerIngressType::Nginx => generate_nginx_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name)?,
+            DockerIngressType::Nginx => {
+                generate_nginx_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name)?
+            }
 
             DockerIngressType::Traefik => {
                 generate_traefik_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name)?;
             }
         }
-
     }
-    
+
     Ok(())
 }
 
@@ -335,10 +352,9 @@ fn generate_swarm(
     fs::create_dir_all(&app_dir)?;
 
     for volume in &deployment.volumes {
-        let volume_sub_dir = app_dir.clone().join("volumes").join(&volume);
+        let volume_sub_dir = app_dir.clone().join("volumes").join(volume);
         fs::create_dir_all(volume_sub_dir)?;
     }
-
 
     let network_name = DOCKER_NETWORK.to_string();
 
@@ -362,9 +378,12 @@ fn generate_swarm(
         let mut docker_service = prepare_service(service, resolved_spec, &app_dir)?;
 
         let mut networks = HashMap::new();
-        networks.insert("default".to_string(), ServiceNetwork {
-            aliases: vec![service.full_name.clone()],
-        });
+        networks.insert(
+            "default".to_string(),
+            ServiceNetwork {
+                aliases: vec![service.full_name.clone()],
+            },
+        );
 
         docker_service.networks = networks;
 
@@ -373,12 +392,21 @@ fn generate_swarm(
         // mirrors what `prepare_service` uses, relative to the deploy directory
         // rather than to the stack file.
         for secret_option in &service.secrets {
-            let SecretMount::FilePath(mount_path) = &secret_option.mount else { continue };
-            let Some(secret) = deployment.secrets.iter()
-                .find(|s| s.name == secret_option.name && s.deferred().is_some()) else { continue };
+            let SecretMount::FilePath(mount_path) = &secret_option.mount else {
+                continue;
+            };
+            let Some(secret) = deployment
+                .secrets
+                .iter()
+                .find(|s| s.name == secret_option.name && s.deferred().is_some())
+            else {
+                continue;
+            };
             let rel_path = mount_path.trim_start_matches('/');
-            fetch_script.write_to_file(secret, &format!(
-                "{}/{}/{}", deployment.name, service.full_name, rel_path));
+            fetch_script.write_to_file(
+                secret,
+                &format!("{}/{}/{}", deployment.name, service.full_name, rel_path),
+            );
         }
 
         prepared.insert(service.full_name.clone(), docker_service);
@@ -397,14 +425,18 @@ fn generate_swarm(
 
     let compose_network = || {
         let mut networks = HashMap::new();
-        networks.insert("default".to_string(), DockerComposeNetwork {
-            external: true,
-            name: network_name.clone(),
-        });
+        networks.insert(
+            "default".to_string(),
+            DockerComposeNetwork {
+                external: true,
+                name: network_name.clone(),
+            },
+        );
         networks
     };
 
-    let stack_services: HashMap<String, DockerService> = long_running.iter()
+    let stack_services: HashMap<String, DockerService> = long_running
+        .iter()
         .filter_map(|s| prepared.get(&s.full_name).map(|d| (s.full_name.clone(), d.clone())))
         .collect();
 
@@ -416,17 +448,16 @@ fn generate_swarm(
 
     let compose_path = &app_dir.join("docker-compose.yaml");
     let yaml = serde_yaml::to_string(&compose)?;
-    fs::write(&compose_path, yaml)?;
+    fs::write(compose_path, yaml)?;
 
     // Phase-1 stack file: only the services the jobs need. Written when it is a
     // real subset — when the jobs need everything, phase 1 deploys the full stack
     // file instead and phase 3 has nothing left to do.
-    let deps_only = !jobs.is_empty()
-        && !prerequisites.is_empty()
-        && prerequisites.len() < long_running.len();
+    let deps_only = !jobs.is_empty() && !prerequisites.is_empty() && prerequisites.len() < long_running.len();
 
     if deps_only {
-        let dep_services: HashMap<String, DockerService> = prerequisites.iter()
+        let dep_services: HashMap<String, DockerService> = prerequisites
+            .iter()
             .filter_map(|s| prepared.get(&s.full_name).map(|d| (s.full_name.clone(), d.clone())))
             .collect();
 
@@ -440,12 +471,10 @@ fn generate_swarm(
         fs::write(&deps_path, serde_yaml::to_string(&deps_compose)?)?;
     }
 
-
-
     // 4. Ingress Stack
     let ingress_dir = output_dir.join("ingress");
     fs::create_dir_all(&ingress_dir)?;
-    
+
     match docker_spec.ingress_type {
         DockerIngressType::Nginx => generate_nginx_swarm(resolved_spec, &ingress_dir, network_name.clone())?,
         DockerIngressType::Traefik => generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone())?,
@@ -453,7 +482,7 @@ fn generate_swarm(
 
     // 5. Deploy Script
     let mut deploy_sh = File::create(output_dir.join("deploy.sh"))?;
-    
+
     #[cfg(unix)]
     {
         let mut perms = deploy_sh.metadata()?.permissions();
@@ -465,15 +494,28 @@ fn generate_swarm(
     writeln!(deploy_sh, "set -e")?;
     write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
     if !jobs.is_empty() {
-        writeln!(deploy_sh, "# Absolute paths are needed for the bind mounts of jobs, which are created")?;
-        writeln!(deploy_sh, "# with `docker service create` instead of being part of the stack file.")?;
+        writeln!(
+            deploy_sh,
+            "# Absolute paths are needed for the bind mounts of jobs, which are created"
+        )?;
+        writeln!(
+            deploy_sh,
+            "# with `docker service create` instead of being part of the stack file."
+        )?;
         writeln!(deploy_sh, "DEPLOY_DIR=\"$(pwd)\"")?;
-        writeln!(deploy_sh, "# Seconds to wait for a single job to finish before giving up.")?;
+        writeln!(
+            deploy_sh,
+            "# Seconds to wait for a single job to finish before giving up."
+        )?;
         writeln!(deploy_sh, "JOB_TIMEOUT=\"${{JOB_TIMEOUT:-{}}}\"", JOB_TIMEOUT_SECONDS)?;
         writeln!(deploy_sh)?;
         write_run_job_function(&mut deploy_sh)?;
     }
-    writeln!(deploy_sh, "docker network create --driver overlay --attachable {} || true", network_name)?;
+    writeln!(
+        deploy_sh,
+        "docker network create --driver overlay --attachable {} || true",
+        network_name
+    )?;
 
     // Bind-mounted volume directories are not created automatically on the node
     // during the first deployment, which makes `docker stack deploy` fail. Collect
@@ -510,14 +552,21 @@ fn generate_swarm(
 
     // --prune removes services that still carry the stack label but are no
     // longer in the file, e.g. after the ingress type was switched.
-    writeln!(deploy_sh, "docker stack deploy -c ingress/docker-compose.yaml ingress --prune --detach=false")?;
+    writeln!(
+        deploy_sh,
+        "docker stack deploy -c ingress/docker-compose.yaml ingress --prune --detach=false"
+    )?;
 
     if jobs.is_empty() {
         // --prune removes services that are still labelled as part of this stack
         // but are no longer in the stack file, i.e. services deleted from the
         // spec since the last deploy. Only ever passed when the file being
         // deployed is the complete stack file.
-        writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune", deployment.name, deployment.name)?;
+        writeln!(
+            deploy_sh,
+            "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune",
+            deployment.name, deployment.name
+        )?;
     } else {
         // Jobs are run between two partial rollouts of the same stack. `docker
         // stack deploy` only removes services missing from the file when it is
@@ -527,26 +576,46 @@ fn generate_swarm(
         // must never be passed for a partial file — it would tear down every
         // service phase 3 is about to bring back.
         writeln!(deploy_sh)?;
-        writeln!(deploy_sh, "echo '== Phase 1/3: starting services the jobs depend on =='")?;
+        writeln!(
+            deploy_sh,
+            "echo '== Phase 1/3: starting services the jobs depend on =='"
+        )?;
         if prerequisites.is_empty() {
-            writeln!(deploy_sh, "echo 'No job dependencies declared, nothing to start first.'")?;
+            writeln!(
+                deploy_sh,
+                "echo 'No job dependencies declared, nothing to start first.'"
+            )?;
         } else {
-            let phase1_file = if deps_only { DEPS_COMPOSE_FILE } else { "docker-compose.yaml" };
+            let phase1_file = if deps_only {
+                DEPS_COMPOSE_FILE
+            } else {
+                "docker-compose.yaml"
+            };
             // Only the full stack file may prune; the deps-only subset may not.
             let prune = if deps_only { "" } else { " --prune" };
             // --detach=false blocks until every service in the file has converged,
             // i.e. its tasks are running and (when a healthcheck is declared)
             // healthy. That is what makes it safe to run the jobs next.
-            writeln!(deploy_sh, "docker stack deploy -c {}/{} {} --with-registry-auth{} --detach=false",
-                deployment.name, phase1_file, deployment.name, prune)?;
+            writeln!(
+                deploy_sh,
+                "docker stack deploy -c {}/{} {} --with-registry-auth{} --detach=false",
+                deployment.name, phase1_file, deployment.name, prune
+            )?;
         }
 
         writeln!(deploy_sh)?;
         writeln!(deploy_sh, "echo '== Phase 2/3: running jobs =='")?;
         for job in &jobs {
-            let docker_service = prepared.get(&job.full_name)
+            let docker_service = prepared
+                .get(&job.full_name)
                 .ok_or_else(|| anyhow!("Job {} was not prepared", job.full_name))?;
-            write_job_invocation(&mut deploy_sh, &deployment.name, &job.full_name, docker_service, &network_name)?;
+            write_job_invocation(
+                &mut deploy_sh,
+                &deployment.name,
+                &job.full_name,
+                docker_service,
+                &network_name,
+            )?;
         }
 
         writeln!(deploy_sh)?;
@@ -554,10 +623,17 @@ fn generate_swarm(
         if long_running.is_empty() {
             writeln!(deploy_sh, "echo 'This deployment has no long-running services.'")?;
         } else if deps_only || prerequisites.is_empty() {
-            writeln!(deploy_sh, "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune", deployment.name, deployment.name)?;
+            writeln!(
+                deploy_sh,
+                "docker stack deploy -c {}/docker-compose.yaml {} --with-registry-auth --prune",
+                deployment.name, deployment.name
+            )?;
         } else {
             // Phase 1 already deployed every long-running service.
-            writeln!(deploy_sh, "echo 'All services were started in phase 1, nothing left to deploy.'")?;
+            writeln!(
+                deploy_sh,
+                "echo 'All services were started in phase 1, nothing left to deploy.'"
+            )?;
         }
     }
 
@@ -586,7 +662,10 @@ fn write_fetch_secrets_call(deploy_sh: &mut File, fetch_script: &FetchScript) ->
     if fetch_script.is_empty() {
         return Ok(());
     }
-    writeln!(deploy_sh, "# Read the secrets with an `aws` source from AWS Secrets Manager. Sourced, so")?;
+    writeln!(
+        deploy_sh,
+        "# Read the secrets with an `aws` source from AWS Secrets Manager. Sourced, so"
+    )?;
     writeln!(deploy_sh, "# the values it exports are visible to the commands below.")?;
     writeln!(deploy_sh, ". ./{}", secret_fetch::SCRIPT_NAME)?;
     writeln!(deploy_sh)?;
@@ -620,7 +699,11 @@ fn write_job_invocation(
     writeln!(deploy_sh, "  --network {} \\", sh_quote(network_name))?;
 
     for env_file in &service.env_file {
-        writeln!(deploy_sh, "  --env-file \"{}\" \\", node_path(deployment_name, env_file))?;
+        writeln!(
+            deploy_sh,
+            "  --env-file \"{}\" \\",
+            node_path(deployment_name, env_file)
+        )?;
     }
 
     let mut env_names: Vec<&String> = service.environment.keys().collect();
@@ -644,8 +727,12 @@ fn write_job_invocation(
         let Some((source, target)) = volume.split_once(':') else {
             return Err(anyhow!("Job {} has an invalid volume entry '{}'", job_name, volume));
         };
-        writeln!(deploy_sh, "  --mount \"type=bind,source={},target={}\" \\",
-            node_path(deployment_name, source), target)?;
+        writeln!(
+            deploy_sh,
+            "  --mount \"type=bind,source={},target={}\" \\",
+            node_path(deployment_name, source),
+            target
+        )?;
     }
 
     // `docker service create --entrypoint` overrides only the executable, so any
@@ -689,7 +776,12 @@ fn node_path(deployment_name: &str, path: &str) -> String {
     }
 }
 
-fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path, deploy_sh: &mut File, network_name: String) -> Result<()> {
+fn generate_nginx_standalone(
+    resolved_spec: &EnvironmentResolvedSpec,
+    output_dir: &Path,
+    deploy_sh: &mut File,
+    network_name: String,
+) -> Result<()> {
     if !resolved_spec.ingress.rules.is_empty() || !resolved_spec.ingress.redirects.is_empty() {
         let nginx_dir = output_dir.join("nginx");
         fs::create_dir_all(&nginx_dir)?;
@@ -698,7 +790,11 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
 
     writeln!(deploy_sh, "echo 'Starting Nginx ingress...'")?;
     writeln!(deploy_sh, "docker rm -f nginx-ingress || true")?;
-    write!(deploy_sh, "docker run -d --name nginx-ingress --network {}", network_name)?;
+    write!(
+        deploy_sh,
+        "docker run -d --name nginx-ingress --network {}",
+        network_name
+    )?;
     write!(deploy_sh, " -p 80:80")?;
 
     let has_tls = resolved_spec.ingress.tls.is_some();
@@ -706,7 +802,10 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
         write!(deploy_sh, " -p 443:443")?;
     }
 
-    write!(deploy_sh, " -v $(pwd)/nginx/default.conf:/etc/nginx/conf.d/default.conf")?;
+    write!(
+        deploy_sh,
+        " -v $(pwd)/nginx/default.conf:/etc/nginx/conf.d/default.conf"
+    )?;
 
     if has_tls {
         fs::create_dir_all(output_dir.join("certs"))?;
@@ -729,7 +828,10 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
             writeln!(certbot_sh, "docker run -it --rm --name certbot \\")?;
             writeln!(certbot_sh, "  -v $(pwd)/letsencrypt:/var/www/letsencrypt \\")?;
             writeln!(certbot_sh, "  -v $(pwd)/certs:/etc/nginx/certs \\")?;
-            writeln!(certbot_sh, "  certbot/certbot certonly --webroot --webroot-path=/var/www/letsencrypt \\")?;
+            writeln!(
+                certbot_sh,
+                "  certbot/certbot certonly --webroot --webroot-path=/var/www/letsencrypt \\"
+            )?;
             writeln!(certbot_sh, "  --email {} --agree-tos --no-eff-email \\", le.email)?;
             // One certificate covers every domain, so pin the lineage name
             // rather than letting it default to whichever domain comes first —
@@ -747,7 +849,11 @@ fn generate_nginx_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir
     Ok(())
 }
 
-fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &Path, network_name: String) -> Result<()> {
+fn generate_nginx_swarm(
+    resolved_spec: &EnvironmentResolvedSpec,
+    ingress_dir: &Path,
+    network_name: String,
+) -> Result<()> {
     if resolved_spec.ingress.rules.is_empty() && resolved_spec.ingress.redirects.is_empty() {
         return Ok(());
     }
@@ -755,7 +861,7 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
     let nginx_conf_dir = ingress_dir.join("nginx");
     fs::create_dir_all(&nginx_conf_dir)?;
     generate_nginx_config(&resolved_spec.ingress, &nginx_conf_dir.join("default.conf"))?;
-    
+
     let mut stack = File::create(ingress_dir.join("docker-compose.yaml"))?;
     writeln!(stack, "version: '3.8'")?;
     writeln!(stack, "services:")?;
@@ -768,20 +874,20 @@ fn generate_nginx_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &P
     }
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf")?;
-    
+
     if resolved_spec.ingress.tls.is_some() {
-         // We assume certs are placed in output_dir/certs -> so from ingress/docker-compose.yaml, it is ../certs
-         // Wait, the structure is output_dir/ingress/docker-compose.yaml
-         // So ../certs is output_dir/certs
-         writeln!(stack, "      - ../certs:/etc/nginx/certs")?;
-         
-         if let Some(tls) = &resolved_spec.ingress.tls {
+        // We assume certs are placed in output_dir/certs -> so from ingress/docker-compose.yaml, it is ../certs
+        // Wait, the structure is output_dir/ingress/docker-compose.yaml
+        // So ../certs is output_dir/certs
+        writeln!(stack, "      - ../certs:/etc/nginx/certs")?;
+
+        if let Some(tls) = &resolved_spec.ingress.tls {
             if tls.letsencrypt.is_some() {
-                 writeln!(stack, "      - ../letsencrypt:/var/www/letsencrypt")?;
+                writeln!(stack, "      - ../letsencrypt:/var/www/letsencrypt")?;
             }
-         }
+        }
     }
-    
+
     write_swarm_compose_network(&mut stack, &network_name)?;
 
     Ok(())
@@ -806,11 +912,14 @@ fn certificate_domains(ingress: &IngressResolvedSpec) -> Vec<&String> {
 /// the redirect-only ones included — read the same files. Without it each domain
 /// is expected to bring its own certificate.
 fn nginx_cert_lineage<'a>(ingress: &'a IngressResolvedSpec, domain: &'a str) -> &'a str {
-    let uses_letsencrypt = ingress.tls.as_ref().map_or(false, |t| t.letsencrypt.is_some());
+    let uses_letsencrypt = ingress.tls.as_ref().is_some_and(|t| t.letsencrypt.is_some());
     if !uses_letsencrypt {
         return domain;
     }
-    certificate_domains(ingress).first().map(|d| d.as_str()).unwrap_or(domain)
+    certificate_domains(ingress)
+        .first()
+        .map(|d| d.as_str())
+        .unwrap_or(domain)
 }
 
 fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<()> {
@@ -824,8 +933,7 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
     // but the first, dropping those routes, so merge every rule's services under
     // a single server block per domain. `domains` preserves first-seen order.
     let mut domains: Vec<&String> = Vec::new();
-    let mut services_by_domain: HashMap<&String, Vec<&crate::resolved_spec::IngressToServiceRule>> =
-        HashMap::new();
+    let mut services_by_domain: HashMap<&String, Vec<&crate::resolved_spec::IngressToServiceRule>> = HashMap::new();
     for rule in &ingress.rules {
         if !services_by_domain.contains_key(&rule.domain_name) {
             domains.push(&rule.domain_name);
@@ -861,13 +969,20 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
             writeln!(file, "    listen 443 ssl;")?;
             writeln!(file, "    server_name {};", domain)?;
             let lineage = nginx_cert_lineage(ingress, domain);
-            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", lineage)?;
-            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", lineage)?;
+            writeln!(
+                file,
+                "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;",
+                lineage
+            )?;
+            writeln!(
+                file,
+                "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;",
+                lineage
+            )?;
 
             generate_locations(&mut file, services)?;
 
             writeln!(file, "}}")?;
-
         } else {
             generate_locations(&mut file, services)?;
             writeln!(file, "}}")?;
@@ -885,7 +1000,7 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
 /// mismatch before it ever sees the redirect.
 fn generate_nginx_redirects(file: &mut File, ingress: &IngressResolvedSpec) -> Result<()> {
     let has_tls = ingress.tls.is_some();
-    let uses_letsencrypt = ingress.tls.as_ref().map_or(false, |t| t.letsencrypt.is_some());
+    let uses_letsencrypt = ingress.tls.as_ref().is_some_and(|t| t.letsencrypt.is_some());
 
     for redirect in &ingress.redirects {
         let target = redirect.target_url(has_tls);
@@ -913,8 +1028,16 @@ fn generate_nginx_redirects(file: &mut File, ingress: &IngressResolvedSpec) -> R
             writeln!(file, "    listen 443 ssl;")?;
             writeln!(file, "    server_name {};", redirect.from_domain)?;
             let lineage = nginx_cert_lineage(ingress, &redirect.from_domain);
-            writeln!(file, "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;", lineage)?;
-            writeln!(file, "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;", lineage)?;
+            writeln!(
+                file,
+                "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;",
+                lineage
+            )?;
+            writeln!(
+                file,
+                "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;",
+                lineage
+            )?;
             writeln!(file, "    return {} {}$request_uri;", code, target)?;
             writeln!(file, "}}")?;
         }
@@ -923,10 +1046,7 @@ fn generate_nginx_redirects(file: &mut File, ingress: &IngressResolvedSpec) -> R
     Ok(())
 }
 
-fn generate_locations(
-    file: &mut File,
-    services: &[&crate::resolved_spec::IngressToServiceRule],
-) -> Result<()> {
+fn generate_locations(file: &mut File, services: &[&crate::resolved_spec::IngressToServiceRule]) -> Result<()> {
     for svc in services {
         let prefix = &svc.prefix;
         let location_path = if prefix.ends_with('/') {
@@ -934,7 +1054,7 @@ fn generate_locations(
         } else {
             format!("{}/", prefix)
         };
-        
+
         writeln!(file, "    location {} {{", location_path)?;
 
         // Per-location, so two services behind the same domain can differ.
@@ -947,17 +1067,25 @@ fn generate_locations(
         } else {
             writeln!(file, "        proxy_pass http://{}:{};", svc.service_name, svc.port)?;
         }
-        
+
         writeln!(file, "        proxy_set_header Host $host;")?;
         writeln!(file, "        proxy_set_header X-Real-IP $remote_addr;")?;
-        writeln!(file, "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")?;
+        writeln!(
+            file,
+            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+        )?;
         writeln!(file, "        proxy_set_header X-Forwarded-Proto $scheme;")?;
         writeln!(file, "    }}")?;
     }
     Ok(())
 }
 
-fn generate_traefik_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path, deploy_sh: &mut File, network_name: String) -> Result<()> {
+fn generate_traefik_standalone(
+    resolved_spec: &EnvironmentResolvedSpec,
+    output_dir: &Path,
+    deploy_sh: &mut File,
+    network_name: String,
+) -> Result<()> {
     let traefik_dir = output_dir.join("traefik");
     fs::create_dir_all(&traefik_dir)?;
 
@@ -971,15 +1099,22 @@ fn generate_traefik_standalone(resolved_spec: &EnvironmentResolvedSpec, output_d
 
     writeln!(deploy_sh, "echo 'Starting Traefik ingress...'")?;
     writeln!(deploy_sh, "docker rm -f traefik-ingress || true")?;
-    
-    write!(deploy_sh, "docker run -d --name traefik-ingress --network {}", network_name)?;
+
+    write!(
+        deploy_sh,
+        "docker run -d --name traefik-ingress --network {}",
+        network_name
+    )?;
     write!(deploy_sh, " -p 80:80")?;
     if has_tls {
         write!(deploy_sh, " -p 443:443")?;
     }
 
     write!(deploy_sh, " -v $(pwd)/traefik/traefik.yml:/etc/traefik/traefik.yml")?;
-    write!(deploy_sh, " -v $(pwd)/traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml")?;
+    write!(
+        deploy_sh,
+        " -v $(pwd)/traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml"
+    )?;
 
     if letsencrypt.is_some() {
         let le_dir = output_dir.join("letsencrypt");
@@ -993,7 +1128,11 @@ fn generate_traefik_standalone(resolved_spec: &EnvironmentResolvedSpec, output_d
     Ok(())
 }
 
-fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: &Path, network_name: String) -> Result<()> {
+fn generate_traefik_swarm(
+    resolved_spec: &EnvironmentResolvedSpec,
+    ingress_dir: &Path,
+    network_name: String,
+) -> Result<()> {
     let traefik_dir = ingress_dir.join("traefik");
     fs::create_dir_all(&traefik_dir)?;
 
@@ -1002,7 +1141,9 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
     if letsencrypt.is_none() {
-        return Err(anyhow!("Currently swarm ingress only supports Let's Encrypt, specify a letsencrypt block in ingress.tls"));
+        return Err(anyhow!(
+            "Currently swarm ingress only supports Let's Encrypt, specify a letsencrypt block in ingress.tls"
+        ));
     }
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
@@ -1022,8 +1163,11 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
     }
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./traefik/traefik.yml:/etc/traefik/traefik.yml")?;
-    writeln!(stack, "      - ./traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml")?;
-    
+    writeln!(
+        stack,
+        "      - ./traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml"
+    )?;
+
     // Mount letsencrypt if needed. Using ../letsencrypt as in nginx
     if letsencrypt.is_some() {
         writeln!(stack, "      - ../letsencrypt:/letsencrypt")?;
@@ -1036,7 +1180,11 @@ fn generate_traefik_swarm(resolved_spec: &EnvironmentResolvedSpec, ingress_dir: 
     Ok(())
 }
 
-fn write_traefik_static_config(file: &mut File, has_tls: bool, letsencrypt: Option<&LetsEncryptResolvedSpec>) -> Result<()> {
+fn write_traefik_static_config(
+    file: &mut File,
+    has_tls: bool,
+    letsencrypt: Option<&LetsEncryptResolvedSpec>,
+) -> Result<()> {
     writeln!(file, "entryPoints:")?;
     writeln!(file, "  web:")?;
     writeln!(file, "    address: \":80\"")?;
@@ -1087,28 +1235,28 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
     let use_le = ingress.tls.as_ref().map(|t| t.letsencrypt.is_some()).unwrap_or(false);
 
     writeln!(file, "http:")?;
-    
+
     let mut middlewares_written = false;
-     // The same domain can appear in more than one rule (e.g. declared under
-     // multiple host groups), so every generated name must include the rule
-     // index `i` in addition to the service index `j`; using only the domain and
-     // `j` would emit duplicate YAML keys that Traefik rejects.
-     for (i, rule) in ingress.rules.iter().enumerate() {
-         let router_name_base = rule.domain_name.replace(".", "-");
-         for (j, svc) in rule.services.iter().enumerate() {
-             if svc.strip_prefix && svc.prefix != "/" {
-                 if !middlewares_written {
-                     writeln!(file, "  middlewares:")?;
-                     middlewares_written = true;
-                 }
-                 writeln!(file, "    strip-{}-{}-{}:", router_name_base, i, j)?;
-                 writeln!(file, "      stripPrefix:")?;
-                 writeln!(file, "        prefixes:")?;
-                 writeln!(file, "          - \"{}\"", svc.prefix)?;
-             }
-         }
+    // The same domain can appear in more than one rule (e.g. declared under
+    // multiple host groups), so every generated name must include the rule
+    // index `i` in addition to the service index `j`; using only the domain and
+    // `j` would emit duplicate YAML keys that Traefik rejects.
+    for (i, rule) in ingress.rules.iter().enumerate() {
+        let router_name_base = rule.domain_name.replace(".", "-");
+        for (j, svc) in rule.services.iter().enumerate() {
+            if svc.strip_prefix && svc.prefix != "/" {
+                if !middlewares_written {
+                    writeln!(file, "  middlewares:")?;
+                    middlewares_written = true;
+                }
+                writeln!(file, "    strip-{}-{}-{}:", router_name_base, i, j)?;
+                writeln!(file, "      stripPrefix:")?;
+                writeln!(file, "        prefixes:")?;
+                writeln!(file, "          - \"{}\"", svc.prefix)?;
+            }
+        }
     }
-    
+
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
         for (j, svc) in rule.services.iter().enumerate() {
@@ -1144,45 +1292,45 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
     writeln!(file, "  routers:")?;
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
-        
+
         for (j, svc) in rule.services.iter().enumerate() {
-             let router_name = format!("{}-{}-{}", router_name_base, i, j);
-             writeln!(file, "    {}:", router_name)?;
-             
-             let path_rule = if svc.prefix == "/" {
-                 String::new()
-             } else {
-                 format!(" && PathPrefix(`{}`)", svc.prefix)
-             };
-             
-             writeln!(file, "      rule: \"Host(`{}`){}\"", rule.domain_name, path_rule)?;
-             writeln!(file, "      service: service-{}-{}-{}", router_name_base, i, j)?;
-             
-             if has_tls {
-                 writeln!(file, "      entryPoints:")?;
-                 writeln!(file, "        - websecure")?;
-                 writeln!(file, "      tls:")?;
-                 if use_le {
-                     writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
-                 }
-             } else {
-                 writeln!(file, "      entryPoints:")?;
-                 writeln!(file, "        - web")?;
-             }
-             
-             let strips = svc.strip_prefix && svc.prefix != "/";
-             if strips || svc.body_limit.is_some() {
-                  writeln!(file, "      middlewares:")?;
-                  if strips {
-                      writeln!(file, "        - strip-{}-{}-{}", router_name_base, i, j)?;
-                  }
-                  if svc.body_limit.is_some() {
-                      writeln!(file, "        - limit-{}-{}-{}", router_name_base, i, j)?;
-                  }
-             }
+            let router_name = format!("{}-{}-{}", router_name_base, i, j);
+            writeln!(file, "    {}:", router_name)?;
+
+            let path_rule = if svc.prefix == "/" {
+                String::new()
+            } else {
+                format!(" && PathPrefix(`{}`)", svc.prefix)
+            };
+
+            writeln!(file, "      rule: \"Host(`{}`){}\"", rule.domain_name, path_rule)?;
+            writeln!(file, "      service: service-{}-{}-{}", router_name_base, i, j)?;
+
+            if has_tls {
+                writeln!(file, "      entryPoints:")?;
+                writeln!(file, "        - websecure")?;
+                writeln!(file, "      tls:")?;
+                if use_le {
+                    writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
+                }
+            } else {
+                writeln!(file, "      entryPoints:")?;
+                writeln!(file, "        - web")?;
+            }
+
+            let strips = svc.strip_prefix && svc.prefix != "/";
+            if strips || svc.body_limit.is_some() {
+                writeln!(file, "      middlewares:")?;
+                if strips {
+                    writeln!(file, "        - strip-{}-{}-{}", router_name_base, i, j)?;
+                }
+                if svc.body_limit.is_some() {
+                    writeln!(file, "        - limit-{}-{}-{}", router_name_base, i, j)?;
+                }
+            }
         }
     }
-    
+
     for redirect in &ingress.redirects {
         let name = traefik_redirect_name(&redirect.from_domain);
         writeln!(file, "    {}:", name)?;
@@ -1209,10 +1357,14 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
         for (j, svc) in rule.services.iter().enumerate() {
-             writeln!(file, "    service-{}-{}-{}:", router_name_base, i, j)?;
-             writeln!(file, "      loadBalancer:")?;
-             writeln!(file, "        servers:")?;
-             writeln!(file, "          - url: \"http://{}_{}:{}/\"", svc.deployment_name,  svc.service_name, svc.port)?;
+            writeln!(file, "    service-{}-{}-{}:", router_name_base, i, j)?;
+            writeln!(file, "      loadBalancer:")?;
+            writeln!(file, "        servers:")?;
+            writeln!(
+                file,
+                "          - url: \"http://{}_{}:{}/\"",
+                svc.deployment_name, svc.service_name, svc.port
+            )?;
         }
     }
 
@@ -1230,14 +1382,20 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
 
 /// Traefik router/middleware names may not contain dots.
 fn traefik_redirect_name(from_domain: &str) -> String {
-    format!("redirect-{}", from_domain.replace('.', "-").replace(':', "-"))
+    format!("redirect-{}", from_domain.replace(['.', ':'], "-"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolved_spec::{ConfigResolvedFile, ConfigResolvedSpec, DeploymentResolvedSpec, IngressRule, IngressToServiceRule, IngressTlsResolvedSpec, RedirectRule, SecretResolvedSpec, SecretResolvedValue, ServiceResolvedSpec};
-    use crate::spec::{AwsSecretRef, DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec, ServiceConfigOption, ServiceSecret, ServiceType};
+    use crate::resolved_spec::{
+        ConfigResolvedFile, ConfigResolvedSpec, DeploymentResolvedSpec, IngressRule, IngressTlsResolvedSpec,
+        IngressToServiceRule, RedirectRule, SecretResolvedSpec, SecretResolvedValue, ServiceResolvedSpec,
+    };
+    use crate::spec::{
+        AwsSecretRef, DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec,
+        ServiceConfigOption, ServiceSecret, ServiceType,
+    };
 
     fn service(name: &str, service_type: ServiceType, depends_on: &[&str]) -> ServiceResolvedSpec {
         ServiceResolvedSpec {
@@ -1245,7 +1403,6 @@ mod tests {
             is_app_service: true,
             full_name: name.to_string(),
             image: format!("registry.example.com/{}:1.0.0", name),
-            service_host: "example.com".to_string(),
             environment_variables: vec![],
             undockerized_environment_variables: vec![],
             configs: vec![],
@@ -1262,8 +1419,12 @@ mod tests {
     }
 
     fn with_secrets(mut service: ServiceResolvedSpec, secrets: &[(&str, SecretMount)]) -> ServiceResolvedSpec {
-        service.secrets = secrets.iter()
-            .map(|(name, mount)| ServiceSecret { name: name.to_string(), mount: mount.clone() })
+        service.secrets = secrets
+            .iter()
+            .map(|(name, mount)| ServiceSecret {
+                name: name.to_string(),
+                mount: mount.clone(),
+            })
             .collect();
         service
     }
@@ -1281,7 +1442,11 @@ mod tests {
     fn healthy(mut service: ServiceResolvedSpec) -> ServiceResolvedSpec {
         service.healthcheck = Some(Healthcheck {
             test: HealthcheckTest::Shell("pg_isready".to_string()),
-            interval: None, timeout: None, retries: None, start_period: None, disable: false,
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+            disable: false,
         });
         service
     }
@@ -1306,8 +1471,14 @@ mod tests {
                 secrets: vec![],
                 defaults: ResourcesSpec {
                     replicas: 1,
-                    requests: ResourceLimits { memory: "128Mi".to_string(), cpu: "100m".to_string() },
-                    limits: ResourceLimits { memory: "256Mi".to_string(), cpu: "200m".to_string() },
+                    requests: ResourceLimits {
+                        memory: "128Mi".to_string(),
+                        cpu: "100m".to_string(),
+                    },
+                    limits: ResourceLimits {
+                        memory: "256Mi".to_string(),
+                        cpu: "200m".to_string(),
+                    },
                 },
                 services,
                 volumes: vec![],
@@ -1346,14 +1517,17 @@ mod tests {
             domains: vec!["somesite.com".to_string()],
             rules: vec![IngressRule {
                 domain_name: "somesite.com".to_string(),
-                services: limits.iter().map(|(name, prefix, limit)| IngressToServiceRule {
-                    service_name: name.to_string(),
-                    deployment_name: "prod".to_string(),
-                    port: 80,
-                    prefix: prefix.to_string(),
-                    strip_prefix: false,
-                    body_limit: *limit,
-                }).collect(),
+                services: limits
+                    .iter()
+                    .map(|(name, prefix, limit)| IngressToServiceRule {
+                        service_name: name.to_string(),
+                        deployment_name: "prod".to_string(),
+                        port: 80,
+                        prefix: prefix.to_string(),
+                        strip_prefix: false,
+                        body_limit: *limit,
+                    })
+                    .collect(),
             }],
             redirects: vec![],
         }
@@ -1423,7 +1597,11 @@ mod tests {
         let conf = write_config(&ingress_with_redirect(None), false);
 
         assert!(conf.contains("server_name somesite.com;"), "{}", conf);
-        assert!(conf.contains("return 301 http://www.somesite.com$request_uri;"), "{}", conf);
+        assert!(
+            conf.contains("return 301 http://www.somesite.com$request_uri;"),
+            "{}",
+            conf
+        );
         // The redirect source carries no routes of its own.
         assert!(!conf.contains("proxy_pass http://api:80/;"), "{}", conf);
     }
@@ -1436,9 +1614,17 @@ mod tests {
         // mismatch before it ever sees the redirect.
         // certbot issues one certificate for every domain, so the redirect's
         // server block reads the same lineage as the served host.
-        assert!(conf.contains("ssl_certificate /etc/nginx/certs/live/www.somesite.com/fullchain.pem;"), "{}", conf);
+        assert!(
+            conf.contains("ssl_certificate /etc/nginx/certs/live/www.somesite.com/fullchain.pem;"),
+            "{}",
+            conf
+        );
         assert!(!conf.contains("live/somesite.com/"), "{}", conf);
-        assert!(conf.contains("return 301 https://www.somesite.com$request_uri;"), "{}", conf);
+        assert!(
+            conf.contains("return 301 https://www.somesite.com$request_uri;"),
+            "{}",
+            conf
+        );
         // The ACME challenge has to stay on plain HTTP or the certificate for
         // this domain can never be issued.
         let plain = conf.split("listen 443 ssl;").next().unwrap();
@@ -1450,11 +1636,19 @@ mod tests {
         let conf = write_config(&ingress_with_redirect(Some(letsencrypt_tls())), true);
 
         assert!(conf.contains("    redirect-somesite-com:"), "{}", conf);
-        assert!(conf.contains("        replacement: \"https://www.somesite.com/${1}\""), "{}", conf);
+        assert!(
+            conf.contains("        replacement: \"https://www.somesite.com/${1}\""),
+            "{}",
+            conf
+        );
         assert!(conf.contains("        permanent: true"), "{}", conf);
         assert!(conf.contains("      rule: \"Host(`somesite.com`)\""), "{}", conf);
         // Redirect-only routers still have to name a backend.
-        assert!(conf.contains(&format!("      service: {}", TRAEFIK_REDIRECT_SERVICE)), "{}", conf);
+        assert!(
+            conf.contains(&format!("      service: {}", TRAEFIK_REDIRECT_SERVICE)),
+            "{}",
+            conf
+        );
         assert!(conf.contains(&format!("    {}:", TRAEFIK_REDIRECT_SERVICE)), "{}", conf);
     }
 
@@ -1487,7 +1681,10 @@ mod tests {
 
     fn generate_swarm_to_temp(spec: &EnvironmentResolvedSpec) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: true };
+        let docker_spec = DockerSpecificSpec {
+            ingress_type: DockerIngressType::Nginx,
+            swarm_mode: true,
+        };
         generate(spec, &docker_spec, dir.path()).unwrap();
         let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
         (dir, script)
@@ -1514,13 +1711,20 @@ mod tests {
         let (dir, script) = generate_swarm_to_temp(&spec);
 
         // Phase 1 brings up only the job's dependency and waits for convergence.
-        let phase1 = script.find("docker stack deploy -c prod/docker-compose.deps.yaml prod --with-registry-auth --detach=false").unwrap();
+        let phase1 = script
+            .find("docker stack deploy -c prod/docker-compose.deps.yaml prod --with-registry-auth --detach=false")
+            .unwrap();
         // The deps-only subset must not prune, or phase 3 would have to bring
         // back every service it removed.
         assert!(!script.contains("docker-compose.deps.yaml prod --with-registry-auth --prune"));
         let job = script.find("run_job 'prod_migrate'").unwrap();
-        let phase3 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune\n").unwrap();
-        assert!(phase1 < job && job < phase3, "phases must be ordered deps -> job -> stack");
+        let phase3 = script
+            .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune\n")
+            .unwrap();
+        assert!(
+            phase1 < job && job < phase3,
+            "phases must be ordered deps -> job -> stack"
+        );
 
         // The dependency stack file holds the database only.
         let deps = fs::read_to_string(dir.path().join("prod").join(DEPS_COMPOSE_FILE)).unwrap();
@@ -1550,7 +1754,9 @@ mod tests {
 
         // Nothing declared, so everything long-running is a prerequisite: phase 1
         // deploys the full stack file and phase 3 has nothing left to do.
-        let phase1 = script.find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false").unwrap();
+        let phase1 = script
+            .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false")
+            .unwrap();
         let job = script.find("run_job 'prod_migrate'").unwrap();
         assert!(phase1 < job);
         assert!(script.contains("All services were started in phase 1"));
@@ -1578,7 +1784,10 @@ mod tests {
             healthy(service("primary-db", ServiceType::Internal, &[])),
             service("migrate", ServiceType::Job, &["primary-db"]),
         ]);
-        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            ingress_type: DockerIngressType::Nginx,
+            swarm_mode: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -1621,7 +1830,10 @@ mod tests {
             name: "shop-tls_key".to_string(),
             value: SecretResolvedValue::Literal("pem".to_string()),
         }];
-        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            ingress_type: DockerIngressType::Nginx,
+            swarm_mode: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -1647,7 +1859,10 @@ mod tests {
             service("api", ServiceType::Public, &[]),
             &[
                 ("shop-db_password", SecretMount::EnvVariable("DB_PASSWORD".to_string())),
-                ("shop-tls_key", SecretMount::FilePath("/run/secrets/tls.key".to_string())),
+                (
+                    "shop-tls_key",
+                    SecretMount::FilePath("/run/secrets/tls.key".to_string()),
+                ),
             ],
         )]);
         spec.current_deployment.secrets = vec![
@@ -1712,7 +1927,10 @@ mod tests {
                 value: SecretResolvedValue::Literal("k3y".to_string()),
             },
         ];
-        let docker_spec = DockerSpecificSpec { ingress_type: DockerIngressType::Nginx, swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            ingress_type: DockerIngressType::Nginx,
+            swarm_mode: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();

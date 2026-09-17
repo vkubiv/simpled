@@ -5,7 +5,7 @@
 //! guides into the binary means `simpled docs ...` is always the same distance away as
 //! `--help`, and an agent can look up a field without leaving the shell.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -144,9 +144,7 @@ fn slice(content: &str, start: usize, end: usize) -> String {
 fn without_trailing_rule(text: &str) -> &str {
     let trimmed = text.trim_end();
     match trimmed.rsplit_once('\n') {
-        Some((head, last)) if last.trim().len() >= 3 && last.trim().chars().all(|c| c == '-') => {
-            head.trim_end()
-        }
+        Some((head, last)) if last.trim().len() >= 3 && last.trim().chars().all(|c| c == '-') => head.trim_end(),
         _ => trimmed,
     }
 }
@@ -226,18 +224,9 @@ pub fn search(query: &str) -> Result<()> {
             }
             // Report the innermost section the hit falls inside, so the reference the
             // caller gets back is the narrowest one they can print.
-            let owner = all
-                .iter()
-                .filter(|s| i >= s.start && i < s.end)
-                .max_by_key(|s| s.level);
+            let owner = all.iter().filter(|s| i >= s.start && i < s.end).max_by_key(|s| s.level);
             match owner {
-                Some(s) => println!(
-                    "{}#{}\n  {}: {}",
-                    topic.name,
-                    s.anchor,
-                    i + 1,
-                    line.trim()
-                ),
+                Some(s) => println!("{}#{}\n  {}: {}", topic.name, s.anchor, i + 1, line.trim()),
                 None => println!("{}\n  {}: {}", topic.name, i + 1, line.trim()),
             }
             total += 1;
@@ -246,9 +235,15 @@ pub fn search(query: &str) -> Result<()> {
 
     if total == 0 {
         println!("No matches for '{}'.", query);
-        println!("Topics searched: {}", TOPICS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
+        println!(
+            "Topics searched: {}",
+            TOPICS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
+        );
     } else {
-        println!("\n{} match(es). Print a section with: simpled docs <topic> --section <name>", total);
+        println!(
+            "\n{} match(es). Print a section with: simpled docs <topic> --section <name>",
+            total
+        );
     }
     Ok(())
 }
@@ -279,7 +274,10 @@ pub fn init_agent(path: Option<&str>, force: bool, stdout: bool) -> Result<()> {
     fs::create_dir_all(&dir)?;
     fs::write(&file, body)?;
     println!("Wrote {}", file.display());
-    println!("Agents working in {} will now find simpled's documentation.", display_root(&root));
+    println!(
+        "Agents working in {} will now find simpled's documentation.",
+        display_root(&root)
+    );
     Ok(())
 }
 
@@ -287,11 +285,7 @@ fn display_root(root: &Path) -> String {
     match root.canonicalize() {
         // Windows canonicalization returns an extended-length path; the `\\?\` prefix is
         // correct but nobody wants to read it back.
-        Ok(p) => p
-            .display()
-            .to_string()
-            .trim_start_matches(r"\\?\")
-            .to_string(),
+        Ok(p) => p.display().to_string().trim_start_matches(r"\\?\").to_string(),
         Err(_) => root.display().to_string(),
     }
 }
@@ -342,10 +336,7 @@ mod tests {
     #[test]
     fn a_trailing_horizontal_rule_is_dropped() {
         assert_eq!(without_trailing_rule("body\n\n---\n"), "body");
-        assert_eq!(
-            without_trailing_rule("body\n--- not a rule\n"),
-            "body\n--- not a rule"
-        );
+        assert_eq!(without_trailing_rule("body\n--- not a rule\n"), "body\n--- not a rule");
         assert_eq!(without_trailing_rule("body"), "body");
     }
 

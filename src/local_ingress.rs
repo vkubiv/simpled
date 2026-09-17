@@ -1,15 +1,15 @@
 use crate::resolved_spec::*;
 use anyhow::{anyhow, Context, Result};
-use std::collections::BTreeMap;
-use std::net::TcpListener as StdTcpListener;
-use std::process::{self, Command};
-use std::thread;
 use axum::extract::Request;
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::Router;
 use axum_reverse_proxy::ReverseProxy;
+use std::collections::BTreeMap;
+use std::net::TcpListener as StdTcpListener;
+use std::process::{self, Command};
+use std::thread;
 
 /// A local gateway domain is written as "hostname" or "hostname:port".
 fn split_domain(domain: &str) -> (&str, u16) {
@@ -65,13 +65,7 @@ fn is_root_prefix(prefix: &str) -> bool {
 /// its length is passed through: the local gateway is here to reproduce the
 /// limit a developer will hit in production, not to police the dev machine.
 fn body_limit_exceeded(limits: &[LocalBodyLimit], req: &Request) -> Option<StatusCode> {
-    let declared: u64 = req
-        .headers()
-        .get(header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()?;
+    let declared: u64 = req.headers().get(header::CONTENT_LENGTH)?.to_str().ok()?.parse().ok()?;
 
     let path = req.uri().path();
     let limit = limits
@@ -117,10 +111,7 @@ async fn apply_redirects(
     req: Request,
     next: Next,
 ) -> axum::response::Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok());
+    let host = req.headers().get(header::HOST).and_then(|value| value.to_str().ok());
 
     if let Some((status, location)) = redirect_response(&redirects, host, req.uri()) {
         return (status, [(header::LOCATION, location)]).into_response();
@@ -217,8 +208,7 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
                 });
             }
 
-            let (app, root_fallback_set) =
-                routers.entry(port).or_insert_with(|| (Router::new(), false));
+            let (app, root_fallback_set) = routers.entry(port).or_insert_with(|| (Router::new(), false));
 
             if is_root_prefix(&svc.prefix) {
                 if *root_fallback_set {
@@ -288,10 +278,7 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
     thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
-            Err(e) => shutdown_stack_and_exit(&format!(
-                "Failed to create tokio runtime for local ingress: {}",
-                e
-            )),
+            Err(e) => shutdown_stack_and_exit(&format!("Failed to create tokio runtime for local ingress: {}", e)),
         };
 
         rt.block_on(async move {
@@ -309,10 +296,7 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
                 println!("Local ingress listening on {}", bind_addr);
                 handles.push(tokio::spawn(async move {
                     if let Err(e) = axum::serve(listener, app).await {
-                        shutdown_stack_and_exit(&format!(
-                            "Error serving ingress on {}: {}",
-                            bind_addr, e
-                        ));
+                        shutdown_stack_and_exit(&format!("Error serving ingress on {}: {}", bind_addr, e));
                     }
                 }));
             }
@@ -371,8 +355,14 @@ mod tests {
 
     fn limits() -> Vec<LocalBodyLimit> {
         vec![
-            LocalBodyLimit { prefix: "/".to_string(), max_bytes: 1024 },
-            LocalBodyLimit { prefix: "/upload".to_string(), max_bytes: 1024 * 1024 },
+            LocalBodyLimit {
+                prefix: "/".to_string(),
+                max_bytes: 1024,
+            },
+            LocalBodyLimit {
+                prefix: "/upload".to_string(),
+                max_bytes: 1024 * 1024,
+            },
         ]
     }
 
@@ -387,7 +377,10 @@ mod tests {
     #[test]
     fn the_most_specific_prefix_sets_the_limit() {
         // /upload allows far more than the gateway-wide default on "/".
-        assert_eq!(body_limit_exceeded(&limits(), &request("/upload/file", Some(2048))), None);
+        assert_eq!(
+            body_limit_exceeded(&limits(), &request("/upload/file", Some(2048))),
+            None
+        );
         assert_eq!(
             body_limit_exceeded(&limits(), &request("/upload/file", Some(2 * 1024 * 1024))),
             Some(StatusCode::PAYLOAD_TOO_LARGE)
@@ -406,13 +399,19 @@ mod tests {
 
     #[test]
     fn a_zero_limit_means_no_limit() {
-        let unlimited = vec![LocalBodyLimit { prefix: "/".to_string(), max_bytes: 0 }];
+        let unlimited = vec![LocalBodyLimit {
+            prefix: "/".to_string(),
+            max_bytes: 0,
+        }];
         assert_eq!(body_limit_exceeded(&unlimited, &request("/api", Some(u64::MAX))), None);
     }
 
     #[test]
     fn a_route_without_a_limit_is_not_capped_by_another_route() {
-        let only_upload = vec![LocalBodyLimit { prefix: "/upload".to_string(), max_bytes: 16 }];
+        let only_upload = vec![LocalBodyLimit {
+            prefix: "/upload".to_string(),
+            max_bytes: 16,
+        }];
         assert_eq!(body_limit_exceeded(&only_upload, &request("/api", Some(4096))), None);
     }
 

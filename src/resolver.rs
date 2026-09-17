@@ -1,19 +1,21 @@
-use crate::spec::*;
-use crate::spec::EnvVariable;
 use crate::resolved_spec::*;
 use crate::secret_fetch;
-use anyhow::{Result, anyhow, Context};
-use std::collections::{HashSet, HashMap};
+use crate::spec::EnvVariable;
+use crate::spec::*;
+use anyhow::{anyhow, Context, Result};
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::Path;
-use std::env;
 
 pub fn resolve(
     env_spec: &DeploymentEnvironmentSpec,
     app_spec: &AppSpec,
-    deployment_name: &str
+    deployment_name: &str,
 ) -> Result<EnvironmentResolvedSpec> {
-    let deployment = env_spec.deployments.iter()
+    let deployment = env_spec
+        .deployments
+        .iter()
         .find(|d| d.name == deployment_name)
         .ok_or_else(|| anyhow!("Deployment {} not found", deployment_name))?;
 
@@ -24,16 +26,16 @@ pub fn resolve(
         for file_path in &config_spec.files {
             let path = Path::new(file_path);
             if !path.exists() {
-                 return Err(anyhow!("Config file not found: {:?}", file_path));
+                return Err(anyhow!("Config file not found: {:?}", file_path));
             }
             if path.is_dir() {
                 for entry in fs::read_dir(path)? {
                     let entry = entry?;
                     let path = entry.path();
                     if path.is_file() {
-                         let content = fs::read(&path).context(format!("Failed to read config file {:?}", path))?;
-                         let name = path.file_name().unwrap().to_string_lossy().to_string();
-                         resolved_files.push(ConfigResolvedFile { name, content });
+                        let content = fs::read(&path).context(format!("Failed to read config file {:?}", path))?;
+                        let name = path.file_name().unwrap().to_string_lossy().to_string();
+                        resolved_files.push(ConfigResolvedFile { name, content });
                     }
                 }
             } else {
@@ -71,7 +73,7 @@ pub fn resolve(
                     return Err(anyhow!("Secret file not found: {:?}", path_str));
                 }
                 SecretResolvedValue::Literal(
-                    fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?
+                    fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?,
                 )
             }
             DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
@@ -119,54 +121,49 @@ pub fn resolve(
         let defaults = &deployment.defaults;
 
         let empty_prefixes = Vec::new();
-        let (variant_name,  prefixes, _resources) =
-            if let Some(ds) = deployment_service_opt {
-             (
-                 ds.variant.as_deref().unwrap_or("default"),
-                 &ds.prefixes,
-                 &ds.resources
-             )
+        let (variant_name, prefixes, _resources) = if let Some(ds) = deployment_service_opt {
+            (ds.variant.as_deref().unwrap_or("default"), &ds.prefixes, &ds.resources)
         } else {
-             ("default",  &empty_prefixes, defaults)
+            ("default", &empty_prefixes, defaults)
         };
-
-
-
 
         let mut host_name = primary_host.clone();
         if let Some(deployment_service) = deployment_service_opt {
             host_name = deployment_service.host.clone().unwrap_or(primary_host.clone());
         }
 
-        let mut host_domain_name: &String;
-
-        let host = env_spec.ingress.hosts.iter()
-            .find(|host_spec| &(host_spec.name) == &host_name);
-
-        match host.and_then(|h| h.domain_names.first()) {
-            Some(host) => {
-                host_domain_name = host;
-            },
-            None =>return Err(anyhow!("Host {} not found in ingress spec", host_name)),
-        }
+        let host_domain_name: &String = env_spec
+            .ingress
+            .hosts
+            .iter()
+            .find(|host_spec| host_spec.name == host_name)
+            .and_then(|h| h.domain_names.first())
+            .ok_or_else(|| anyhow!("Host {} not found in ingress spec", host_name))?;
 
         let is_app_service = app_service.is_app_service;
 
         // Resolve Image
         let mut raw_image = match &app_service.image {
             ImageSpec::Exact(img) => img.clone(),
-            ImageSpec::Variants(variants) => variants.iter()
+            ImageSpec::Variants(variants) => variants
+                .iter()
                 .find(|v| v.variant_name == variant_name)
                 .map(|v| v.image.clone())
-                .ok_or_else(|| anyhow!("Image variant '{}' not found for service '{}'", variant_name, app_service.name))?,
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Image variant '{}' not found for service '{}'",
+                        variant_name,
+                        app_service.name
+                    )
+                })?,
         };
 
         if is_app_service {
-             if let DeploymentEnvType::Local = env_spec.env_type {
-                  raw_image = format!("{}:latest", raw_image);
-             } else {
-                  raw_image = format!("{}:{}", raw_image, version_to_tag(&app_spec.version.to_string()));
-             }
+            if let DeploymentEnvType::Local = env_spec.env_type {
+                raw_image = format!("{}:latest", raw_image);
+            } else {
+                raw_image = format!("{}:{}", raw_image, version_to_tag(&app_spec.version.to_string()));
+            }
         }
 
         if env_spec.env_type != DeploymentEnvType::Local && env_spec.registry.is_empty() {
@@ -182,17 +179,22 @@ pub fn resolve(
         // Check Public Service uniqueness
         if let ServiceType::Public = app_service.service_type {
             for prefix in prefixes {
-                 let key = (host_name.to_string(), prefix.prefix.clone());
-                 if !public_host_prefix_combinations.insert(key) {
-                     return Err(anyhow!("Duplicate host+prefix combination for public service {}: {}{}",
-                         app_service.name, host_name, prefix.prefix));
-                 }
+                let key = (host_name.to_string(), prefix.prefix.clone());
+                if !public_host_prefix_combinations.insert(key) {
+                    return Err(anyhow!(
+                        "Duplicate host+prefix combination for public service {}: {}{}",
+                        app_service.name,
+                        host_name,
+                        prefix.prefix
+                    ));
+                }
             }
         }
 
         // Resolve Environment Variables
         let use_tls = env_spec.ingress.tls.is_some();
-        let environment_variables = resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
+        let environment_variables =
+            resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
         let final_service_env_vars = filter_service_env_vars(app_service, app_spec, &environment_variables)?;
 
         // Resolve Undockerized Environment Variables
@@ -200,33 +202,43 @@ pub fn resolve(
         for override_var in &deployment_undockerized_environment {
             add_unique_var(&mut undockerized_values, override_var.clone());
         }
-        let undockerized_variables = resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
-        let final_undockerized_service_env_vars = filter_service_env_vars(app_service, app_spec, &undockerized_variables)?;
+        let undockerized_variables =
+            resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
+        let final_undockerized_service_env_vars =
+            filter_service_env_vars(app_service, app_spec, &undockerized_variables)?;
 
         // Resolve Configs
         let mut service_configs = Vec::new();
         for sc_opt in &app_service.configs {
-             let config_name = format!("{}-{}", app_spec.name, sc_opt.config_name);
-             if !resolved_configs.iter().any(|c| c.name == config_name) {
-                  return Err(anyhow!("Service {} references undefined config {}", app_service.name, config_name));
-             }
-             service_configs.push(ServiceConfigOption {
-                 config_name,
-                 mount_path: sc_opt.mount_path.clone(),
-             });
+            let config_name = format!("{}-{}", app_spec.name, sc_opt.config_name);
+            if !resolved_configs.iter().any(|c| c.name == config_name) {
+                return Err(anyhow!(
+                    "Service {} references undefined config {}",
+                    app_service.name,
+                    config_name
+                ));
+            }
+            service_configs.push(ServiceConfigOption {
+                config_name,
+                mount_path: sc_opt.mount_path.clone(),
+            });
         }
 
         // Resolve Secrets
         let mut service_secrets = Vec::new();
         for sec in &app_service.secrets {
-             let secret_name = format!("{}-{}", app_spec.name, sec.name);
-             if !resolved_secrets.iter().any(|s| s.name == secret_name) {
-                  return Err(anyhow!("Service {} references undefined secret {}", app_service.name, secret_name));
-             }
-             service_secrets.push(ServiceSecret {
-                 name: secret_name,
-                 mount: sec.mount.clone(),
-             });
+            let secret_name = format!("{}-{}", app_spec.name, sec.name);
+            if !resolved_secrets.iter().any(|s| s.name == secret_name) {
+                return Err(anyhow!(
+                    "Service {} references undefined secret {}",
+                    app_service.name,
+                    secret_name
+                ));
+            }
+            service_secrets.push(ServiceSecret {
+                name: secret_name,
+                mount: sec.mount.clone(),
+            });
         }
 
         // The deployment's volumes are appended to the service's own, so a
@@ -250,11 +262,10 @@ pub fn resolve(
         }
 
         resolved_services.push(ServiceResolvedSpec {
-            full_name: format!("{}", app_service.name),
+            full_name: app_service.name.to_string(),
             service_type: app_service.service_type.clone(),
             is_app_service,
             image,
-            service_host: host_domain_name.clone(),
             environment_variables: final_service_env_vars,
             undockerized_environment_variables: final_undockerized_service_env_vars,
             configs: service_configs,
@@ -269,9 +280,9 @@ pub fn resolve(
                 .or_else(|| app_service.entrypoint.clone()),
             healthcheck: app_service.healthcheck.clone(),
             depends_on: app_service.depends_on.clone(),
-            ports: deployment_service_opt.map(|s|
-                s.ports.clone()
-            ).unwrap_or(app_service.ports.clone()),
+            ports: deployment_service_opt
+                .map(|s| s.ports.clone())
+                .unwrap_or(app_service.ports.clone()),
             working_dir: deployment_service_opt.and_then(|s| s.working_dir.clone()),
         });
     }
@@ -316,35 +327,34 @@ pub fn resolve(
                 let mut dep_services: Vec<_> = dep.services.clone().unwrap_or_default().into_iter().collect();
                 dep_services.sort_by(|a, b| a.0.cmp(&b.0));
                 for (service_name, ds) in dep_services {
-                        let h = ds.host.clone().unwrap_or(dep_primary_host.clone());
-                        if &h == &host_spec.name {
-                            let full_name = format!("{}", service_name);
-                            // Determine port
-                            let port = if let Some(_) = ds.ports.iter().find(|p| p.external == 80) {
-                                80
-                            } else if let Some(p) = ds.ports.first() {
-                                p.external
-                            } else {
-                                80 // Default
-                            };
+                    let h = ds.host.clone().unwrap_or(dep_primary_host.clone());
+                    if h == host_spec.name {
+                        let full_name = service_name.to_string();
+                        // Determine port
+                        let port = if ds.ports.iter().find(|p| p.external == 80).is_some() {
+                            80
+                        } else if let Some(p) = ds.ports.first() {
+                            p.external
+                        } else {
+                            80 // Default
+                        };
 
-                            // A service's own limit wins over the gateway-wide
-                            // default; resolving it here means every generator
-                            // sees one effective number per route.
-                            let body_limit = ds.body_limit.or(env_spec.ingress.body_limit);
+                        // A service's own limit wins over the gateway-wide
+                        // default; resolving it here means every generator
+                        // sees one effective number per route.
+                        let body_limit = ds.body_limit.or(env_spec.ingress.body_limit);
 
-                            for prefix in &ds.prefixes {
-                                service_rules.push(IngressToServiceRule {
-                                    service_name: full_name.clone(),
-                                    deployment_name: dep.name.clone(),
-                                    port,
-                                    prefix: prefix.prefix.clone(),
-                                    strip_prefix: prefix.strip,
-                                    body_limit,
-                                });
-                            }
+                        for prefix in &ds.prefixes {
+                            service_rules.push(IngressToServiceRule {
+                                service_name: full_name.clone(),
+                                deployment_name: dep.name.clone(),
+                                port,
+                                prefix: prefix.prefix.clone(),
+                                strip_prefix: prefix.strip,
+                                body_limit,
+                            });
+                        }
                     }
-
                 }
             }
 
@@ -387,14 +397,13 @@ pub fn resolve(
     }
 
     let tls = if let Some(tls_spec) = &env_spec.ingress.tls {
-        let le_resolved = if let Some(le) = &tls_spec.letsencrypt {
-             Some(LetsEncryptResolvedSpec {
-                 server: le.server.clone().unwrap_or("https://acme-v02.api.letsencrypt.org/directory".to_string()),
-                 email: le.email.clone(),
-             })
-        } else {
-             None
-        };
+        let le_resolved = tls_spec.letsencrypt.as_ref().map(|le| LetsEncryptResolvedSpec {
+            server: le
+                .server
+                .clone()
+                .unwrap_or("https://acme-v02.api.letsencrypt.org/directory".to_string()),
+            email: le.email.clone(),
+        });
         Some(IngressTlsResolvedSpec {
             secret: tls_spec.secret.clone(),
             letsencrypt: le_resolved,
@@ -408,7 +417,10 @@ pub fn resolve(
     // Redirect sources are domains the gateway answers on without routing them to
     // a service, so they belong in `domains` (which drives the certificate) even
     // though they carry no rules.
-    let mut domains: Vec<String> = env_spec.ingress.hosts.iter()
+    let mut domains: Vec<String> = env_spec
+        .ingress
+        .hosts
+        .iter()
         .flat_map(|h| h.domain_names.clone())
         .collect();
     domains.extend(redirects.iter().map(|r| r.from_domain.clone()));
@@ -434,7 +446,9 @@ pub fn resolve(
 /// on that domain, and a source declared twice has no defined winner, so both are
 /// rejected here rather than silently resolved by whichever generator runs.
 fn resolve_redirects(ingress: &IngressSpec) -> Result<Vec<RedirectRule>> {
-    let served_domains: Vec<&str> = ingress.hosts.iter()
+    let served_domains: Vec<&str> = ingress
+        .hosts
+        .iter()
         .flat_map(|h| h.domain_names.iter().map(|d| d.as_str()))
         .collect();
 
@@ -453,7 +467,9 @@ fn resolve_redirects(ingress: &IngressSpec) -> Result<Vec<RedirectRule>> {
             if let Some(previous) = redirects.iter().find(|r| &r.from_domain == from) {
                 return Err(anyhow!(
                     "Gateway redirect source '{}' is declared twice (to '{}' and to '{}')",
-                    from, previous.to, redirect.to
+                    from,
+                    previous.to,
+                    redirect.to
                 ));
             }
             redirects.push(RedirectRule {
@@ -477,7 +493,11 @@ fn resolve_app_service_image(env_spec: &DeploymentEnvironmentSpec, raw_image: St
                 raw_image
             } else {
                 let available: Vec<_> = env_spec.registry.keys().collect();
-                return Err(anyhow!("Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}", namespace, available));
+                return Err(anyhow!(
+                    "Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}",
+                    namespace,
+                    available
+                ));
             }
         }
     } else {
@@ -499,11 +519,7 @@ fn add_unique_var(vars: &mut Vec<EnvVariable>, var: EnvVariable) {
 /// unknown secret is an error, as is referencing one in `deferred` — a secret
 /// whose value is only fetched on the deploy target, and so is not available to
 /// substitute into the env files written here.
-fn resolve_secret_refs(
-    input: &str,
-    secrets: &HashMap<String, String>,
-    deferred: &HashSet<String>,
-) -> Result<String> {
+fn resolve_secret_refs(input: &str, secrets: &HashMap<String, String>, deferred: &HashSet<String>) -> Result<String> {
     const MARKER: &str = "$secret(";
     let mut result = String::new();
     let mut last_end = 0;
@@ -519,12 +535,14 @@ fn resolve_secret_refs(
 
             match secrets.get(secret_name) {
                 Some(value) => result.push_str(value),
-                None if deferred.contains(secret_name) => return Err(anyhow!(
-                    "$secret({}) cannot be used: the secret has an 'aws' source, so its value is \
+                None if deferred.contains(secret_name) => {
+                    return Err(anyhow!(
+                        "$secret({}) cannot be used: the secret has an 'aws' source, so its value is \
                      only fetched on the deploy target and cannot be substituted into an env \
                      variable here. Mount it on the service with `variable:` instead.",
-                    secret_name
-                )),
+                        secret_name
+                    ))
+                }
                 None => return Err(anyhow!("Undefined secret reference: $secret({})", secret_name)),
             }
 
@@ -592,51 +610,71 @@ fn resolve_app_env_vars(
 
     // External
     for external in &app_spec.environment.external {
-         let val = deployment_values.iter()
-             .find(|e| e.name == external.name)
-             .map(|e| e.value.clone())
-             .or_else(|| external.default.clone());
+        let val = deployment_values
+            .iter()
+            .find(|e| e.name == external.name)
+            .map(|e| e.value.clone())
+            .or_else(|| external.default.clone());
 
-         if let Some(v) = val {
-              add_unique_var(&mut environment_variables, EnvVariable{ name: external.name.clone(), value:v });
-         } else {
-              return Err(anyhow!("Missing external env variable: {}", external.name));
-         }
+        if let Some(v) = val {
+            add_unique_var(
+                &mut environment_variables,
+                EnvVariable {
+                    name: external.name.clone(),
+                    value: v,
+                },
+            );
+        } else {
+            return Err(anyhow!("Missing external env variable: {}", external.name));
+        }
     }
 
     // Optional
     for optional in &app_spec.environment.optional {
-        let val = deployment_values.iter()
+        let val = deployment_values
+            .iter()
             .find(|e| e.name == optional.name)
             .map(|e| e.value.clone());
 
         if let Some(v) = val {
-            add_unique_var(&mut environment_variables, EnvVariable{ name: optional.name.clone(), value:v });
+            add_unique_var(
+                &mut environment_variables,
+                EnvVariable {
+                    name: optional.name.clone(),
+                    value: v,
+                },
+            );
         }
     }
 
     // Relative
     for relative in &app_spec.environment.relative {
-         if let Some(h) = host_domain_name {
-              let scheme = if use_tls { "https" } else { "http" };
-              let url = format!("{}://{}{}", scheme, h, relative.relative_value);
-              let value = resolve_variable_in_string(&url, &environment_variables)
-                  .context(format!("Failed to resolve relative env variable {}", relative.name))?;
-              add_unique_var(&mut environment_variables, EnvVariable{
-                  name:relative.name.clone(),
-                  value,
-              });
-         }
+        if let Some(h) = host_domain_name {
+            let scheme = if use_tls { "https" } else { "http" };
+            let url = format!("{}://{}{}", scheme, h, relative.relative_value);
+            let value = resolve_variable_in_string(&url, &environment_variables)
+                .context(format!("Failed to resolve relative env variable {}", relative.name))?;
+            add_unique_var(
+                &mut environment_variables,
+                EnvVariable {
+                    name: relative.name.clone(),
+                    value,
+                },
+            );
+        }
     }
 
     // Internal
     for internal in &app_spec.environment.internal {
         let value = resolve_variable_in_string(&internal.value, &environment_variables)
             .context(format!("Failed to resolve internal env variable {}", internal.name))?;
-        add_unique_var(&mut environment_variables, EnvVariable{
-            name: internal.name.clone(),
-            value,
-        });
+        add_unique_var(
+            &mut environment_variables,
+            EnvVariable {
+                name: internal.name.clone(),
+                value,
+            },
+        );
     }
 
     Ok(environment_variables)
@@ -665,12 +703,15 @@ fn referenced_var_names(input: &str) -> Vec<&str> {
 fn filter_service_env_vars(
     app_service: &ServiceSpec,
     app_spec: &AppSpec,
-    all_env_vars: &[EnvVariable]
+    all_env_vars: &[EnvVariable],
 ) -> Result<Vec<EnvVariable>> {
     // Optional variables this environment did not provide. A service may reference
     // one either directly or through `${...}`; the entry is then left off the
     // service instead of failing the deployment, which is what makes it optional.
-    let unset_optional: HashSet<&str> = app_spec.environment.optional.iter()
+    let unset_optional: HashSet<&str> = app_spec
+        .environment
+        .optional
+        .iter()
         .map(|o| o.name.as_str())
         .filter(|name| !all_env_vars.iter().any(|e| e.name == *name))
         .collect();
@@ -678,30 +719,37 @@ fn filter_service_env_vars(
     let mut final_service_env_vars = Vec::new();
 
     for svc_env_opt in &app_service.environment {
-         match svc_env_opt {
-             ServiceEnvOption::All => {
-                 for env_var in all_env_vars {
-                     add_unique_var(&mut final_service_env_vars, env_var.clone());
-                 }
-             }
-             ServiceEnvOption::Simple(name) => {
-                 if let Some(env_var) = all_env_vars.iter().find(|e| &e.name == name) {
-                     add_unique_var(&mut final_service_env_vars, env_var.clone());
-                 } else if !unset_optional.contains(name.as_str()) {
-                     return Err(anyhow!("Service {} references undefined env var {}", app_service.name, name));
-                 }
-             }
-             ServiceEnvOption::WithValue(k, v) => {
-                 if referenced_var_names(v).iter().any(|n| unset_optional.contains(n)) {
-                     continue;
-                 }
-                 add_unique_var(&mut final_service_env_vars,EnvVariable{
-                     name: k.clone(),
-                     value: resolve_variable_in_string(v, all_env_vars)
-                         .context(format!("{}: Failed to resolve env var {}={}", app_service.name, k, v))?
-                 });
-             }
-         }
+        match svc_env_opt {
+            ServiceEnvOption::All => {
+                for env_var in all_env_vars {
+                    add_unique_var(&mut final_service_env_vars, env_var.clone());
+                }
+            }
+            ServiceEnvOption::Simple(name) => {
+                if let Some(env_var) = all_env_vars.iter().find(|e| &e.name == name) {
+                    add_unique_var(&mut final_service_env_vars, env_var.clone());
+                } else if !unset_optional.contains(name.as_str()) {
+                    return Err(anyhow!(
+                        "Service {} references undefined env var {}",
+                        app_service.name,
+                        name
+                    ));
+                }
+            }
+            ServiceEnvOption::WithValue(k, v) => {
+                if referenced_var_names(v).iter().any(|n| unset_optional.contains(n)) {
+                    continue;
+                }
+                add_unique_var(
+                    &mut final_service_env_vars,
+                    EnvVariable {
+                        name: k.clone(),
+                        value: resolve_variable_in_string(v, all_env_vars)
+                            .context(format!("{}: Failed to resolve env var {}={}", app_service.name, k, v))?,
+                    },
+                );
+            }
+        }
     }
     Ok(final_service_env_vars)
 }
@@ -713,7 +761,8 @@ mod tests {
     fn ingress_with(hosts: &[(&str, &[&str])], redirects: Vec<RedirectSpec>) -> IngressSpec {
         IngressSpec {
             name: "gateway".to_string(),
-            hosts: hosts.iter()
+            hosts: hosts
+                .iter()
                 .map(|(name, domains)| HostSpec {
                     name: name.to_string(),
                     domain_names: domains.iter().map(|d| d.to_string()).collect(),
@@ -838,7 +887,8 @@ mod tests {
             version: semver::Version::new(1, 0, 0),
             environment: AppEnvironment {
                 external: vec![],
-                optional: optional.iter()
+                optional: optional
+                    .iter()
                     .map(|n| OptionalEnvVariable { name: n.to_string() })
                     .collect(),
                 relative: vec![],
@@ -880,7 +930,11 @@ mod tests {
         ]);
 
         let vars = filter_service_env_vars(&service, &app_spec, &[]).unwrap();
-        assert!(vars.is_empty(), "unset optional vars must not reach the service: {:?}", vars);
+        assert!(
+            vars.is_empty(),
+            "unset optional vars must not reach the service: {:?}",
+            vars
+        );
     }
 
     #[test]
@@ -891,8 +945,14 @@ mod tests {
             ServiceEnvOption::WithValue("URL".to_string(), "${LIVEKIT_URL}".to_string()),
         ]);
         let all = vec![
-            EnvVariable { name: "LIVEKIT_API_KEY".to_string(), value: "key".to_string() },
-            EnvVariable { name: "LIVEKIT_URL".to_string(), value: "wss://lk".to_string() },
+            EnvVariable {
+                name: "LIVEKIT_API_KEY".to_string(),
+                value: "key".to_string(),
+            },
+            EnvVariable {
+                name: "LIVEKIT_URL".to_string(),
+                value: "wss://lk".to_string(),
+            },
         ];
 
         let vars = filter_service_env_vars(&service, &app_spec, &all).unwrap();

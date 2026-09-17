@@ -1,4 +1,7 @@
-use crate::spec::{AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, ResourcesSpec, ServiceCommand, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume};
+use crate::spec::{
+    AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, ResourcesSpec, ServiceCommand, ServiceConfigOption,
+    ServicePort, ServiceSecret, ServiceType, ServiceVolume,
+};
 
 #[derive(Debug)]
 pub struct EnvironmentResolvedSpec {
@@ -45,7 +48,11 @@ impl RedirectRule {
     }
 
     pub fn status_code(&self) -> u16 {
-        if self.permanent { 301 } else { 302 }
+        if self.permanent {
+            301
+        } else {
+            302
+        }
     }
 }
 
@@ -91,13 +98,12 @@ pub struct ServiceResolvedSpec {
     // resolved image with a full name, including registry and version
     pub image: String,
 
-    pub service_host: String,
     // Resolution rules for environment_variables:
     // * AppEnvironment::external are substituted with values from DeploymentSpec::environment
     // * AppEnvironment::relative are transformed into this form https://{service_host}/${variable_value}
     // * AppEnvironment::internal are added without any transformation
     pub environment_variables: Vec<EnvVariable>,
-    
+
     // overrides environment_variables for local non-dockerized execution
     pub undockerized_environment_variables: Vec<EnvVariable>,
 
@@ -169,9 +175,16 @@ impl SecretResolvedSpec {
     /// reference a deferred secret from the generated deploy script and, through
     /// compose's `${VAR}` interpolation, from the generated stack file.
     pub fn shell_var(&self) -> String {
-        let sanitized: String = self.name
+        let sanitized: String = self
+            .name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
             .collect();
         format!("{}{}", SHELL_VAR_PREFIX, sanitized)
     }
@@ -198,7 +211,8 @@ impl DeploymentResolvedSpec {
     /// AWS lookup that fetches it. Empty for a deployment that declares none, in
     /// which case no `fetch-secrets.sh` is generated at all.
     pub fn deferred_secrets(&self) -> Vec<(&SecretResolvedSpec, &AwsSecretRef)> {
-        self.secrets.iter()
+        self.secrets
+            .iter()
             .filter_map(|secret| secret.deferred().map(|reference| (secret, reference)))
             .collect()
     }
@@ -207,7 +221,9 @@ impl DeploymentResolvedSpec {
     /// that depends on another job comes after it. Ties are broken by name so the
     /// generated scripts are stable across runs.
     pub fn jobs_in_order(&self) -> Vec<&ServiceResolvedSpec> {
-        let mut jobs: Vec<&ServiceResolvedSpec> = self.services.iter()
+        let mut jobs: Vec<&ServiceResolvedSpec> = self
+            .services
+            .iter()
             .filter(|s| matches!(s.service_type, ServiceType::Job))
             .collect();
         jobs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
@@ -243,7 +259,9 @@ impl DeploymentResolvedSpec {
 
     /// Long-running services (everything that is not a job), sorted by name.
     pub fn long_running_services(&self) -> Vec<&ServiceResolvedSpec> {
-        let mut services: Vec<&ServiceResolvedSpec> = self.services.iter()
+        let mut services: Vec<&ServiceResolvedSpec> = self
+            .services
+            .iter()
             .filter(|s| !matches!(s.service_type, ServiceType::Job))
             .collect();
         services.sort_by(|a, b| a.full_name.cmp(&b.full_name));
@@ -274,7 +292,9 @@ impl DeploymentResolvedSpec {
             }
         }
 
-        let mut services: Vec<&ServiceResolvedSpec> = self.services.iter()
+        let mut services: Vec<&ServiceResolvedSpec> = self
+            .services
+            .iter()
             .filter(|s| !matches!(s.service_type, ServiceType::Job))
             .filter(|s| needed.contains(&s.full_name.as_str()))
             .collect();

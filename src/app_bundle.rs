@@ -1,15 +1,15 @@
-use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
-use std::path::Path;
-use std::process::Command;
-use std::fs::{self, File};
-use std::time::{SystemTime, UNIX_EPOCH};
+use anyhow::{bail, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::path::Path;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::bundle_repo;
 use crate::spec::{self, ImageSpec};
 use crate::spec_loader;
-use crate::bundle_repo;
 
 /// Turns an arbitrary label into a valid semver build-metadata identifier so that a
 /// raw branch name can be passed straight through from CI.
@@ -52,8 +52,8 @@ fn apply_version_suffix(version: &semver::Version, suffix: &str) -> Result<semve
         format!("{}.{}", version.build, sanitized)
     };
 
-    let build = semver::BuildMetadata::new(&build_str)
-        .with_context(|| format!("Invalid version suffix '{}'", sanitized))?;
+    let build =
+        semver::BuildMetadata::new(&build_str).with_context(|| format!("Invalid version suffix '{}'", sanitized))?;
 
     let mut version = version.clone();
     version.build = build;
@@ -157,8 +157,10 @@ fn ensure_ecr_repository(image: &str) -> Result<()> {
             &target.repository,
         ])
         .output()
-        .context("Failed to run the AWS CLI. It is required to create missing ECR repositories. \
-                  Pass --no-create-repos to push without it.")?;
+        .context(
+            "Failed to run the AWS CLI. It is required to create missing ECR repositories. \
+                  Pass --no-create-repos to push without it.",
+        )?;
 
     if describe.status.success() {
         return Ok(());
@@ -207,6 +209,7 @@ fn ensure_ecr_repository(image: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_app_bundle(
     registry: &Option<String>,
     push_images: bool,
@@ -231,11 +234,11 @@ pub fn create_app_bundle(
 
     let mut registry_map = HashMap::new();
     if let Some(reg_str) = registry {
-         for part in reg_str.split(',') {
-             if let Some((k, v)) = part.split_once('=') {
-                 registry_map.insert(k, v.to_string());
-             }
-         }
+        for part in reg_str.split(',') {
+            if let Some((k, v)) = part.split_once('=') {
+                registry_map.insert(k, v.to_string());
+            }
+        }
     }
 
     for service in app_spec.app_services {
@@ -244,63 +247,67 @@ pub fn create_app_bundle(
             ImageSpec::Variants(variants) => variants.into_iter().map(|v| v.image).collect(),
         };
         for source_image in &images {
-             let (base_name, _) = source_image.split_once(':').unwrap_or((source_image, ""));
-             
-             let mut target_image = format!("{}:{}", base_name, version_tag);
-             let mut matched = false;
+            let (base_name, _) = source_image.split_once(':').unwrap_or((source_image, ""));
 
-             for (prefix, reg_url) in &registry_map {
-                 let mut prefix = prefix.to_string();
-                 if !prefix.ends_with('/') {
-                     prefix.push('/');
-                 }
-                 
-                 if base_name.starts_with(&prefix) {
-                     let url = reg_url.trim_end_matches('/');
-                     target_image = format!("{}/{}", url, target_image);
-                     matched = true;
-                     break; 
-                 }
-             }
-             
-             if !registry_map.is_empty() && !matched {
-                 let available = registry_map
-                     .iter()
-                     .map(|(k, v)| format!("{}={}", k, v))
-                     .collect::<Vec<_>>()
-                     .join(", ");
-                 bail!("No registry match for image {}, available registries: {}", source_image, available);
-             }
+            let mut target_image = format!("{}:{}", base_name, version_tag);
+            let mut matched = false;
 
-             println!("Tagging {} as {}", source_image, target_image);
-             
-             let status = Command::new("docker")
-                 .arg("tag")
-                 .arg(source_image)
-                 .arg(&target_image)
-                 .status()
-                 .with_context(|| format!("Failed to execute docker tag for {}", source_image))?;
-                 
-             if !status.success() {
-                 bail!("Docker tag failed for {}", source_image);
-             }
-             
-             if push_images {
-                 if create_repos {
-                     ensure_ecr_repository(&target_image)?;
-                 }
+            for (prefix, reg_url) in &registry_map {
+                let mut prefix = prefix.to_string();
+                if !prefix.ends_with('/') {
+                    prefix.push('/');
+                }
 
-                 println!("Pushing {}", target_image);
-                 let status = Command::new("docker")
-                     .arg("push")
-                     .arg(&target_image)
-                     .status()
-                     .with_context(|| format!("Failed to execute docker push for {}", target_image))?;
-                     
-                 if !status.success() {
-                     bail!("Docker push failed for {}", target_image);
-                 }
-             }
+                if base_name.starts_with(&prefix) {
+                    let url = reg_url.trim_end_matches('/');
+                    target_image = format!("{}/{}", url, target_image);
+                    matched = true;
+                    break;
+                }
+            }
+
+            if !registry_map.is_empty() && !matched {
+                let available = registry_map
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "No registry match for image {}, available registries: {}",
+                    source_image,
+                    available
+                );
+            }
+
+            println!("Tagging {} as {}", source_image, target_image);
+
+            let status = Command::new("docker")
+                .arg("tag")
+                .arg(source_image)
+                .arg(&target_image)
+                .status()
+                .with_context(|| format!("Failed to execute docker tag for {}", source_image))?;
+
+            if !status.success() {
+                bail!("Docker tag failed for {}", source_image);
+            }
+
+            if push_images {
+                if create_repos {
+                    ensure_ecr_repository(&target_image)?;
+                }
+
+                println!("Pushing {}", target_image);
+                let status = Command::new("docker")
+                    .arg("push")
+                    .arg(&target_image)
+                    .status()
+                    .with_context(|| format!("Failed to execute docker push for {}", target_image))?;
+
+                if !status.success() {
+                    bail!("Docker push failed for {}", target_image);
+                }
+            }
         }
     }
 
@@ -323,8 +330,7 @@ pub fn create_app_bundle(
         // The suffixed version has to travel inside the bundle: `prepare-deployment`
         // reads the version from the bundled appspec to tag the images it deploys,
         // so an untouched appspec would point the deployment at unsuffixed images.
-        let content = fs::read_to_string(spec_path)
-            .with_context(|| format!("Failed to read {:?}", spec_path))?;
+        let content = fs::read_to_string(spec_path).with_context(|| format!("Failed to read {:?}", spec_path))?;
         let patched = rewrite_version(&content, &version)?;
 
         let mtime = SystemTime::now()
@@ -342,16 +348,17 @@ pub fn create_app_bundle(
         tar.append_path(spec_path)?;
     }
 
-
     let archive = tar.into_inner().context("Failed to write bundle file")?;
 
     archive.finish().context("Failed to finish bundle file")?;
-    
+
     println!("Created artifact: {}", filename);
-    
+
     if let Some(target) = upload_bundle_to {
         if target == "github-release" {
-            let repo = gh_repo.as_ref().context("--github-repo is required when uploading to github-release")?;
+            let repo = gh_repo
+                .as_ref()
+                .context("--github-repo is required when uploading to github-release")?;
             bundle_repo::gh_release::upload(repo, &version_tag, &filename, gh_tag_prefix.as_deref())?;
         } else {
             bail!("Unknown upload target: {}. Only 'github-release' is supported.", target);

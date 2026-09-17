@@ -1,25 +1,34 @@
 use crate::spec::*;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_name: &str) -> Result<()> {
-    let deployment = env_spec.deployments.iter()
+    let deployment = env_spec
+        .deployments
+        .iter()
         .find(|d| d.name == env_name)
         .ok_or_else(|| anyhow!("Deployment {} not found in envspec", env_name))?;
 
     // Check application name
     if deployment.application.name != app_spec.name {
-         return Err(anyhow!("Deployment {} expects application {}, but appspec is for {}", 
-             env_name, deployment.application.name, app_spec.name));
+        return Err(anyhow!(
+            "Deployment {} expects application {}, but appspec is for {}",
+            env_name,
+            deployment.application.name,
+            app_spec.name
+        ));
     }
 
     // Check version
     if let Some(req) = &deployment.application.version {
         if !req.matches(&app_spec.version) {
-             return Err(anyhow!("App version {} does not satisfy deployment requirement {}", 
-                 app_spec.version, req));
+            return Err(anyhow!(
+                "App version {} does not satisfy deployment requirement {}",
+                app_spec.version,
+                req
+            ));
         }
     }
 
@@ -28,57 +37,74 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     let mut missing_env_vars = Vec::new();
     for env_var in &app_spec.environment.external {
         if !provided_env_vars.contains(&env_var.name) && env_var.default.is_none() {
-             missing_env_vars.push(&env_var.name);
+            missing_env_vars.push(&env_var.name);
         }
     }
 
     if !missing_env_vars.is_empty() {
-        return Err(anyhow!("Environment variables {:?} required by application are not provided by deployment {}", 
-             missing_env_vars, env_name));
+        return Err(anyhow!(
+            "Environment variables {:?} required by application are not provided by deployment {}",
+            missing_env_vars,
+            env_name
+        ));
     }
 
     // Check secrets
     let provided_secrets: HashSet<&String> = deployment.secrets.iter().map(|c| &c.secret_name).collect();
     for secret in &app_spec.secrets {
         if !provided_secrets.contains(&secret.secret_name) {
-             return Err(anyhow!("Secret {} required by application is not provided by deployment {}", 
-                 secret.secret_name, env_name));
+            return Err(anyhow!(
+                "Secret {} required by application is not provided by deployment {}",
+                secret.secret_name,
+                env_name
+            ));
         }
     }
-    
+
     // Check configs
     for config in &app_spec.configs {
-        let deployment_config = deployment.configs.iter().find(|c| c.name == config.name)
-             .ok_or_else(|| anyhow!("Config {} required by application is not provided by deployment {}", config.name, env_name))?;
+        let deployment_config = deployment
+            .configs
+            .iter()
+            .find(|c| c.name == config.name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Config {} required by application is not provided by deployment {}",
+                    config.name,
+                    env_name
+                )
+            })?;
 
         let mut available_files = HashSet::new();
         for file_path in &deployment_config.files {
-             let path = Path::new(file_path);
-             if path.is_dir() {
-                 if let Ok(entries) = fs::read_dir(path) {
-                     for entry in entries {
-                         if let Ok(entry) = entry {
-                              let path = entry.path();
-                              if path.is_file() {
-                                  if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                      available_files.insert(name.to_string());
-                                  }
-                              }
-                         }
-                     }
-                 }
-             } else {
-                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                      available_files.insert(name.to_string());
-                 }
-             }
+            let path = Path::new(file_path);
+            if path.is_dir() {
+                if let Ok(entries) = fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                available_files.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    available_files.insert(name.to_string());
+                }
+            }
         }
-        
+
         for required_file in &config.files {
-             if !available_files.contains(required_file) {
-                 return Err(anyhow!("Config {} requires file {}, but it is not provided by deployment config (checked paths: {:?})", 
-                      config.name, required_file, deployment_config.files));
-             }
+            if !available_files.contains(required_file) {
+                return Err(anyhow!(
+                    "Config {} requires file {}, but it is not provided by deployment config (checked paths: {:?})",
+                    config.name,
+                    required_file,
+                    deployment_config.files
+                ));
+            }
         }
     }
 
@@ -90,9 +116,12 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     }
 
     if let Some(services) = &deployment.services {
-        for (svc_name, _) in services {
+        for svc_name in services.keys() {
             if !available_services.contains(svc_name) {
-                 return Err(anyhow!("Deployment configures service {} which is not defined in application", svc_name));
+                return Err(anyhow!(
+                    "Deployment configures service {} which is not defined in application",
+                    svc_name
+                ));
             }
         }
     }
@@ -103,7 +132,11 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     for service in app_spec.all_services() {
         for dep in &service.depends_on {
             if !available_services.contains(dep) {
-                return Err(anyhow!("Service {} depends on {} which is not defined in application", service.name, dep));
+                return Err(anyhow!(
+                    "Service {} depends on {} which is not defined in application",
+                    service.name,
+                    dep
+                ));
             }
         }
     }
@@ -140,7 +173,11 @@ fn validate_service_env_references(app_spec: &AppSpec) -> Result<()> {
         for env_opt in &service.environment {
             if let ServiceEnvOption::Simple(var_name) = env_opt {
                 if !app_defined_env_vars.contains(var_name) {
-                     return Err(anyhow!("Service {} references undefined environment variable {}", service.name, var_name));
+                    return Err(anyhow!(
+                        "Service {} references undefined environment variable {}",
+                        service.name,
+                        var_name
+                    ));
                 }
             }
         }
@@ -223,7 +260,10 @@ mod tests {
             name: "shop".to_string(),
             version: semver::Version::new(1, 0, 0),
             environment: AppEnvironment {
-                external: vec![], optional: vec![], relative: vec![], internal: vec![],
+                external: vec![],
+                optional: vec![],
+                relative: vec![],
+                internal: vec![],
             },
             app_services,
             extra_services: vec![],
@@ -245,10 +285,7 @@ mod tests {
 
     #[test]
     fn a_dependency_cycle_is_reported() {
-        let spec = app_spec(vec![
-            service("api", &["worker"]),
-            service("worker", &["api"]),
-        ]);
+        let spec = app_spec(vec![service("api", &["worker"]), service("worker", &["api"])]);
         let cycle = find_depends_on_cycle(&spec).expect("cycle must be detected");
         assert_eq!(cycle.first(), cycle.last());
         assert!(cycle.contains(&"api".to_string()) && cycle.contains(&"worker".to_string()));
@@ -259,7 +296,9 @@ mod tests {
         let mut svc = service("backend", &[]);
         svc.environment = vec![ServiceEnvOption::Simple("LIVEKIT_API_KEY".to_string())];
         let mut spec = app_spec(vec![svc]);
-        spec.environment.optional = vec![OptionalEnvVariable { name: "LIVEKIT_API_KEY".to_string() }];
+        spec.environment.optional = vec![OptionalEnvVariable {
+            name: "LIVEKIT_API_KEY".to_string(),
+        }];
 
         validate_service_env_references(&spec).expect("optional variables are defined");
     }
@@ -271,7 +310,9 @@ mod tests {
         let spec = app_spec(vec![svc]);
 
         let err = validate_service_env_references(&spec).unwrap_err();
-        assert!(err.to_string().contains("references undefined environment variable LIVEKIT_API_KEY"));
+        assert!(err
+            .to_string()
+            .contains("references undefined environment variable LIVEKIT_API_KEY"));
     }
 
     #[test]

@@ -1,12 +1,12 @@
+use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
+use crate::spec;
+use crate::spec::{EnvVariable, Healthcheck, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType};
+use anyhow::Context;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::Context;
-use serde::Serialize;
-use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
-use crate::spec;
-use crate::spec::{EnvVariable, Healthcheck, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType};
 
 #[derive(Serialize)]
 pub struct DockerCompose {
@@ -31,7 +31,13 @@ pub fn local_project_name(application_name: &str) -> String {
     let sanitized: String = application_name
         .chars()
         .map(|c| c.to_ascii_lowercase())
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
 
     let sanitized = sanitized.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
@@ -101,18 +107,22 @@ pub struct ServiceNetwork {
     pub aliases: Vec<String>,
 }
 
-pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolvedSpec, output_dir: &Path) -> anyhow::Result<DockerService> {
+pub fn prepare_service(
+    service: &ServiceResolvedSpec,
+    spec: &EnvironmentResolvedSpec,
+    output_dir: &Path,
+) -> anyhow::Result<DockerService> {
     let svc_dir = output_dir.join(service.full_name.clone());
     fs::create_dir_all(&svc_dir).context("Failed to create service directory")?;
 
     // Generate .env files
-    let env_path = svc_dir.join(".env".to_string());
+    let env_path = svc_dir.join(".env");
     write_env_file(&env_path, &service.environment_variables)?;
 
     // A host-run service with a `working_dir` gets its `.env` written into that
     // directory by `write_working_dir`, so skip the in-tree `undockerized.env`.
     if spec.env_type == spec::DeploymentEnvType::Local && service.working_dir.is_none() {
-        let undoc_env_path = svc_dir.join("undockerized.env".to_string());
+        let undoc_env_path = svc_dir.join("undockerized.env");
         write_env_file(&undoc_env_path, &service.undockerized_environment_variables)?;
     }
 
@@ -122,23 +132,31 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
     for volume in &service.volumes {
         match &volume.name {
             ServiceVolumeType::Named(name) => {
-                volumes.push(format!("./volumes/{}:{}",  name, volume.mount_path));
+                volumes.push(format!("./volumes/{}:{}", name, volume.mount_path));
             }
             ServiceVolumeType::Path(from_path) => {
-                volumes.push(format!("{}:{}",  from_path, volume.mount_path));
+                volumes.push(format!("{}:{}", from_path, volume.mount_path));
             }
         }
     }
 
     // Configs
     for config_option in &service.configs {
-        if let Some(config_spec) = spec.current_deployment.configs.iter().find(|c| c.name == config_option.config_name) {
+        if let Some(config_spec) = spec
+            .current_deployment
+            .configs
+            .iter()
+            .find(|c| c.name == config_option.config_name)
+        {
             let rel_path = config_option.mount_path.trim_start_matches('/');
             let host_path = svc_dir.join(rel_path);
 
             let is_file_mount = if config_spec.files.len() == 1 {
                 let file = &config_spec.files[0];
-                let mount_filename = Path::new(&config_option.mount_path).file_name().unwrap_or_default().to_string_lossy();
+                let mount_filename = Path::new(&config_option.mount_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
                 mount_filename == file.name
             } else {
                 false
@@ -152,7 +170,10 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
 
                 // Use forward slashes for docker-compose
                 let rel_path_str = rel_path.replace("\\", "/");
-                volumes.push(format!("./{}/{}:{}", service.full_name, rel_path_str, config_option.mount_path));
+                volumes.push(format!(
+                    "./{}/{}:{}",
+                    service.full_name, rel_path_str, config_option.mount_path
+                ));
             } else {
                 fs::create_dir_all(&host_path).context("Failed to create config directory")?;
                 for file in &config_spec.files {
@@ -161,13 +182,18 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
                 }
 
                 let rel_path_str = rel_path.replace("\\", "/");
-                volumes.push(format!("./{}/{}:{}", service.full_name, rel_path_str, config_option.mount_path));
+                volumes.push(format!(
+                    "./{}/{}:{}",
+                    service.full_name, rel_path_str, config_option.mount_path
+                ));
             }
         } else {
-            eprintln!("Warning: Config {} not found for service {}", config_option.config_name, service.full_name);
+            eprintln!(
+                "Warning: Config {} not found for service {}",
+                config_option.config_name, service.full_name
+            );
         }
     }
-
 
     // Secrets. A secret with an `aws` source has no value yet: `fetch-secrets.sh`
     // exports it as a shell variable and writes its file on the deploy target, so
@@ -175,7 +201,12 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
     // `docker stack deploy` resolves from its own environment — and the file mount
     // points at a path the fetch script will have populated.
     for secret_option in &service.secrets {
-        if let Some(secret_spec) =  spec.current_deployment.secrets.iter().find(|s| s.name == secret_option.name) {
+        if let Some(secret_spec) = spec
+            .current_deployment
+            .secrets
+            .iter()
+            .find(|s| s.name == secret_option.name)
+        {
             match &secret_option.mount {
                 SecretMount::EnvVariable(var_name) => {
                     let value = match secret_spec.literal() {
@@ -183,7 +214,7 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
                         None => format!("${{{}}}", secret_spec.shell_var()),
                     };
                     environment.insert(var_name.clone(), value);
-                },
+                }
 
                 SecretMount::FilePath(mount_path) => {
                     let rel_path = mount_path.trim_start_matches('/');
@@ -201,12 +232,17 @@ pub fn prepare_service(service: &ServiceResolvedSpec, spec: &EnvironmentResolved
                 }
             }
         } else {
-            eprintln!("Warning: Secret {} not found for service {}", secret_option.name, service.full_name);
+            eprintln!(
+                "Warning: Secret {} not found for service {}",
+                secret_option.name, service.full_name
+            );
         }
     }
 
     // Ports
-    let ports = service.ports.iter()
+    let ports = service
+        .ports
+        .iter()
         .map(|port| format!("{}:{}", port.external, port.internal))
         .collect();
 
@@ -262,20 +298,34 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
     // Env-variable secrets are merged into `.env`; file secrets are written as
     // files relative to the working directory.
     for secret_option in &service.secrets {
-        let Some(secret_spec) = spec.current_deployment.secrets.iter().find(|s| s.name == secret_option.name) else {
-            eprintln!("Warning: Secret {} not found for service {}", secret_option.name, service.full_name);
+        let Some(secret_spec) = spec
+            .current_deployment
+            .secrets
+            .iter()
+            .find(|s| s.name == secret_option.name)
+        else {
+            eprintln!(
+                "Warning: Secret {} not found for service {}",
+                secret_option.name, service.full_name
+            );
             continue;
         };
         // Host-run services exist for `local` only, where secrets with an `aws`
         // source are fetched during resolution, so a value is always available.
         let Some(value) = secret_spec.literal() else {
-            eprintln!("Warning: Secret {} is only fetched on the deploy target and cannot be written \
-                to the working_dir of {}", secret_option.name, service.full_name);
+            eprintln!(
+                "Warning: Secret {} is only fetched on the deploy target and cannot be written \
+                to the working_dir of {}",
+                secret_option.name, service.full_name
+            );
             continue;
         };
         match &secret_option.mount {
             SecretMount::EnvVariable(var_name) => {
-                env_vars.push(EnvVariable { name: var_name.clone(), value: value.to_string() });
+                env_vars.push(EnvVariable {
+                    name: var_name.clone(),
+                    value: value.to_string(),
+                });
             }
             SecretMount::FilePath(mount_path) => {
                 let rel_path = mount_path.trim_start_matches('/');
@@ -293,7 +343,8 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
 }
 
 fn write_env_file(path: &Path, vars: &[EnvVariable]) -> anyhow::Result<()> {
-    let content = vars.iter()
+    let content = vars
+        .iter()
         .map(|v| format!("{}={}", v.name, v.value))
         .collect::<Vec<_>>()
         .join("\n");

@@ -1,25 +1,25 @@
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use anyhow::{Context, Result, bail, anyhow};
 use std::path::Path;
 
-mod spec;
-mod spec_yaml;
-mod env_loader;
-mod transform;
-mod validator;
-mod resolved_spec;
-mod resolver;
-mod secret_fetch;
-mod k8s_generator;
-mod docker_generator;
-mod run_local;
-mod local_ingress;
-mod spec_loader;
 mod app_bundle;
 mod bundle_repo;
 mod docker_compose;
-mod updater;
+mod docker_generator;
 mod docs;
+mod env_loader;
+mod k8s_generator;
+mod local_ingress;
+mod resolved_spec;
+mod resolver;
+mod run_local;
+mod secret_fetch;
+mod spec;
+mod spec_loader;
+mod spec_yaml;
+mod transform;
+mod updater;
+mod validator;
 
 #[derive(Parser)]
 #[command(name = "simpled")]
@@ -44,10 +44,10 @@ enum Commands {
     /// Prepare deployment (e.g. generate k8s manifests)
     PrepareDeployment {
         deployment_name: String,
-        
+
         #[arg(long, alias = "app-bundle")]
         bundle: Option<String>,
-        
+
         #[arg(long, alias = "app-version")]
         version: Option<String>,
 
@@ -201,8 +201,26 @@ fn main() -> Result<()> {
             AppBundleCommands::Version => {
                 version_command()?;
             }
-            AppBundleCommands::Create { registry, push_images, no_create_repos, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix } => {
-                app_bundle::create_app_bundle(registry, *push_images, !*no_create_repos, upload, upload_bundle_to, github_repo, github_tag_prefix, version_suffix)?;
+            AppBundleCommands::Create {
+                registry,
+                push_images,
+                no_create_repos,
+                upload,
+                upload_bundle_to,
+                github_repo,
+                github_tag_prefix,
+                version_suffix,
+            } => {
+                app_bundle::create_app_bundle(
+                    registry,
+                    *push_images,
+                    !*no_create_repos,
+                    upload,
+                    upload_bundle_to,
+                    github_repo,
+                    github_tag_prefix,
+                    version_suffix,
+                )?;
             }
         },
         Commands::Secrets { command } => match command {
@@ -210,11 +228,25 @@ fn main() -> Result<()> {
                 println!("Set secrets for {}, path={:?}, args={:?}", env_name, path, file);
             }
         },
-        Commands::PrepareDeployment { deployment_name, bundle, version, download_bundle_from, github_repo, github_tag_prefix } => {
-            prepare_deployment_command(deployment_name, bundle, version, download_bundle_from, github_repo, github_tag_prefix)?;
-        },
+        Commands::PrepareDeployment {
+            deployment_name,
+            bundle,
+            version,
+            download_bundle_from,
+            github_repo,
+            github_tag_prefix,
+        } => {
+            prepare_deployment_command(
+                deployment_name,
+                bundle,
+                version,
+                download_bundle_from,
+                github_repo,
+                github_tag_prefix,
+            )?;
+        }
         Commands::Local { command } => {
-            local(&command)?;
+            local(command)?;
         }
         Commands::Docs { args, section, outline } => {
             docs_command(args, section, *outline)?;
@@ -240,7 +272,7 @@ fn docs_command(args: &[String], section: &Option<String>, outline: bool) -> Res
             Ok(())
         }
         Some((first, rest)) if first == "search" => docs::search(&rest.join(" ")),
-        Some((topic, rest)) if rest.is_empty() => docs::show(topic, section.as_deref(), outline),
+        Some((topic, [])) => docs::show(topic, section.as_deref(), outline),
         Some((topic, rest)) => bail!(
             "Unexpected arguments after the topic '{}': {}. Did you mean `simpled docs search {}`?",
             topic,
@@ -252,7 +284,10 @@ fn docs_command(args: &[String], section: &Option<String>, outline: bool) -> Res
 
 fn verify_command() -> Result<()> {
     let app_spec = spec_loader::load_app_spec(Path::new("."), None)?;
-    println!("Successfully validated appspec: {} v{}", app_spec.name, app_spec.version);
+    println!(
+        "Successfully validated appspec: {} v{}",
+        app_spec.name, app_spec.version
+    );
     Ok(())
 }
 
@@ -263,37 +298,49 @@ fn version_command() -> Result<()> {
 }
 
 fn prepare_deployment_command(
-    deployment_name: &str, 
-    bundle: &Option<String>, 
+    deployment_name: &str,
+    bundle: &Option<String>,
     version: &Option<String>,
     download_bundle_from: &Option<String>,
     github_repo: &Option<String>,
-    github_tag_prefix: &Option<String>
+    github_tag_prefix: &Option<String>,
 ) -> Result<()> {
     // 1. Load specs
     let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name))?;
-    
+
     // Find deployment to get app name
-    let deployment = env_spec.deployments.iter()
+    let deployment = env_spec
+        .deployments
+        .iter()
         .find(|d| d.name == deployment_name)
         .context(format!("Deployment {} not found", deployment_name))?;
-        
+
     let app_name = &deployment.application.name;
 
     let bundle_path_str = if let Some(source) = download_bundle_from {
         if source == "github-release" {
-            let ver = version.as_ref().context("--app-version is required when downloading from github-release")?;
-            let repo = github_repo.as_ref().context("--github-repo is required when downloading from github-release")?;
-            
+            let ver = version
+                .as_ref()
+                .context("--app-version is required when downloading from github-release")?;
+            let repo = github_repo
+                .as_ref()
+                .context("--github-repo is required when downloading from github-release")?;
+
             bundle_repo::gh_release::download(repo, ver, app_name, github_tag_prefix.as_deref())?
         } else {
-            bail!("Unknown download source: {}. Only 'github-release' is supported.", source);
+            bail!(
+                "Unknown download source: {}. Only 'github-release' is supported.",
+                source
+            );
         }
     } else {
         if version.is_some() {
-             bail!("Deploying by version without download is not implemented yet. Use --app-bundle to specify file.");
+            bail!("Deploying by version without download is not implemented yet. Use --app-bundle to specify file.");
         }
-        bundle.as_ref().context("Either --app-bundle or --download-bundle-from must be specified")?.clone()
+        bundle
+            .as_ref()
+            .context("Either --app-bundle or --download-bundle-from must be specified")?
+            .clone()
     };
 
     let bundle_path = Path::new(&bundle_path_str);
@@ -314,14 +361,14 @@ fn prepare_deployment_command(
             let output_dir = Path::new("manifests");
             k8s_generator::generate(&resolved_spec, output_dir).context("Generation failed")?;
             println!("Manifests generated in {:?}", output_dir);
-        },
+        }
         spec::DeploymentEnvType::Docker(ref docker_spec) => {
             let output_dir = Path::new("docker-deploy");
             docker_generator::generate(&resolved_spec, docker_spec, output_dir).context("Generation failed")?;
             println!("Docker deployment script generated in {:?}", output_dir);
-        },
+        }
         spec::DeploymentEnvType::Local => {
-             bail!("prepare deployment doesn't support local deployments, use 'simpled local run' instead");
+            bail!("prepare deployment doesn't support local deployments, use 'simpled local run' instead");
         }
     }
 
@@ -339,7 +386,9 @@ fn select_deployment<'a>(
     requested: Option<&str>,
 ) -> Result<&'a spec::DeploymentSpec> {
     if let Some(name) = requested {
-        return env_spec.deployments.iter()
+        return env_spec
+            .deployments
+            .iter()
             .find(|d| d.name == name)
             .context(format!("Deployment '{}' not found in env spec", name));
     }
@@ -348,10 +397,7 @@ fn select_deployment<'a>(
         [] => bail!("No deployments defined in envspec"),
         [single] => Ok(single),
         multiple => {
-            let names = multiple.iter()
-                .map(|d| d.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let names = multiple.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ");
             bail!(
                 "Multiple deployments defined ({}). Specify which one to run with --deployment <name>.",
                 names
@@ -364,12 +410,9 @@ fn local(command: &LocalCommands) -> Result<()> {
     let (root, deployment_name) = match command {
         LocalCommands::Run { path, deployment, .. }
         | LocalCommands::OnlyExtra { path, deployment }
-        | LocalCommands::GenerateConfig { path, deployment } => (
-            path.as_ref()
-                .map(|p| Path::new(p))
-                .unwrap_or(Path::new(".")),
-            deployment,
-        ),
+        | LocalCommands::GenerateConfig { path, deployment } => {
+            (path.as_ref().map(Path::new).unwrap_or(Path::new(".")), deployment)
+        }
     };
 
     let exclude = match command {
@@ -384,39 +427,33 @@ fn local(command: &LocalCommands) -> Result<()> {
 
     validator::validate(&env_spec, &app_spec, &deployment.name).context("Validation failed")?;
 
-    println!("Validation passed for deployment {}", &deployment.name);
+    println!("Validation passed for deployment {}", deployment.name);
 
     // 3. Resolve
     let resolved_spec = resolver::resolve(&env_spec, &app_spec, &deployment.name).context("Resolution failed")?;
 
     // 4. Generate
     match env_spec.env_type {
-        spec::DeploymentEnvType::K8S => {
-            return Err(anyhow!("Environment type should be local"))
-        },
-        spec::DeploymentEnvType::Docker(_) => {
-            return Err(anyhow!("Environment type should be local"))
-        },
-        spec::DeploymentEnvType::Local => {
-            match command {
-                LocalCommands::GenerateConfig { .. } => {
-                    println!("Regenerating local configuration");
-                    run_local::generate_config(&resolved_spec)?;
-                },
-                _ => {
-                    local_ingress::run(resolved_spec.ingress.clone(), &resolved_spec.current_deployment.name)?;
-                    match command {
-                        LocalCommands::Run { .. } => {
-                            println!("Running local deployment");
-                            run_local::run(&resolved_spec, &exclude)?;
-                        },
-                        LocalCommands::OnlyExtra { .. } => {
-                            println!("Running gateway and extra services only");
-                            run_local::run_only_extra(&resolved_spec)?;
-                        },
-                        LocalCommands::GenerateConfig { .. } => unreachable!(),
+        spec::DeploymentEnvType::K8S => return Err(anyhow!("Environment type should be local")),
+        spec::DeploymentEnvType::Docker(_) => return Err(anyhow!("Environment type should be local")),
+        spec::DeploymentEnvType::Local => match command {
+            LocalCommands::GenerateConfig { .. } => {
+                println!("Regenerating local configuration");
+                run_local::generate_config(&resolved_spec)?;
+            }
+            _ => {
+                local_ingress::run(resolved_spec.ingress.clone(), &resolved_spec.current_deployment.name)?;
+                match command {
+                    LocalCommands::Run { .. } => {
+                        println!("Running local deployment");
+                        run_local::run(&resolved_spec, &exclude)?;
                     }
-                },
+                    LocalCommands::OnlyExtra { .. } => {
+                        println!("Running gateway and extra services only");
+                        run_local::run_only_extra(&resolved_spec)?;
+                    }
+                    LocalCommands::GenerateConfig { .. } => unreachable!(),
+                }
             }
         },
     }

@@ -48,10 +48,7 @@ fn parse_version(tag: &str) -> Result<Version> {
 }
 
 fn fetch_latest_release() -> Result<Release> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        GITHUB_REPO
-    );
+    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
 
     let mut builder = reqwest::blocking::Client::new()
         .get(&url)
@@ -174,8 +171,7 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
         let path = entry.path().context("Failed to read entry path")?;
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if file_name == binary_name {
-            let mut tmp_file = std::fs::File::create(&tmp_path)
-                .context("Failed to create temp file for update")?;
+            let mut tmp_file = std::fs::File::create(&tmp_path).context("Failed to create temp file for update")?;
 
             #[cfg(unix)]
             {
@@ -185,8 +181,7 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
                     .context("Failed to set permissions on temp file")?;
             }
 
-            std::io::copy(&mut entry, &mut tmp_file)
-                .context("Failed to extract binary from archive")?;
+            std::io::copy(&mut entry, &mut tmp_file).context("Failed to extract binary from archive")?;
             tmp_file.flush().context("Failed to flush update file")?;
             found = true;
             break;

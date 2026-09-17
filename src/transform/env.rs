@@ -1,7 +1,7 @@
 use crate::spec::*;
 use crate::spec_yaml::*;
 use crate::{env_loader, spec};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -9,8 +9,13 @@ use std::path::{Component, Path, PathBuf};
 const DEFAULT_MEMORY: &str = "128Mi";
 const DEFAULT_CPU: &str = "100m";
 
-pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, selected_deployment: Option<&str>) -> Result<DeploymentEnvironmentSpec> {
-    let env_type_yaml = yaml.env_type
+pub fn convert_env_spec(
+    yaml: DeploymentEnvironmentSpecYaml,
+    root: &Path,
+    selected_deployment: Option<&str>,
+) -> Result<DeploymentEnvironmentSpec> {
+    let env_type_yaml = yaml
+        .env_type
         .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
     let swarm_mode_opt = yaml.swarm_mode;
     let gateway_yaml = match (yaml.gateway, yaml.ingress) {
@@ -76,7 +81,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                 return Err(anyhow!("working_dir cannot be set for K8S environment"));
             }
             DeploymentEnvType::K8S
-        },
+        }
         DeploymentEnvTypeYaml::Docker => {
             let swarm_mode = swarm_mode_opt.unwrap_or(false);
             let ingress_type = match ingress_type_str.as_deref() {
@@ -94,7 +99,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                 swarm_mode,
                 ingress_type,
             })
-        },
+        }
         DeploymentEnvTypeYaml::Local => {
             if swarm_mode_opt.is_some() {
                 return Err(anyhow!("swarm_mode cannot be set for Local environment"));
@@ -106,7 +111,9 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                 return Err(anyhow!("registry must be empty for Local environment"));
             }
             if deployments.is_empty() {
-                return Err(anyhow!("For Local environment at least one deployment must be specified"));
+                return Err(anyhow!(
+                    "For Local environment at least one deployment must be specified"
+                ));
             }
             // Multiple deployments are allowed, but only one runs at a time. When more
             // than one is defined the caller must pick which with --deployment.
@@ -129,11 +136,18 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                     for svc_name in svc_names {
                         let svc_spec = &services[svc_name];
                         if svc_spec.ports.is_empty() {
-                            return Err(anyhow!("In Local environment, service {} must have at least one port", svc_name));
+                            return Err(anyhow!(
+                                "In Local environment, service {} must have at least one port",
+                                svc_name
+                            ));
                         }
                         for port in &svc_spec.ports {
                             if !ports_seen.insert(port.external) {
-                                return Err(anyhow!("Duplicate external port {} in deployment {}", port.external, dep.name));
+                                return Err(anyhow!(
+                                    "Duplicate external port {} in deployment {}",
+                                    port.external,
+                                    dep.name
+                                ));
                             }
                         }
                         // A host-run service writes its `.env` and secret files straight
@@ -145,7 +159,10 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
                                     "Services '{}' and '{}' in deployment '{}' share working_dir '{}'. \
                                      Each host-run service needs its own directory: its .env file and \
                                      secrets are written there and would overwrite each other.",
-                                    other, svc_name, dep.name, dir
+                                    other,
+                                    svc_name,
+                                    dep.name,
+                                    dir
                                 ));
                             }
                         }
@@ -154,7 +171,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
             }
 
             DeploymentEnvType::Local
-        },
+        }
     };
 
     Ok(DeploymentEnvironmentSpec {
@@ -168,9 +185,7 @@ pub fn convert_env_spec(yaml: DeploymentEnvironmentSpecYaml, root: &Path, select
 /// Resolves `extends` inheritance for every deployment, returning a map of fully
 /// merged specs keyed by the original names. Chains of `extends` are followed and
 /// cycles are reported as errors.
-fn resolve_extends(
-    raw: &HashMap<String, DeploymentSpecYaml>,
-) -> Result<HashMap<String, DeploymentSpecYaml>> {
+fn resolve_extends(raw: &HashMap<String, DeploymentSpecYaml>) -> Result<HashMap<String, DeploymentSpecYaml>> {
     let mut resolved: HashMap<String, DeploymentSpecYaml> = HashMap::new();
     for name in raw.keys() {
         resolve_deployment(name, raw, &mut resolved, &mut Vec::new())?;
@@ -192,9 +207,13 @@ fn resolve_deployment(
         return Err(anyhow!("Cyclic 'extends' chain in deployments: {}", stack.join(" -> ")));
     }
 
-    let dep = raw
-        .get(name)
-        .ok_or_else(|| anyhow!("Deployment '{}' extends unknown deployment '{}'", stack.last().map(|s| s.as_str()).unwrap_or(name), name))?;
+    let dep = raw.get(name).ok_or_else(|| {
+        anyhow!(
+            "Deployment '{}' extends unknown deployment '{}'",
+            stack.last().map(|s| s.as_str()).unwrap_or(name),
+            name
+        )
+    })?;
 
     let merged = match &dep.extends {
         Some(base_name) => {
@@ -248,10 +267,7 @@ fn merge_env_variables(
         (None, None) => None,
         (Some(b), None) => Some(b.clone()),
         (None, Some(c)) => Some(c.clone()),
-        (
-            Some(DeploymentEnvVariablesYaml::FromList(b)),
-            Some(DeploymentEnvVariablesYaml::FromList(c)),
-        ) => {
+        (Some(DeploymentEnvVariablesYaml::FromList(b)), Some(DeploymentEnvVariablesYaml::FromList(c))) => {
             let mut out = b.clone();
             let mut index: HashMap<String, usize> = HashMap::new();
             for (i, entry) in out.iter().enumerate() {
@@ -340,10 +356,7 @@ fn merge_application(
 }
 
 /// Field-wise merge of a per-service override; the child wins on any field it sets.
-fn merge_service(
-    base: &DeploymentServiceSpecYaml,
-    child: &DeploymentServiceSpecYaml,
-) -> DeploymentServiceSpecYaml {
+fn merge_service(base: &DeploymentServiceSpecYaml, child: &DeploymentServiceSpecYaml) -> DeploymentServiceSpecYaml {
     DeploymentServiceSpecYaml {
         variant: child.variant.clone().or_else(|| base.variant.clone()),
         host: child.host.clone().or_else(|| base.host.clone()),
@@ -386,7 +399,7 @@ fn any_service_has_working_dir(deployments: &HashMap<String, DeploymentSpecYaml>
     deployments.values().any(|d| {
         d.services
             .as_ref()
-            .map_or(false, |svcs| svcs.values().any(|s| s.working_dir.is_some()))
+            .is_some_and(|svcs| svcs.values().any(|s| s.working_dir.is_some()))
     })
 }
 
@@ -394,7 +407,10 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
     let mut hosts = Vec::new();
     for (name, host) in yaml.hosts {
         match host {
-            HostSpecYaml::Single(s) => hosts.push(HostSpec { name, domain_names: vec![s] }),
+            HostSpecYaml::Single(s) => hosts.push(HostSpec {
+                name,
+                domain_names: vec![s],
+            }),
             HostSpecYaml::Multiple(v) => hosts.push(HostSpec { name, domain_names: v }),
         }
     }
@@ -454,21 +470,23 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
 fn convert_body_limit(value: Option<&str>, owner: &str) -> Result<Option<u64>> {
     match value {
         None => Ok(None),
-        Some(raw) => parse_body_size_bytes(raw).map(Some).ok_or_else(|| anyhow!(
-            "Invalid body_limit '{}' on {}: expected a byte count with an optional k/m/g suffix, e.g. \"10m\"",
-            raw, owner
-        )),
+        Some(raw) => parse_body_size_bytes(raw).map(Some).ok_or_else(|| {
+            anyhow!(
+                "Invalid body_limit '{}' on {}: expected a byte count with an optional k/m/g suffix, e.g. \"10m\"",
+                raw,
+                owner
+            )
+        }),
     }
 }
 
 fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>, root: &Path) -> Result<Vec<spec::EnvVariable>> {
     match yaml {
         Some(DeploymentEnvVariablesYaml::FromEnvFile(env_file)) => env_loader::load_env_file(env_file),
-        Some(DeploymentEnvVariablesYaml::FromList(entries)) => {
-            entries.iter()
-                .map(|entry| convert_env_entry(entry, root))
-                .collect::<Result<Vec<_>>>()
-        },
+        Some(DeploymentEnvVariablesYaml::FromList(entries)) => entries
+            .iter()
+            .map(|entry| convert_env_entry(entry, root))
+            .collect::<Result<Vec<_>>>(),
         None => Ok(vec![]),
     }
 }
@@ -488,7 +506,7 @@ fn convert_env_entry(entry: &EnvVariableEntryYaml, root: &Path) -> Result<spec::
             let value = fs::read_to_string(&file_path)
                 .with_context(|| format!("Failed to read value for env variable '{}' from {:?}", name, file_path))?;
             // Files commonly end with a trailing newline that is not part of the value.
-            let value = value.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+            let value = value.trim_end_matches(['\n', '\r']).to_string();
             Ok(spec::EnvVariable {
                 name: name.clone(),
                 value,
@@ -497,14 +515,21 @@ fn convert_env_entry(entry: &EnvVariableEntryYaml, root: &Path) -> Result<spec::
     }
 }
 
-fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_type: &DeploymentEnvTypeYaml) -> Result<DeploymentSpec> {
+fn convert_deployment(
+    name: String,
+    yaml: &DeploymentSpecYaml,
+    root: &Path,
+    env_type: &DeploymentEnvTypeYaml,
+) -> Result<DeploymentSpec> {
     let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
-    let primary_host = yaml.primary_host.clone().ok_or_else(|| {
-        anyhow!("Deployment '{}' is missing required field 'primary_host'", name)
-    })?;
-    let application_yaml = yaml.application.as_ref().ok_or_else(|| {
-        anyhow!("Deployment '{}' is missing required field 'application'", name)
-    })?;
+    let primary_host = yaml
+        .primary_host
+        .clone()
+        .ok_or_else(|| anyhow!("Deployment '{}' is missing required field 'primary_host'", name))?;
+    let application_yaml = yaml
+        .application
+        .as_ref()
+        .ok_or_else(|| anyhow!("Deployment '{}' is missing required field 'application'", name))?;
     let application = convert_deployment_app(application_yaml)?;
     let environment = convert_env_variables(&yaml.environment, root)?;
     let mut undockerized_environment = convert_env_variables(&yaml.undockerized_environment, root)?;
@@ -561,10 +586,16 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_
                         .filter(|present| **present)
                         .count();
                     if sources > 1 {
-                        return Err(anyhow!("Secret {} can only have one of the env, file and aws sources", k));
+                        return Err(anyhow!(
+                            "Secret {} can only have one of the env, file and aws sources",
+                            k
+                        ));
                     }
                     if v.jq.is_some() && v.aws.is_none() {
-                        return Err(anyhow!("Secret {} sets jq, which is only valid together with an aws source", k));
+                        return Err(anyhow!(
+                            "Secret {} sets jq, which is only valid together with an aws source",
+                            k
+                        ));
                     }
                     let source = if let Some(env) = &v.env {
                         DeploymentSecretSource::EnvVariable(env.clone())
@@ -612,8 +643,14 @@ fn convert_deployment(name: String, yaml: &DeploymentSpecYaml, root: &Path, env_
     } else {
         ResourcesSpec {
             replicas: 1,
-            requests: ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
-            limits: ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
+            requests: ResourceLimits {
+                memory: DEFAULT_MEMORY.into(),
+                cpu: DEFAULT_CPU.into(),
+            },
+            limits: ResourceLimits {
+                memory: DEFAULT_MEMORY.into(),
+                cpu: DEFAULT_CPU.into(),
+            },
         }
     };
 
@@ -663,12 +700,22 @@ fn convert_defaults(yaml: &DefaultsSpecYaml) -> Result<ResourcesSpec> {
         )
     } else {
         (
-            ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
-            ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() },
+            ResourceLimits {
+                memory: DEFAULT_MEMORY.into(),
+                cpu: DEFAULT_CPU.into(),
+            },
+            ResourceLimits {
+                memory: DEFAULT_MEMORY.into(),
+                cpu: DEFAULT_CPU.into(),
+            },
         )
     };
 
-    Ok(ResourcesSpec { replicas, requests, limits })
+    Ok(ResourcesSpec {
+        replicas,
+        requests,
+        limits,
+    })
 }
 
 fn convert_limits(yaml: Option<&ResourceLimitsYaml>) -> ResourceLimits {
@@ -678,22 +725,34 @@ fn convert_limits(yaml: Option<&ResourceLimitsYaml>) -> ResourceLimits {
             cpu: l.cpu.clone().unwrap_or_else(|| DEFAULT_CPU.into()),
         }
     } else {
-        ResourceLimits { memory: DEFAULT_MEMORY.into(), cpu: DEFAULT_CPU.into() }
+        ResourceLimits {
+            memory: DEFAULT_MEMORY.into(),
+            cpu: DEFAULT_CPU.into(),
+        }
     }
 }
 
-fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, name: &str, defaults: &ResourcesSpec) -> Result<DeploymentServiceSpec> {
+fn convert_deployment_service(
+    yaml: &DeploymentServiceSpecYaml,
+    name: &str,
+    defaults: &ResourcesSpec,
+) -> Result<DeploymentServiceSpec> {
     let mut prefixes = if let Some(p) = &yaml.prefixes {
-        p.iter().map(|(k, v)| Prefix {
-            prefix: k.clone(),
-            strip: v.strip.unwrap_or(false),
-        }).collect()
+        p.iter()
+            .map(|(k, v)| Prefix {
+                prefix: k.clone(),
+                strip: v.strip.unwrap_or(false),
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
     if let Some(prefix) = &yaml.prefix {
-        prefixes.push(Prefix { prefix: prefix.clone(), strip: yaml.strip_prefix.unwrap_or(true) });
+        prefixes.push(Prefix {
+            prefix: prefix.clone(),
+            strip: yaml.strip_prefix.unwrap_or(true),
+        });
     }
 
     let resources = if let Some(res) = &yaml.resources {
@@ -718,7 +777,11 @@ fn convert_deployment_service(yaml: &DeploymentServiceSpecYaml, name: &str, defa
 
     let ports = super::parse_ports(&yaml.ports)?;
 
-    let volumes = yaml.volumes.clone().unwrap_or_default().into_iter()
+    let volumes = yaml
+        .volumes
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
         .map(|s| super::parse_service_volume(&s))
         .collect::<Result<Vec<_>>>()?;
 
@@ -785,7 +848,10 @@ deployments:
         let db = vars.iter().find(|v| v.name == "DB_HOST").unwrap();
         assert_eq!(db.value, "localhost");
         // unchanged var stays as defined in the spec
-        assert_eq!(vars.iter().find(|v| v.name == "REDIS_HOST").unwrap().value, "docker-redis");
+        assert_eq!(
+            vars.iter().find(|v| v.name == "REDIS_HOST").unwrap().value,
+            "docker-redis"
+        );
         assert_eq!(vars.iter().find(|v| v.name == "EXTRA").unwrap().value, "value");
     }
 
@@ -983,8 +1049,7 @@ child:
 
         // Base order is kept, the child's redefinition replaces in place, and new
         // variables are appended.
-        let pairs: Vec<(&str, &str)> =
-            env.iter().map(|v| (v.name.as_str(), v.value.as_str())).collect();
+        let pairs: Vec<(&str, &str)> = env.iter().map(|v| (v.name.as_str(), v.value.as_str())).collect();
         assert_eq!(
             pairs,
             vec![
@@ -996,8 +1061,7 @@ child:
         );
 
         // undockerized_environment merges the same way.
-        let undockerized =
-            convert_env_variables(&resolved["child"].undockerized_environment, root.path()).unwrap();
+        let undockerized = convert_env_variables(&resolved["child"].undockerized_environment, root.path()).unwrap();
         let names: Vec<&str> = undockerized.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["DB", "KEEP", "EXTRA"]);
     }
@@ -1147,7 +1211,9 @@ deployments:
     fn local_unknown_selected_deployment_is_rejected() {
         let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_SIBLINGS).unwrap();
         let root = tempfile::tempdir().unwrap();
-        let err = convert_env_spec(yaml, root.path(), Some("nope")).unwrap_err().to_string();
+        let err = convert_env_spec(yaml, root.path(), Some("nope"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not found in env spec"), "unexpected error: {err}");
         assert!(err.contains("local, with-prod-firebase"), "unexpected error: {err}");
     }

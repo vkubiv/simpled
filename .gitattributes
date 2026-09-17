@@ -1,0 +1,11 @@
+# Check every text file out with LF line endings on every platform.
+# docs/*.md are embedded in the binary with include_str! and compared byte for
+# byte in tests, so a CRLF checkout on Windows must not change their contents.
+* text=auto eol=lf
+
+# Binary files that must never be touched.
+*.png binary
+*.jpg binary
+*.gz binary
+*.zip binary
+*.tar binary
