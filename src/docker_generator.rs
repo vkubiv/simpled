@@ -10,8 +10,13 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOCKER_NETWORK: &str = "common_network";
-const NGINX_IMAGE: &str = "nginx:alpine";
+// Pinned, so two deploys of the same spec run the same gateway. A floating tag
+// would change the ingress underneath a deployment that touched nothing else.
+// nginx tracks a stable minor line; certbot is pinned exactly. Traefik stays
+// on v2 because v3 changes the configuration format.
+const NGINX_IMAGE: &str = "nginx:1.31-alpine";
 const TRAEFIK_IMAGE: &str = "traefik:v2.10";
+const CERTBOT_IMAGE: &str = "certbot/certbot:v5.8.0";
 const TRAEFIK_RESOLVER: &str = "myresolver";
 /// Placeholder backend for redirect-only routers, which still have to name one.
 const TRAEFIK_REDIRECT_SERVICE: &str = "redirect-noop";
@@ -831,7 +836,8 @@ fn generate_nginx_standalone(
             writeln!(certbot_sh, "  -v $(pwd)/certs:/etc/nginx/certs \\")?;
             writeln!(
                 certbot_sh,
-                "  certbot/certbot certonly --webroot --webroot-path=/var/www/letsencrypt \\"
+                "  {} certonly --webroot --webroot-path=/var/www/letsencrypt \\",
+                CERTBOT_IMAGE
             )?;
             writeln!(certbot_sh, "  --email {} --agree-tos --no-eff-email \\", le.email)?;
             // One certificate covers every domain, so pin the lineage name
