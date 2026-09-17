@@ -1,13 +1,11 @@
 use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, DockerService, ServiceNetwork};
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
-use crate::secret_fetch::{self, sh_quote, FetchScript};
+use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -169,14 +167,7 @@ fn generate_standalone(
     fs::create_dir_all(&envs_dir)?;
 
     // 4. Script
-    let mut deploy_sh = File::create(output_dir.join("deploy.sh"))?;
-
-    #[cfg(unix)]
-    {
-        let mut perms = deploy_sh.metadata()?.permissions();
-        perms.set_mode(0o755);
-        deploy_sh.set_permissions(perms)?;
-    }
+    let mut deploy_sh = create_executable(&output_dir.join("deploy.sh"))?;
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
@@ -487,14 +478,7 @@ fn generate_swarm(
     }
 
     // 5. Deploy Script
-    let mut deploy_sh = File::create(output_dir.join("deploy.sh"))?;
-
-    #[cfg(unix)]
-    {
-        let mut perms = deploy_sh.metadata()?.permissions();
-        perms.set_mode(0o755);
-        deploy_sh.set_permissions(perms)?;
-    }
+    let mut deploy_sh = create_executable(&output_dir.join("deploy.sh"))?;
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;

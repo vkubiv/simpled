@@ -28,6 +28,20 @@ pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Create `path` with the executable bit set, for the shell scripts every
+/// generator writes. On Windows the bit does not exist and the file is simply
+/// created.
+pub fn create_executable(path: &Path) -> Result<File> {
+    let file = File::create(path).with_context(|| format!("Failed to create {:?}", path))?;
+    #[cfg(unix)]
+    {
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o755);
+        file.set_permissions(perms)?;
+    }
+    Ok(file)
+}
+
 /// Name of the helper the script uses to read one secret, defined in its
 /// preamble. Prefixed like the other shell state the script leaves behind,
 /// because `deploy.sh` sources it.
@@ -165,14 +179,7 @@ impl FetchScript {
     /// header, which differs per target: sourced by `deploy.sh` for Docker, run by
     /// hand before `kubectl apply` for Kubernetes.
     pub fn write(&self, path: &Path, usage: &str) -> Result<()> {
-        let mut file = File::create(path).with_context(|| format!("Failed to create {:?}", path))?;
-
-        #[cfg(unix)]
-        {
-            let mut perms = file.metadata()?.permissions();
-            perms.set_mode(0o755);
-            file.set_permissions(perms)?;
-        }
+        let mut file = create_executable(path)?;
 
         writeln!(file, "#!/bin/bash")?;
         writeln!(

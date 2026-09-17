@@ -289,11 +289,7 @@ fn prepare_deployment_command(
     let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name))?;
 
     // Find deployment to get app name
-    let deployment = env_spec
-        .deployments
-        .iter()
-        .find(|d| d.name == deployment_name)
-        .context(format!("Deployment {} not found", deployment_name))?;
+    let deployment = env_spec.deployment(deployment_name)?;
 
     let app_name = &deployment.application.name;
 
@@ -366,11 +362,7 @@ fn select_deployment<'a>(
     requested: Option<&str>,
 ) -> Result<&'a spec::DeploymentSpec> {
     if let Some(name) = requested {
-        return env_spec
-            .deployments
-            .iter()
-            .find(|d| d.name == name)
-            .context(format!("Deployment '{}' not found in env spec", name));
+        return env_spec.deployment(name);
     }
 
     match env_spec.deployments.as_slice() {

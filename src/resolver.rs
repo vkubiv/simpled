@@ -13,11 +13,7 @@ pub fn resolve(
     app_spec: &AppSpec,
     deployment_name: &str,
 ) -> Result<EnvironmentResolvedSpec> {
-    let deployment = env_spec
-        .deployments
-        .iter()
-        .find(|d| d.name == deployment_name)
-        .ok_or_else(|| anyhow!("Deployment {} not found", deployment_name))?;
+    let deployment = env_spec.deployment(deployment_name)?;
 
     // 1. Resolve Configs
     let mut resolved_configs = Vec::new();
@@ -111,6 +107,15 @@ pub fn resolve(
 
     // 3. Resolve Services
     let mut resolved_services = Vec::new();
+    let use_tls = env_spec.ingress.tls.is_some();
+    // The undockerized environment is the deployment environment with the
+    // undockerized overrides applied on top.
+    let mut undockerized_values = deployment_environment.clone();
+    for override_var in &deployment_undockerized_environment {
+        add_unique_var(&mut undockerized_values, override_var.clone());
+    }
+    // (environment, undockerized environment) resolved per host domain.
+    let mut env_by_host: HashMap<String, (Vec<EnvVariable>, Vec<EnvVariable>)> = HashMap::new();
     let mut public_host_prefix_combinations = HashSet::new();
 
     let primary_host = &deployment.primary_host;
@@ -191,21 +196,24 @@ pub fn resolve(
             }
         }
 
-        // Resolve Environment Variables
-        let use_tls = env_spec.ingress.tls.is_some();
-        let environment_variables =
-            resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
-        let final_service_env_vars = filter_service_env_vars(app_service, app_spec, &environment_variables)?;
-
-        // Resolve Undockerized Environment Variables
-        let mut undockerized_values = deployment_environment.clone();
-        for override_var in &deployment_undockerized_environment {
-            add_unique_var(&mut undockerized_values, override_var.clone());
-        }
-        let undockerized_variables =
-            resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
+        // Resolve Environment Variables. The full set depends only on the host
+        // a service is served from, so it is computed once per host and every
+        // service then picks the entries it asks for.
+        let (environment_variables, undockerized_variables) = match env_by_host.get(host_domain_name) {
+            Some(resolved) => resolved,
+            None => {
+                let environment =
+                    resolve_app_env_vars(app_spec, &deployment_environment, Some(host_domain_name), use_tls)?;
+                let undockerized =
+                    resolve_app_env_vars(app_spec, &undockerized_values, Some(host_domain_name), use_tls)?;
+                env_by_host
+                    .entry(host_domain_name.clone())
+                    .or_insert((environment, undockerized))
+            }
+        };
+        let final_service_env_vars = filter_service_env_vars(app_service, app_spec, environment_variables)?;
         let final_undockerized_service_env_vars =
-            filter_service_env_vars(app_service, app_spec, &undockerized_variables)?;
+            filter_service_env_vars(app_service, app_spec, undockerized_variables)?;
 
         // Resolve Configs
         let mut service_configs = Vec::new();

@@ -350,6 +350,21 @@ pub struct DeploymentEnvironmentSpec {
     pub deployments: Vec<DeploymentSpec>,
 }
 
+impl DeploymentEnvironmentSpec {
+    /// The deployment called `name`, or an error naming the ones that exist.
+    pub fn deployment(&self, name: &str) -> anyhow::Result<&DeploymentSpec> {
+        self.deployments.iter().find(|d| d.name == name).ok_or_else(|| {
+            let mut available: Vec<&str> = self.deployments.iter().map(|d| d.name.as_str()).collect();
+            available.sort();
+            anyhow::anyhow!(
+                "Deployment '{}' not found in env spec. Available deployments: {}",
+                name,
+                available.join(", ")
+            )
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngressSpec {
     pub name: String,

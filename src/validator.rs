@@ -5,11 +5,7 @@ use std::fs;
 use std::path::Path;
 
 pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_name: &str) -> Result<()> {
-    let deployment = env_spec
-        .deployments
-        .iter()
-        .find(|d| d.name == env_name)
-        .ok_or_else(|| anyhow!("Deployment {} not found in envspec", env_name))?;
+    let deployment = env_spec.deployment(env_name)?;
 
     // Check application name
     if deployment.application.name != app_spec.name {
