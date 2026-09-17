@@ -1,8 +1,9 @@
+use crate::resolved_spec::{DeploymentResolvedSpec, ServiceResolvedSpec};
 use crate::resolved_spec::{
     EnvironmentResolvedSpec, IngressResolvedSpec, IngressToServiceRule, LetsEncryptResolvedSpec,
 };
 use crate::secret_fetch::{self, sh_quote, FetchScript};
-use crate::spec::{parse_duration_secs, Healthcheck, SecretMount};
+use crate::spec::{parse_duration_secs, Healthcheck, SecretMount, ServiceType};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
@@ -22,12 +23,13 @@ pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> R
 
     // 1. ConfigMaps
     for config in &deployment.configs {
-        let file_name = output_dir.join(format!("configmap-{}.yaml", config.name));
+        let name = k8s_name(&config.name);
+        let file_name = output_dir.join(format!("configmap-{}.yaml", name));
         let mut file = File::create(file_name)?;
         writeln!(file, "apiVersion: v1")?;
         writeln!(file, "kind: ConfigMap")?;
         writeln!(file, "metadata:")?;
-        writeln!(file, "  name: {}", config.name)?;
+        writeln!(file, "  name: {}", name)?;
         writeln!(file, "binaryData:")?;
         for cfg_file in &config.files {
             let encoded = general_purpose::STANDARD.encode(&cfg_file.content);
@@ -51,7 +53,7 @@ pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> R
             fetch_script.command(format!(
                 "kubectl create secret generic {name} --from-literal=value=\"${var}\" \
                  --dry-run=client -o yaml | kubectl apply -f -",
-                name = sh_quote(&secret.name),
+                name = sh_quote(&k8s_name(&secret.name)),
                 var = secret.shell_var(),
             ));
         }
@@ -61,12 +63,13 @@ pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> R
             continue;
         }
 
-        let file_name = output_dir.join(format!("secret-{}.yaml", secret.name));
+        let name = k8s_name(&secret.name);
+        let file_name = output_dir.join(format!("secret-{}.yaml", name));
         let mut file = File::create(file_name)?;
         writeln!(file, "apiVersion: v1")?;
         writeln!(file, "kind: Secret")?;
         writeln!(file, "metadata:")?;
-        writeln!(file, "  name: {}", secret.name)?;
+        writeln!(file, "  name: {}", name)?;
         writeln!(file, "type: Opaque")?;
         writeln!(file, "data:")?;
         let encoded = general_purpose::STANDARD.encode(secret.literal().unwrap_or_default());
@@ -81,135 +84,14 @@ pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> R
         )?;
     }
 
-    // 3. Deployments & Services
+    // 3. Workloads & Services
+    let deploy_date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     for service in &deployment.services {
-        let file_name = output_dir.join(format!("deployment-{}.yaml", service.full_name));
-        let mut file = File::create(file_name)?;
-
-        // Deployment
-        writeln!(file, "apiVersion: apps/v1")?;
-        writeln!(file, "kind: Deployment")?;
-        writeln!(file, "metadata:")?;
-        writeln!(file, "  name: {}", service.full_name)?;
-        writeln!(file, "spec:")?;
-        writeln!(file, "  replicas: {}", deployment.defaults.replicas)?;
-        writeln!(file, "  selector:")?;
-        writeln!(file, "    matchLabels:")?;
-        writeln!(file, "      app: {}", service.full_name)?;
-        writeln!(file, "  template:")?;
-        writeln!(file, "    metadata:")?;
-        writeln!(file, "      labels:")?;
-        writeln!(file, "        app: {}", service.full_name)?;
-        writeln!(file, "    spec:")?;
-        writeln!(file, "      containers:")?;
-        writeln!(file, "      - name: {}", service.full_name)?;
-        writeln!(file, "        image: {}", service.image)?;
-        // docker-compose `entrypoint` overrides the image ENTRYPOINT, which maps
-        // to a container's `command` in Kubernetes; `command` overrides the image
-        // CMD, which maps to a container's `args`.
-        if let Some(entrypoint) = &service.entrypoint {
-            writeln!(file, "        command:")?;
-            for arg in entrypoint.to_args() {
-                writeln!(file, "        - \"{}\"", arg)?;
-            }
-        }
-        if let Some(command) = &service.command {
-            writeln!(file, "        args:")?;
-            for arg in command.to_args() {
-                writeln!(file, "        - \"{}\"", arg)?;
-            }
-        }
-        // docker-compose `healthcheck` maps to liveness/readiness probes.
-        if let Some(hc) = &service.healthcheck {
-            if let Some(argv) = hc.probe_argv() {
-                write_probe(&mut file, "livenessProbe", &argv, hc)?;
-                write_probe(&mut file, "readinessProbe", &argv, hc)?;
-            }
-        }
-        writeln!(file, "        resources:")?;
-        writeln!(file, "          requests:")?;
-        writeln!(file, "            memory: {}", deployment.defaults.requests.memory)?;
-        writeln!(file, "            cpu: {}", deployment.defaults.requests.cpu)?;
-        writeln!(file, "          limits:")?;
-        writeln!(file, "            memory: {}", deployment.defaults.limits.memory)?;
-        writeln!(file, "            cpu: {}", deployment.defaults.limits.cpu)?;
-
-        let deploy_date = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        writeln!(file, "        env:")?;
-        writeln!(file, "        - name: DEPLOY_DATE")?;
-        writeln!(file, "          value: \"{}\"", deploy_date)?;
-        for env in &service.environment_variables {
-            writeln!(file, "        - name: {}", env.name)?;
-            writeln!(file, "          value: \"{}\"", env.value)?;
-        }
-        for secret in &service.secrets {
-            if let SecretMount::EnvVariable(var_name) = &secret.mount {
-                writeln!(file, "        - name: {}", var_name)?;
-                writeln!(file, "          valueFrom:")?;
-                writeln!(file, "            secretKeyRef:")?;
-                writeln!(file, "              name: {}", secret.name)?;
-                writeln!(file, "              key: value")?;
-            }
-        }
-
-        // Volume Mounts (Configs & Secrets)
-        let has_volume_mounts = !service.configs.is_empty()
-            || service
-                .secrets
-                .iter()
-                .any(|s| !matches!(s.mount, SecretMount::EnvVariable(_)));
-
-        if has_volume_mounts {
-            writeln!(file, "        volumeMounts:")?;
-            for config in &service.configs {
-                writeln!(file, "        - name: config-{}", config.config_name)?;
-                writeln!(file, "          mountPath: {}", config.mount_path)?;
-            }
-            for secret in &service.secrets {
-                match &secret.mount {
-                    SecretMount::FilePath(path) => {
-                        writeln!(file, "        - name: secret-{}", secret.name)?;
-                        writeln!(file, "          mountPath: {}", path)?;
-                    }
-                    SecretMount::EnvVariable(_) => {}
-                }
-            }
-        }
-
-        if has_volume_mounts {
-            writeln!(file, "      volumes:")?;
-            for config in &service.configs {
-                writeln!(file, "      - name: config-{}", config.config_name)?;
-                writeln!(file, "        configMap:")?;
-                writeln!(file, "          name: {}", config.config_name)?;
-            }
-            for secret in &service.secrets {
-                if !matches!(secret.mount, SecretMount::EnvVariable(_)) {
-                    writeln!(file, "      - name: secret-{}", secret.name)?;
-                    writeln!(file, "        secret:")?;
-                    writeln!(file, "          secretName: {}", secret.name)?;
-                }
-            }
-        }
-
-        // Service
-        let svc_file_name = output_dir.join(format!("service-{}.yaml", service.full_name));
-        let mut svc_file = File::create(svc_file_name)?;
-        writeln!(svc_file, "apiVersion: v1")?;
-        writeln!(svc_file, "kind: Service")?;
-        writeln!(svc_file, "metadata:")?;
-        writeln!(svc_file, "  name: {}", service.full_name)?;
-        writeln!(svc_file, "spec:")?;
-        writeln!(svc_file, "  selector:")?;
-        writeln!(svc_file, "    app: {}", service.full_name)?;
-        writeln!(svc_file, "  ports:")?;
-        for port in &service.ports {
-            writeln!(svc_file, "  - port: {}", port.external)?;
-            writeln!(svc_file, "    targetPort: {}", port.internal)?;
-        }
+        write_workload(output_dir, deployment, service, deploy_date)?;
+        write_service(output_dir, service)?;
     }
 
     // 4. Ingress
@@ -225,6 +107,217 @@ pub fn generate(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> R
     Ok(())
 }
 
+/// Seconds a finished Job is kept before Kubernetes garbage-collects it, long
+/// enough to read its logs after a failed deploy.
+const JOB_TTL_SECONDS: u32 = 86_400;
+
+/// Kubernetes object names must be DNS-1123 subdomains: lower-case alphanumerics,
+/// `-` and `.`, starting and ending with an alphanumeric. Spec names are freer
+/// (`db_password` is the documented style), so every name is normalized on the
+/// way into a manifest, references included, and both sides always agree.
+pub fn k8s_name(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' })
+        .collect();
+    mapped.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_string()
+}
+
+/// A YAML double-quoted scalar, so a value holding quotes, backslashes or line
+/// breaks cannot break the manifest around it.
+fn yaml_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The Deployment for a long-running service, or the Job for a `type: job` one.
+///
+/// A Job's pod template is immutable and its image changes with every release,
+/// so re-applying a Job of the same name would be rejected. Each deploy therefore
+/// gets a Job of its own, named after the deploy date and garbage-collected a day
+/// after it finishes. Kubernetes applies the whole directory at once, so unlike
+/// the Docker targets nothing waits for the job: `depends_on` is not enforced.
+fn write_workload(
+    output_dir: &Path,
+    deployment: &DeploymentResolvedSpec,
+    service: &ServiceResolvedSpec,
+    deploy_date: u64,
+) -> Result<()> {
+    let name = k8s_name(&service.full_name);
+    let is_job = matches!(service.service_type, ServiceType::Job);
+
+    let file_name = if is_job {
+        output_dir.join(format!("job-{}.yaml", name))
+    } else {
+        output_dir.join(format!("deployment-{}.yaml", name))
+    };
+    let mut file = File::create(file_name)?;
+
+    if is_job {
+        writeln!(file, "apiVersion: batch/v1")?;
+        writeln!(file, "kind: Job")?;
+        writeln!(file, "metadata:")?;
+        writeln!(file, "  name: {}-{}", name, deploy_date)?;
+        writeln!(file, "  labels:")?;
+        writeln!(file, "    app: {}", name)?;
+        writeln!(file, "spec:")?;
+        // A migration that fails must surface as a failed deploy, not be retried
+        // until it happens to pass; this mirrors the Docker deploy scripts.
+        writeln!(file, "  backoffLimit: 0")?;
+        writeln!(file, "  ttlSecondsAfterFinished: {}", JOB_TTL_SECONDS)?;
+        writeln!(file, "  template:")?;
+        writeln!(file, "    metadata:")?;
+        writeln!(file, "      labels:")?;
+        writeln!(file, "        app: {}", name)?;
+        writeln!(file, "    spec:")?;
+        writeln!(file, "      restartPolicy: Never")?;
+    } else {
+        writeln!(file, "apiVersion: apps/v1")?;
+        writeln!(file, "kind: Deployment")?;
+        writeln!(file, "metadata:")?;
+        writeln!(file, "  name: {}", name)?;
+        writeln!(file, "spec:")?;
+        writeln!(file, "  replicas: {}", deployment.defaults.replicas)?;
+        writeln!(file, "  selector:")?;
+        writeln!(file, "    matchLabels:")?;
+        writeln!(file, "      app: {}", name)?;
+        writeln!(file, "  template:")?;
+        writeln!(file, "    metadata:")?;
+        writeln!(file, "      labels:")?;
+        writeln!(file, "        app: {}", name)?;
+        writeln!(file, "    spec:")?;
+    }
+
+    writeln!(file, "      containers:")?;
+    writeln!(file, "      - name: {}", name)?;
+    writeln!(file, "        image: {}", service.image)?;
+    // docker-compose `entrypoint` overrides the image ENTRYPOINT, which maps
+    // to a container's `command` in Kubernetes; `command` overrides the image
+    // CMD, which maps to a container's `args`.
+    if let Some(entrypoint) = &service.entrypoint {
+        writeln!(file, "        command:")?;
+        for arg in entrypoint.to_args() {
+            writeln!(file, "        - {}", yaml_quote(&arg))?;
+        }
+    }
+    if let Some(command) = &service.command {
+        writeln!(file, "        args:")?;
+        for arg in command.to_args() {
+            writeln!(file, "        - {}", yaml_quote(&arg))?;
+        }
+    }
+    // docker-compose `healthcheck` maps to liveness/readiness probes. A job is
+    // expected to exit, so it gets neither.
+    if !is_job {
+        if let Some(hc) = &service.healthcheck {
+            if let Some(argv) = hc.probe_argv() {
+                write_probe(&mut file, "livenessProbe", &argv, hc)?;
+                write_probe(&mut file, "readinessProbe", &argv, hc)?;
+            }
+        }
+    }
+    writeln!(file, "        resources:")?;
+    writeln!(file, "          requests:")?;
+    writeln!(file, "            memory: {}", deployment.defaults.requests.memory)?;
+    writeln!(file, "            cpu: {}", deployment.defaults.requests.cpu)?;
+    writeln!(file, "          limits:")?;
+    writeln!(file, "            memory: {}", deployment.defaults.limits.memory)?;
+    writeln!(file, "            cpu: {}", deployment.defaults.limits.cpu)?;
+
+    writeln!(file, "        env:")?;
+    writeln!(file, "        - name: DEPLOY_DATE")?;
+    writeln!(file, "          value: \"{}\"", deploy_date)?;
+    for env in &service.environment_variables {
+        writeln!(file, "        - name: {}", env.name)?;
+        writeln!(file, "          value: {}", yaml_quote(&env.value))?;
+    }
+    for secret in &service.secrets {
+        if let SecretMount::EnvVariable(var_name) = &secret.mount {
+            writeln!(file, "        - name: {}", var_name)?;
+            writeln!(file, "          valueFrom:")?;
+            writeln!(file, "            secretKeyRef:")?;
+            writeln!(file, "              name: {}", k8s_name(&secret.name))?;
+            writeln!(file, "              key: value")?;
+        }
+    }
+
+    // Volume Mounts (Configs & Secrets)
+    let has_volume_mounts = !service.configs.is_empty()
+        || service
+            .secrets
+            .iter()
+            .any(|s| !matches!(s.mount, SecretMount::EnvVariable(_)));
+
+    if has_volume_mounts {
+        writeln!(file, "        volumeMounts:")?;
+        for config in &service.configs {
+            writeln!(file, "        - name: config-{}", k8s_name(&config.config_name))?;
+            writeln!(file, "          mountPath: {}", config.mount_path)?;
+        }
+        for secret in &service.secrets {
+            if let SecretMount::FilePath(path) = &secret.mount {
+                writeln!(file, "        - name: secret-{}", k8s_name(&secret.name))?;
+                writeln!(file, "          mountPath: {}", path)?;
+            }
+        }
+
+        writeln!(file, "      volumes:")?;
+        for config in &service.configs {
+            let config_name = k8s_name(&config.config_name);
+            writeln!(file, "      - name: config-{}", config_name)?;
+            writeln!(file, "        configMap:")?;
+            writeln!(file, "          name: {}", config_name)?;
+        }
+        for secret in &service.secrets {
+            if !matches!(secret.mount, SecretMount::EnvVariable(_)) {
+                let secret_name = k8s_name(&secret.name);
+                writeln!(file, "      - name: secret-{}", secret_name)?;
+                writeln!(file, "        secret:")?;
+                writeln!(file, "          secretName: {}", secret_name)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The Service in front of a long-running workload. A Service must declare at
+/// least one port, and a job is never dialled, so neither gets one.
+fn write_service(output_dir: &Path, service: &ServiceResolvedSpec) -> Result<()> {
+    if matches!(service.service_type, ServiceType::Job) || service.ports.is_empty() {
+        return Ok(());
+    }
+    let name = k8s_name(&service.full_name);
+    let svc_file_name = output_dir.join(format!("service-{}.yaml", name));
+    let mut svc_file = File::create(svc_file_name)?;
+    writeln!(svc_file, "apiVersion: v1")?;
+    writeln!(svc_file, "kind: Service")?;
+    writeln!(svc_file, "metadata:")?;
+    writeln!(svc_file, "  name: {}", name)?;
+    writeln!(svc_file, "spec:")?;
+    writeln!(svc_file, "  selector:")?;
+    writeln!(svc_file, "    app: {}", name)?;
+    writeln!(svc_file, "  ports:")?;
+    for port in &service.ports {
+        writeln!(svc_file, "  - port: {}", port.external)?;
+        writeln!(svc_file, "    targetPort: {}", port.internal)?;
+    }
+    Ok(())
+}
+
 /// Write a Kubernetes exec probe (`livenessProbe`/`readinessProbe`) built from a
 /// docker-compose healthcheck. Compose durations are parsed to whole seconds;
 /// `retries` maps to `failureThreshold` and `start_period` to
@@ -235,7 +328,7 @@ fn write_probe(file: &mut File, name: &str, argv: &[String], hc: &Healthcheck) -
     writeln!(file, "          exec:")?;
     writeln!(file, "            command:")?;
     for arg in argv {
-        writeln!(file, "            - \"{}\"", arg)?;
+        writeln!(file, "            - {}", yaml_quote(arg))?;
     }
     if let Some(interval) = hc.interval.as_deref().and_then(parse_duration_secs) {
         writeln!(file, "          periodSeconds: {}", interval)?;
@@ -382,7 +475,7 @@ fn generate_ingress(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) 
                 writeln!(file, "        pathType: {}", path_type)?;
                 writeln!(file, "        backend:")?;
                 writeln!(file, "          service:")?;
-                writeln!(file, "            name: {}", svc_rule.service_name)?;
+                writeln!(file, "            name: {}", k8s_name(&svc_rule.service_name))?;
                 writeln!(file, "            port:")?;
                 writeln!(file, "              number: {}", svc_rule.port)?;
             }
@@ -479,7 +572,7 @@ fn generate_redirect_ingresses(ingress: &IngressResolvedSpec, file: &mut File) -
             writeln!(file, "        pathType: Prefix")?;
             writeln!(file, "        backend:")?;
             writeln!(file, "          service:")?;
-            writeln!(file, "            name: {}", placeholder.service_name)?;
+            writeln!(file, "            name: {}", k8s_name(&placeholder.service_name))?;
             writeln!(file, "            port:")?;
             writeln!(file, "              number: {}", placeholder.port)?;
         }
@@ -747,5 +840,152 @@ mod tests {
         let mut file = File::create(dir.path().join("ingress.yaml")).unwrap();
         let err = generate_redirect_ingresses(&spec, &mut file).unwrap_err().to_string();
         assert!(err.contains("at least one service"), "unexpected error: {}", err);
+    }
+
+    fn workload(name: &str, service_type: ServiceType) -> ServiceResolvedSpec {
+        ServiceResolvedSpec {
+            service_type,
+            is_app_service: true,
+            full_name: name.to_string(),
+            image: format!("registry.example.com/{}:1.0.0", name),
+            environment_variables: vec![],
+            undockerized_environment_variables: vec![],
+            configs: vec![],
+            secrets: vec![],
+            ports: vec![crate::spec::ServicePort {
+                external: 80,
+                internal: 8080,
+            }],
+            expose: vec![],
+            volumes: vec![],
+            command: None,
+            entrypoint: None,
+            healthcheck: None,
+            depends_on: vec![],
+            working_dir: None,
+        }
+    }
+
+    fn generate_to_temp(services: Vec<ServiceResolvedSpec>) -> tempfile::TempDir {
+        let mut spec = spec_with_limits(&[("api", "/", None)]);
+        spec.current_deployment.services = services;
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, dir.path()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn names_are_normalized_to_dns_1123() {
+        assert_eq!(k8s_name("shop-db_password"), "shop-db-password");
+        assert_eq!(k8s_name("Main Svc"), "main-svc");
+        assert_eq!(k8s_name("-api-"), "api");
+        assert_eq!(k8s_name("api"), "api");
+    }
+
+    #[test]
+    fn yaml_scalars_are_escaped() {
+        assert_eq!(yaml_quote("plain"), "\"plain\"");
+        assert_eq!(yaml_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(yaml_quote("a\\b"), "\"a\\\\b\"");
+        assert_eq!(yaml_quote("line1\nline2"), "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn a_job_becomes_a_kubernetes_job_without_a_service() {
+        let dir = generate_to_temp(vec![workload("migrate", ServiceType::Job)]);
+
+        let job = fs::read_to_string(dir.path().join("job-migrate.yaml")).unwrap();
+        assert!(job.contains("kind: Job"), "{}", job);
+        assert!(job.contains("backoffLimit: 0"), "{}", job);
+        assert!(job.contains("restartPolicy: Never"), "{}", job);
+        // The name carries the deploy date, since a Job's template is immutable.
+        assert!(job.contains("  name: migrate-"), "{}", job);
+        assert!(!dir.path().join("deployment-migrate.yaml").exists());
+        assert!(!dir.path().join("service-migrate.yaml").exists());
+    }
+
+    #[test]
+    fn a_service_without_ports_gets_no_service_object() {
+        let mut worker = workload("worker", ServiceType::Internal);
+        worker.ports.clear();
+        let dir = generate_to_temp(vec![worker]);
+
+        assert!(dir.path().join("deployment-worker.yaml").exists());
+        assert!(!dir.path().join("service-worker.yaml").exists());
+    }
+
+    #[test]
+    fn underscored_secret_names_are_valid_everywhere_they_appear() {
+        let mut api = workload("api", ServiceType::Public);
+        api.secrets = vec![
+            crate::spec::ServiceSecret {
+                name: "shop-db_password".to_string(),
+                mount: SecretMount::EnvVariable("DB_PASSWORD".to_string()),
+            },
+            crate::spec::ServiceSecret {
+                name: "shop-tls_key".to_string(),
+                mount: SecretMount::FilePath("/run/secrets/tls.key".to_string()),
+            },
+        ];
+        let mut spec = spec_with_limits(&[("api", "/", None)]);
+        spec.current_deployment.services = vec![api];
+        spec.current_deployment.secrets = vec![
+            crate::resolved_spec::SecretResolvedSpec {
+                name: "shop-db_password".to_string(),
+                value: crate::resolved_spec::SecretResolvedValue::Literal("pw".to_string()),
+            },
+            crate::resolved_spec::SecretResolvedSpec {
+                name: "shop-tls_key".to_string(),
+                value: crate::resolved_spec::SecretResolvedValue::Deferred(crate::spec::AwsSecretRef {
+                    secret_id: "prod/tls".to_string(),
+                    jq: None,
+                }),
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        generate(&spec, dir.path()).unwrap();
+
+        let secret = fs::read_to_string(dir.path().join("secret-shop-db-password.yaml")).unwrap();
+        assert!(secret.contains("  name: shop-db-password"), "{}", secret);
+
+        let deployment = fs::read_to_string(dir.path().join("deployment-api.yaml")).unwrap();
+        assert!(
+            deployment.contains("              name: shop-db-password"),
+            "{}",
+            deployment
+        );
+        assert!(
+            deployment.contains("          secretName: shop-tls-key"),
+            "{}",
+            deployment
+        );
+
+        // The deferred secret is created under the same normalized name.
+        let fetch = fs::read_to_string(dir.path().join("fetch-secrets.sh")).unwrap();
+        assert!(
+            fetch.contains("kubectl create secret generic 'shop-tls-key'"),
+            "{}",
+            fetch
+        );
+    }
+
+    #[test]
+    fn env_values_with_quotes_stay_valid_yaml() {
+        let mut api = workload("api", ServiceType::Public);
+        api.environment_variables = vec![crate::spec::EnvVariable {
+            name: "GREETING".to_string(),
+            value: "say \"hi\"\\now".to_string(),
+        }];
+        let dir = generate_to_temp(vec![api]);
+
+        let deployment = fs::read_to_string(dir.path().join("deployment-api.yaml")).unwrap();
+        assert!(
+            deployment.contains("value: \"say \\\"hi\\\"\\\\now\""),
+            "{}",
+            deployment
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&deployment).unwrap();
+        let env = &parsed["spec"]["template"]["spec"]["containers"][0]["env"][1];
+        assert_eq!(env["value"].as_str(), Some("say \"hi\"\\now"));
     }
 }

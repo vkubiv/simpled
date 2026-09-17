@@ -106,7 +106,7 @@ extra_services:
 | `environment` | list | no | Variables to inject. Use `$all` to pass everything. Individual entries can override with `NAME=value`. |
 | `configs` | list | no | Config groups to mount. Format: `- config-name: /mount/path`. |
 | `secrets` | list | no | Secrets to provide. See below. |
-| `ports` | list | no | Ports to expose (Docker). Informational in Kubernetes. |
+| `ports` | list | no | Ports to expose. On Kubernetes they become the Service's ports; a service without ports gets no Service object. |
 | `volumes` | list | no | Volume mounts. Named volumes must be declared in the top-level `volumes:` list. |
 | `depends_on` | list | no | Services that must be running before this one starts. Drives the ordering of the generated Docker deploy scripts and the local compose file; ignored for Kubernetes. Cycles are rejected. |
 
@@ -156,6 +156,14 @@ limit with `JOB_TIMEOUT`), prints its logs, removes the service, and exits non-z
 unless the task reports `Complete`. Overriding `entrypoint` on a job requires a
 Docker CLI that supports `docker service create --entrypoint` (25.0+); `command`,
 env files, secrets, configs and volume mounts work on any version.
+
+On Kubernetes a job becomes a `batch/v1` Job with `restartPolicy: Never` and
+`backoffLimit: 0`, so a failed migration shows up as a failed Job rather than being
+retried. A Job's pod template is immutable and the image changes with every release,
+so each deploy gets a Job of its own, named `<service>-<deploy date>` and
+garbage-collected a day after it finishes. `kubectl apply` submits the whole directory
+at once, so nothing waits for the job there: the phases above are a Docker feature, and
+`depends_on` is not enforced on Kubernetes.
 
 #### Secret mount options
 
@@ -851,12 +859,18 @@ Output directory: `manifests/`
 
 | File | Description |
 |------|-------------|
-| `deployment-<service>.yaml` | Kubernetes Deployment |
-| `service-<service>.yaml` | Kubernetes Service |
+| `deployment-<service>.yaml` | Kubernetes Deployment, one per long-running service |
+| `job-<service>.yaml` | Kubernetes Job, one per `type: job` service |
+| `service-<service>.yaml` | Kubernetes Service, for every long-running service that declares `ports` |
 | `ingress.yaml` | Ingress resource with all routing rules |
 | `configmap-<name>.yaml` | ConfigMap for each config group |
 | `secret-<name>.yaml` | Secret for each secret |
 | `cluster-issuer.yaml` | Let's Encrypt ClusterIssuer (if configured) |
+
+Object names follow Kubernetes' DNS-1123 rules, so a spec name such as `db_password` is
+written as `shop-db-password`: lower-cased, with every character other than letters,
+digits and `.` turned into `-`. References are normalized the same way, so manifests
+always agree with each other.
 
 ### Docker standalone (`type: docker`, no swarm)
 
