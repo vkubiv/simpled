@@ -8,15 +8,15 @@ clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 anyhow = "1.0"
-env_logger = "0.11.8"
 semver = "1.0.27"
 tar = "0.4"
 flate2 = "1.0"
 base64 = "0.22"
 axum-reverse-proxy = { version = "1.0", features = [] }
-tokio = "1.48.0"
+tokio = { version = "1.48", features = ["rt-multi-thread", "net"] }
 axum = "0.8.8"
-reqwest = { version = "0.11", features = ["blocking", "rustls-tls", "json"] }
+# default-features off keeps native-tls (and so OpenSSL on Linux) out of the build.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3.8"

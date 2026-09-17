@@ -187,7 +187,6 @@ enum AppBundleCommands {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
     let cli = Cli::parse();
 
     match &cli.command {
