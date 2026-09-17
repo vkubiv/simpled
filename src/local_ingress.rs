@@ -155,7 +155,7 @@ fn shutdown_stack_and_exit(message: &str) -> ! {
 /// this function returns so that a bind failure (e.g. the port is already in
 /// use) is reported to the caller *before* any docker compose services are
 /// started, rather than orphaning them.
-pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
+pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> Result<()> {
     let current_deployment = current_deployment.to_string();
 
     // A local run binds real sockets on the host, and a port can only be bound
@@ -262,7 +262,7 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str) -> Result<()> {
                 async move { apply_redirects(redirects, limits, req, next).await }
             }))
         };
-        let bind_addr = format!("0.0.0.0:{}", port);
+        let bind_addr = format!("{}:{}", bind, port);
         let listener = StdTcpListener::bind(&bind_addr)
             .with_context(|| format!("Failed to bind local ingress on {}", bind_addr))?;
         listener

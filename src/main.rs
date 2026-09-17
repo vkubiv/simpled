@@ -124,6 +124,12 @@ enum LocalCommands {
         /// Deployment to run. Required when the env spec defines more than one.
         #[arg(long)]
         deployment: Option<String>,
+
+        /// Address the local gateway listens on. The default keeps a stack that
+        /// carries real secrets off the network; pass 0.0.0.0 to reach it from
+        /// another device.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
     },
     /// Run the gateway and only extra services (no app services)
     OnlyExtra {
@@ -133,6 +139,12 @@ enum LocalCommands {
         /// Deployment to run. Required when the env spec defines more than one.
         #[arg(long)]
         deployment: Option<String>,
+
+        /// Address the local gateway listens on. The default keeps a stack that
+        /// carries real secrets off the network; pass 0.0.0.0 to reach it from
+        /// another device.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
     },
     /// Regenerate local_env configuration without running the gateway or docker compose
     GenerateConfig {
@@ -381,7 +393,7 @@ fn select_deployment<'a>(
 fn local(command: &LocalCommands) -> Result<()> {
     let (root, deployment_name) = match command {
         LocalCommands::Run { path, deployment, .. }
-        | LocalCommands::OnlyExtra { path, deployment }
+        | LocalCommands::OnlyExtra { path, deployment, .. }
         | LocalCommands::GenerateConfig { path, deployment } => {
             (path.as_ref().map(Path::new).unwrap_or(Path::new(".")), deployment)
         }
@@ -413,8 +425,12 @@ fn local(command: &LocalCommands) -> Result<()> {
                 println!("Regenerating local configuration");
                 run_local::generate_config(&resolved_spec)?;
             }
-            _ => {
-                local_ingress::run(resolved_spec.ingress.clone(), &resolved_spec.current_deployment.name)?;
+            LocalCommands::Run { bind, .. } | LocalCommands::OnlyExtra { bind, .. } => {
+                local_ingress::run(
+                    resolved_spec.ingress.clone(),
+                    &resolved_spec.current_deployment.name,
+                    bind,
+                )?;
                 match command {
                     LocalCommands::Run { .. } => {
                         println!("Running local deployment");

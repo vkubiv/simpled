@@ -777,6 +777,8 @@ Options:
   --path <PATH>            Path to the project directory (default: current dir)
   --deployment <NAME>      Deployment to run. Required when the env spec defines
                            more than one deployment.
+  --bind <ADDR>            Address the gateway listens on (default: 127.0.0.1).
+                           Pass 0.0.0.0 to reach it from another device.
 ```
 
 An env spec may define multiple deployments, but only one can run locally at a
@@ -800,6 +802,7 @@ Options:
   --path <PATH>        Path to the project directory (default: current dir)
   --deployment <NAME>  Deployment to run. Required when the env spec defines
                        more than one deployment.
+  --bind <ADDR>        Address the gateway listens on (default: 127.0.0.1)
 ```
 
 ### `simpled local generate-config`
