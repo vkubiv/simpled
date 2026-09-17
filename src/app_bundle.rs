@@ -209,6 +209,35 @@ fn ensure_ecr_repository(image: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parses `--registry`: comma-separated `namespace=host` pairs, e.g.
+/// `mycompany=registry.example.com,other=ghcr.io/other`. A part without `=`
+/// was previously skipped without a word, which left every image of that
+/// namespace unmatched and the error pointing at the wrong place.
+fn parse_registry_map(registry: &str) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for part in registry.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((namespace, host)) = part.split_once('=') else {
+            bail!(
+                "Invalid --registry entry '{}': expected namespace=host, e.g. mycompany=registry.example.com",
+                part
+            );
+        };
+        let (namespace, host) = (namespace.trim(), host.trim());
+        if namespace.is_empty() || host.is_empty() {
+            bail!(
+                "Invalid --registry entry '{}': the namespace and the host must both be set",
+                part
+            );
+        }
+        map.insert(namespace.to_string(), host.to_string());
+    }
+    Ok(map)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_app_bundle(
     registry: &Option<String>,
@@ -232,14 +261,10 @@ pub fn create_app_bundle(
 
     println!("Creating bundle for {} v{}", app_spec.name, version);
 
-    let mut registry_map = HashMap::new();
-    if let Some(reg_str) = registry {
-        for part in reg_str.split(',') {
-            if let Some((k, v)) = part.split_once('=') {
-                registry_map.insert(k, v.to_string());
-            }
-        }
-    }
+    let registry_map = match registry {
+        Some(reg_str) => parse_registry_map(reg_str)?,
+        None => HashMap::new(),
+    };
 
     for service in app_spec.app_services {
         let images: Vec<String> = match service.image {
@@ -376,6 +401,18 @@ mod tests {
         apply_version_suffix(&semver::Version::parse(version).unwrap(), suffix)
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn registry_pairs_are_parsed_and_malformed_ones_rejected() {
+        let map = parse_registry_map("mycompany=registry.example.com, other=ghcr.io/other,").unwrap();
+        assert_eq!(map["mycompany"], "registry.example.com");
+        assert_eq!(map["other"], "ghcr.io/other");
+        assert_eq!(map.len(), 2);
+
+        let err = parse_registry_map("mycompany").unwrap_err().to_string();
+        assert!(err.contains("expected namespace=host"), "{}", err);
+        assert!(parse_registry_map("=host").is_err());
     }
 
     #[test]
