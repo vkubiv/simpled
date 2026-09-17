@@ -401,7 +401,7 @@ fn local(command: &LocalCommands) -> Result<()> {
     };
 
     let env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref())?;
-    let app_spec = spec_loader::load_app_spec_from_dir(Path::new("."), Some(&env_spec))?;
+    let app_spec = spec_loader::load_app_spec_from_dir(root, Some(&env_spec))?;
 
     let deployment = select_deployment(&env_spec, deployment_name.as_deref())?;
 

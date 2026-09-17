@@ -482,7 +482,7 @@ fn convert_body_limit(value: Option<&str>, owner: &str) -> Result<Option<u64>> {
 
 fn convert_env_variables(yaml: &Option<DeploymentEnvVariablesYaml>, root: &Path) -> Result<Vec<spec::EnvVariable>> {
     match yaml {
-        Some(DeploymentEnvVariablesYaml::FromEnvFile(env_file)) => env_loader::load_env_file(env_file),
+        Some(DeploymentEnvVariablesYaml::FromEnvFile(env_file)) => env_loader::load_env_file(root.join(env_file)),
         Some(DeploymentEnvVariablesYaml::FromList(entries)) => entries
             .iter()
             .map(|entry| convert_env_entry(entry, root))
@@ -530,7 +530,7 @@ fn convert_deployment(
         .application
         .as_ref()
         .ok_or_else(|| anyhow!("Deployment '{}' is missing required field 'application'", name))?;
-    let application = convert_deployment_app(application_yaml)?;
+    let application = convert_deployment_app(application_yaml, root)?;
     let environment = convert_env_variables(&yaml.environment, root)?;
     let mut undockerized_environment = convert_env_variables(&yaml.undockerized_environment, root)?;
 
@@ -600,7 +600,7 @@ fn convert_deployment(
                     let source = if let Some(env) = &v.env {
                         DeploymentSecretSource::EnvVariable(env.clone())
                     } else if let Some(file) = &v.file {
-                        DeploymentSecretSource::FilePath(file.clone())
+                        DeploymentSecretSource::FilePath(root.join(file).to_string_lossy().into_owned())
                     } else if let Some(aws) = &v.aws {
                         DeploymentSecretSource::Aws(AwsSecretRef {
                             secret_id: aws.clone(),
@@ -677,7 +677,9 @@ fn convert_deployment(
     })
 }
 
-fn convert_deployment_app(yaml: &DeploymentAppSpecYaml) -> Result<DeploymentAppSpec> {
+/// Every path an env spec names is taken relative to the spec's own directory,
+/// so a spec reads the same wherever `simpled` is run from (`--path`).
+fn convert_deployment_app(yaml: &DeploymentAppSpecYaml, root: &Path) -> Result<DeploymentAppSpec> {
     let version = if let Some(v) = &yaml.version {
         Some(semver::VersionReq::parse(v)?)
     } else {
@@ -687,7 +689,12 @@ fn convert_deployment_app(yaml: &DeploymentAppSpecYaml) -> Result<DeploymentAppS
     Ok(DeploymentAppSpec {
         name: yaml.name.clone(),
         version,
-        extra: yaml.extra.clone().unwrap_or_default(),
+        extra: yaml
+            .extra
+            .iter()
+            .flatten()
+            .map(|extra| root.join(extra).to_string_lossy().into_owned())
+            .collect(),
     })
 }
 
@@ -1347,6 +1354,50 @@ deployments:
         assert_eq!(web.volumes[0].mount_path, "/app/shared");
         assert_eq!(web.volumes[1].mount_path, "/app/src");
         assert!(matches!(&web.command, Some(ServiceCommand::Shell(s)) if s == "npm run dev"));
+    }
+
+    /// `--path` points simpled at a project elsewhere, so a path written in the
+    /// spec has to be read relative to the spec, not to wherever simpled runs.
+    #[test]
+    fn spec_paths_resolve_against_the_spec_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("vars.env"), "DB_HOST=db\n").unwrap();
+        fs::write(root.path().join("secret.txt"), "s3cr3t").unwrap();
+
+        let raw = r#"
+type: k8s
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    disable: true
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: app
+      extra:
+        - extra.yaml
+    environment: vars.env
+    secrets:
+      db:
+        file: secret.txt
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+        let prod = &spec.deployments[0];
+
+        assert_eq!(prod.environment[0].value, "db");
+        assert_eq!(
+            prod.application.extra,
+            vec![root.path().join("extra.yaml").to_string_lossy()]
+        );
+        match &prod.secrets[0].source {
+            DeploymentSecretSource::FilePath(path) => {
+                assert_eq!(Path::new(path), root.path().join("secret.txt"));
+            }
+            other => panic!("unexpected source: {other:?}"),
+        }
     }
 
     #[test]

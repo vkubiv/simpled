@@ -747,6 +747,10 @@ Options:
 
 Must be run from the directory containing `envspec.yaml`.
 
+Every relative path inside the spec (`environment: file.env`, `file:` secrets, `configs`,
+`secrets_folder`, `application.extra`) is resolved against the directory that holds the
+spec, not against the current directory. The same holds for `simpled local --path`.
+
 There is no `--version-suffix` here: a suffixed bundle carries its version internally, so
 pass the suffixed version to `--app-version` and the images resolve accordingly.
 
