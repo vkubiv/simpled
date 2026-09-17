@@ -117,15 +117,27 @@ pub fn prepare_service(
     let svc_dir = output_dir.join(service.full_name.clone());
     fs::create_dir_all(&svc_dir).context("Failed to create service directory")?;
 
-    // Generate .env files
+    // Generate .env files. The local compose file is read by `docker compose`,
+    // which applies dotenv rules to `env_file`; the Swarm stack file is read by
+    // `docker stack deploy`, whose legacy loader takes every value literally.
+    let is_local = spec.env_type == spec::DeploymentEnvType::Local;
+    let format = if is_local {
+        EnvFileFormat::Compose
+    } else {
+        EnvFileFormat::Raw
+    };
     let env_path = svc_dir.join(".env");
-    write_env_file(&env_path, &service.environment_variables)?;
+    write_env_file(&env_path, &service.environment_variables, format)?;
 
     // A host-run service with a `working_dir` gets its `.env` written into that
     // directory by `write_working_dir`, so skip the in-tree `undockerized.env`.
-    if spec.env_type == spec::DeploymentEnvType::Local && service.working_dir.is_none() {
+    if is_local && service.working_dir.is_none() {
         let undoc_env_path = svc_dir.join("undockerized.env");
-        write_env_file(&undoc_env_path, &service.undockerized_environment_variables)?;
+        write_env_file(
+            &undoc_env_path,
+            &service.undockerized_environment_variables,
+            EnvFileFormat::Raw,
+        )?;
     }
 
     let mut volumes = Vec::new();
@@ -351,14 +363,47 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
     }
 
     let env_path = dir.join(".env");
-    write_env_file(&env_path, &env_vars)
+    // Read by whatever dotenv loader the developer's own process uses, so the
+    // plainest form is the most portable one.
+    write_env_file(&env_path, &env_vars, EnvFileFormat::Raw)
 }
 
-fn write_env_file(path: &Path, vars: &[EnvVariable]) -> anyhow::Result<()> {
+/// How the reader of an env file interprets a value.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EnvFileFormat {
+    /// `docker run --env-file`, `docker stack deploy` and most dotenv loaders:
+    /// everything after `=` is the value, byte for byte, up to the end of the
+    /// line. Nothing can be escaped, so a value cannot contain a line break.
+    Raw,
+    /// `docker compose` (compose-go): an unquoted value has `${VAR}` expanded and
+    /// ` #` starts a comment, and quotes are interpreted. A single-quoted value
+    /// is taken literally, with `\'` for a quote inside it.
+    Compose,
+}
+
+/// One `NAME=value` line in `format`, or an error when the value cannot be
+/// represented in it at all.
+fn env_file_line(var: &EnvVariable, format: EnvFileFormat) -> anyhow::Result<String> {
+    match format {
+        EnvFileFormat::Raw => {
+            if var.value.contains(['\n', '\r']) {
+                anyhow::bail!(
+                    "Environment variable {} contains a line break, which an env file cannot carry. \
+                     Mount the value as a secret file instead.",
+                    var.name
+                );
+            }
+            Ok(format!("{}={}", var.name, var.value))
+        }
+        EnvFileFormat::Compose => Ok(format!("{}='{}'", var.name, var.value.replace('\'', "\\'"))),
+    }
+}
+
+fn write_env_file(path: &Path, vars: &[EnvVariable], format: EnvFileFormat) -> anyhow::Result<()> {
     let content = vars
         .iter()
-        .map(|v| format!("{}={}", v.name, v.value))
-        .collect::<Vec<_>>()
+        .map(|v| env_file_line(v, format))
+        .collect::<anyhow::Result<Vec<_>>>()?
         .join("\n");
     fs::write(path, content).context(format!("Failed to write env file {:?}", path))
 }
@@ -366,6 +411,43 @@ fn write_env_file(path: &Path, vars: &[EnvVariable]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn var(name: &str, value: &str) -> EnvVariable {
+        EnvVariable {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// `docker compose` expands `$`, strips ` #` comments and interprets quotes
+    /// in an unquoted env_file value; a single-quoted value is left alone.
+    #[test]
+    fn compose_env_values_are_single_quoted() {
+        assert_eq!(
+            env_file_line(&var("PASSWORD", "pa$$ #word"), EnvFileFormat::Compose).unwrap(),
+            "PASSWORD='pa$$ #word'"
+        );
+        assert_eq!(
+            env_file_line(&var("QUOTE", "it's"), EnvFileFormat::Compose).unwrap(),
+            "QUOTE='it\\'s'"
+        );
+    }
+
+    /// `docker run --env-file` and `docker stack deploy` take the value literally,
+    /// so quoting there would put the quotes into the container.
+    #[test]
+    fn raw_env_values_are_written_as_is() {
+        assert_eq!(
+            env_file_line(&var("PASSWORD", "pa$$ #word 'q'"), EnvFileFormat::Raw).unwrap(),
+            "PASSWORD=pa$$ #word 'q'"
+        );
+    }
+
+    #[test]
+    fn a_raw_env_value_cannot_contain_a_line_break() {
+        let err = env_file_line(&var("PEM", "a\nb"), EnvFileFormat::Raw).unwrap_err();
+        assert!(err.to_string().contains("line break"), "{}", err);
+    }
 
     #[test]
     fn project_name_suffixes_the_application_name() {

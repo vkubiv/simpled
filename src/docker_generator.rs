@@ -225,7 +225,17 @@ fn generate_standalone(
         let env_path = envs_dir.join(&env_file_name);
         let mut env_file = File::create(&env_path)?;
 
+        // `docker run --env-file` takes each value literally up to the end of
+        // the line, so a value with a line break cannot be carried.
         for env in &service.environment_variables {
+            if env.value.contains(['\n', '\r']) {
+                return Err(anyhow!(
+                    "Environment variable {} of service {} contains a line break, which an env file \
+                     cannot carry. Mount the value as a secret file instead.",
+                    env.name,
+                    service.full_name
+                ));
+            }
             writeln!(env_file, "{}={}", env.name, env.value)?;
         }
 
