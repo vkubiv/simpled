@@ -166,10 +166,16 @@ simpled local run                            # generate compose + start gateway
 simpled local run --exclude api              # ...without one service
 simpled local only-extra                     # gateway + extra services only; run app services yourself
 simpled local generate-config                # write local_env/ without starting anything
+
+# Tests (dir containing localenv.yaml + testspec.yaml)
+simpled test                                 # up, run every suite, down; exit code = first failure
+simpled test e2e --keep                      # one suite, leave the stack up to look at it
+simpled test e2e --no-up                     # against a stack that is already running
 ```
 
 Add `--deployment <name>` to any `local` command when the env spec defines more than
-one deployment.
+one deployment. A suite in `testspec.yaml` names its deployment itself, or declares
+one inline with `extends:`.
 
 ## Choosing between the pieces
 
@@ -185,6 +191,8 @@ one deployment.
 | Value is a URL under the deployment's own domain | `environment.relative` |
 | Two deployments differ in a few fields | `extends:` on the child, `abstract: true` on the base |
 | A local service you run from your IDE | `working_dir:` + `simpled local only-extra` |
+| A local deployment that starts only some services | `exclude_services:` on the deployment (replaces `--exclude` flags) |
+| An end-to-end suite against the local stack | `testspec.yaml` suite with `deployment: {extends: local, ...}` + `simpled test` |
 | Secret already in the CI environment | `env: VAR` |
 | Secret that must not pass through CI | `aws: path/to/secret` (resolved on the deploy target) |
 
@@ -199,6 +207,10 @@ one deployment.
 | `Config C required by application is not provided by deployment X` | Map `C` to a directory under the deployment's `configs:`. |
 | `Config C requires file F, but it is not provided by deployment config` | Put `F` in that directory. |
 | `Deployment configures service S which is not defined in application` | Typo in the deployment's `services:` key, or the service is missing from `appspec.yaml`. |
+| `Deployment D excludes service S which is not defined in application` | Typo in `exclude_services`. |
+| `Suite X forwards V, which deployment D does not define` | Add `V` to the deployment's `environment` (or the suite's inline block), or set it with `V=value`. |
+| `Suite X uses secret S, which deployment D does not provide` | Add `S` under the deployment's `secrets:`. |
+| `Suite X declares its own deployment, but the env spec already has a deployment named X` | Rename the suite, or use `deployment: X` to reference the existing one. |
 | `Service S references undefined environment variable V` | Declare `V` in `appspec.yaml` `environment:`, or use `$all`. |
 | `Dependency cycle in depends_on: ...` | Break the cycle named in the message. |
 | `name unknown: The repository ... does not exist` (ECR) | Let `--push-images` create it (the default), or create it yourself and pass `--no-create-repos`. |
@@ -214,8 +226,13 @@ one deployment.
   which starts the whole stack before the migration. Always list its dependencies.
 - Give a job's dependency a `healthcheck`; without one "ready" only means the container
   was started.
-- `secrets_folder`, `working_dir`, and inline literal secret values are **local only** —
-  they are rejected in `k8s` and `docker` env specs.
+- `secrets_folder`, `working_dir`, `exclude_services`, and inline literal secret values
+  are **local only** — they are rejected in `k8s` and `docker` env specs.
+- `simpled test` runs in its own compose project (`test_env/`, `<app>_test`) with Docker
+  volumes and removes them afterwards: every run starts from empty data, so a suite
+  must seed what it needs. It never touches `local_env/`.
+- A suite forwards variables from the deployment's *host* view (`undockerized_environment`
+  over `environment`). Override a variable in both lists if both set it.
 - `.env.local` next to `localenv.yaml` overrides `undockerized_environment` per
   developer. Keep it out of version control.
 - Only one deployment can run locally at a time; the ones you do not pick are dropped

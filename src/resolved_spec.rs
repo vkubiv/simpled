@@ -140,6 +140,10 @@ pub struct ServiceResolvedSpec {
     // local-only: working directory of a host-run (non-dockerized) service.
     // When set, undockerized env is written there as `.env` and secrets copied alongside.
     pub working_dir: Option<String>,
+
+    // local-only: listed in the deployment's `exclude_services`, so no container
+    // is started for it. Its routes and working_dir files are still produced.
+    pub excluded: bool,
 }
 
 #[derive(Debug)]
@@ -207,6 +211,10 @@ pub struct DeploymentResolvedSpec {
     pub secrets: Vec<SecretResolvedSpec>,
     pub services: Vec<ServiceResolvedSpec>,
     pub volumes: Vec<String>,
+    /// The deployment's variables as a process on this machine sees them:
+    /// `environment` with `undockerized_environment` applied on top and
+    /// `$secret(...)` references expanded. This is what a test suite forwards from.
+    pub host_environment: Vec<EnvVariable>,
 }
 
 impl DeploymentResolvedSpec {

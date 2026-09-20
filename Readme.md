@@ -62,6 +62,9 @@ kubectl apply -f manifests/        # Kubernetes
 
 # On a laptop: gateway, services and compose file, from the same appspec.
 simpled local run
+
+# Bring the local stack up, run the e2e suite from testspec.yaml, tear it down.
+simpled test e2e
 ```
 
 Every field, flag and generated file is described in the [Reference](docs/reference.md);

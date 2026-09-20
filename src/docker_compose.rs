@@ -17,7 +17,14 @@ pub struct DockerCompose {
     pub services: HashMap<String, DockerService>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub networks: HashMap<String, DockerComposeNetwork>,
+    // Docker-managed named volumes. Only an isolated (test) run declares them;
+    // everywhere else a named volume is a bind directory under `volumes/`.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub volumes: HashMap<String, DockerVolume>,
 }
+
+#[derive(Serialize, Default)]
+pub struct DockerVolume {}
 
 /// Compose project name for a local run.
 ///
@@ -46,6 +53,17 @@ pub fn local_project_name(application_name: &str) -> String {
         "local".to_string()
     } else {
         format!("{}_local", sanitized)
+    }
+}
+
+/// Compose project name for a test run: `<app>_test`, kept apart from the local
+/// project so bringing a test stack up and down never touches the developer's
+/// own containers and data.
+pub fn test_project_name(application_name: &str) -> String {
+    let local = local_project_name(application_name);
+    match local.strip_suffix("_local") {
+        Some(base) => format!("{}_test", base),
+        None => "test".to_string(),
     }
 }
 
@@ -117,6 +135,19 @@ pub fn prepare_service(
     spec: &EnvironmentResolvedSpec,
     output_dir: &Path,
 ) -> anyhow::Result<DockerService> {
+    prepare_service_with(service, spec, output_dir, false)
+}
+
+/// `isolated` is the test run's flavour of a local service: named volumes are
+/// Docker volumes instead of bind directories (so `compose down --volumes`
+/// removes them on every OS), and containers keep compose's generated names, so
+/// a stopped local stack holding `container_name: api` does not block the run.
+pub fn prepare_service_with(
+    service: &ServiceResolvedSpec,
+    spec: &EnvironmentResolvedSpec,
+    output_dir: &Path,
+    isolated: bool,
+) -> anyhow::Result<DockerService> {
     let svc_dir = output_dir.join(service.full_name.clone());
     fs::create_dir_all(&svc_dir).context("Failed to create service directory")?;
 
@@ -148,6 +179,9 @@ pub fn prepare_service(
 
     for volume in &service.volumes {
         match &volume.name {
+            ServiceVolumeType::Named(name) if isolated => {
+                volumes.push(format!("{}:{}", name, volume.mount_path));
+            }
             ServiceVolumeType::Named(name) => {
                 volumes.push(format!("./volumes/{}:{}", name, volume.mount_path));
             }
@@ -293,7 +327,7 @@ pub fn prepare_service(
 
     Ok(DockerService {
         image: service.image.clone(),
-        container_name: is_local.then(|| service.full_name.clone()),
+        container_name: (is_local && !isolated).then(|| service.full_name.clone()),
         entrypoint: service.entrypoint.clone(),
         command: service.command.clone(),
         healthcheck: service.healthcheck.clone(),
@@ -316,34 +350,50 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
     let Some(working_dir) = service.working_dir.as_deref() else {
         return Ok(());
     };
+    write_host_env(
+        Path::new(working_dir),
+        &service.undockerized_environment_variables,
+        &service.secrets,
+        spec,
+        &service.full_name,
+    )
+    .map(|_| ())
+}
 
-    let dir = Path::new(working_dir);
+/// Writes `dir/.env` from `env_vars` plus the `variable:` secrets, and the
+/// `path:` secrets as files under `dir`. Shared by host-run services and test
+/// suites, which are host-run processes in all but name. Returns the variables
+/// that went into `.env`, secrets included, for a caller that also launches the
+/// process. `owner` names the service or suite in warnings.
+pub fn write_host_env(
+    dir: &Path,
+    env_vars: &[EnvVariable],
+    secrets: &[crate::spec::ServiceSecret],
+    spec: &EnvironmentResolvedSpec,
+    owner: &str,
+) -> anyhow::Result<Vec<EnvVariable>> {
     fs::create_dir_all(dir).context(format!("Failed to create working_dir {:?}", dir))?;
 
-    let mut env_vars = service.undockerized_environment_variables.clone();
+    let mut env_vars = env_vars.to_vec();
 
     // Env-variable secrets are merged into `.env`; file secrets are written as
     // files relative to the working directory.
-    for secret_option in &service.secrets {
+    for secret_option in secrets {
         let Some(secret_spec) = spec
             .current_deployment
             .secrets
             .iter()
             .find(|s| s.name == secret_option.name)
         else {
-            eprintln!(
-                "Warning: Secret {} not found for service {}",
-                secret_option.name, service.full_name
-            );
+            eprintln!("Warning: Secret {} not found for {}", secret_option.name, owner);
             continue;
         };
         // Host-run services exist for `local` only, where secrets with an `aws`
         // source are fetched during resolution, so a value is always available.
         let Some(value) = secret_spec.literal() else {
             eprintln!(
-                "Warning: Secret {} is only fetched on the deploy target and cannot be written \
-                to the working_dir of {}",
-                secret_option.name, service.full_name
+                "Warning: Secret {} is only fetched on the deploy target and cannot be written                 to the working_dir of {}",
+                secret_option.name, owner
             );
             continue;
         };
@@ -368,7 +418,8 @@ pub fn write_working_dir(service: &ServiceResolvedSpec, spec: &EnvironmentResolv
     let env_path = dir.join(".env");
     // Read by whatever dotenv loader the developer's own process uses, so the
     // plainest form is the most portable one.
-    write_env_file(&env_path, &env_vars, EnvFileFormat::Raw)
+    write_env_file(&env_path, &env_vars, EnvFileFormat::Raw)?;
+    Ok(env_vars)
 }
 
 /// How the reader of an env file interprets a value.
@@ -456,6 +507,12 @@ mod tests {
     fn project_name_suffixes_the_application_name() {
         assert_eq!(local_project_name("room_scaner_backend"), "room_scaner_backend_local");
         assert_eq!(local_project_name("shop-api"), "shop-api_local");
+    }
+
+    #[test]
+    fn test_project_name_sits_next_to_the_local_one() {
+        assert_eq!(test_project_name("shop-api"), "shop-api_test");
+        assert_eq!(test_project_name("***"), "test");
     }
 
     #[test]

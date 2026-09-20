@@ -65,6 +65,7 @@ pub fn resolved_service(name: &str, service_type: ServiceType, depends_on: &[&st
         depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
         resources: resources(),
         working_dir: None,
+        excluded: false,
     }
 }
 
@@ -76,6 +77,7 @@ pub fn resolved_deployment(services: Vec<ServiceResolvedSpec>) -> DeploymentReso
         secrets: vec![],
         services,
         volumes: vec![],
+        host_environment: vec![],
     }
 }
 

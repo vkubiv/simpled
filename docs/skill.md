@@ -56,11 +56,15 @@ into `--section`.
 - Environment-specific values (domains, connection strings, replica counts) belong in
   the env spec. Structure (services, images, variable and secret *names*) belongs in
   `appspec.yaml`. Never put a secret value in `appspec.yaml`.
-- `secrets_folder`, `working_dir`, and inline literal secret values are valid only for
-  `type: local`.
+- `secrets_folder`, `working_dir`, `exclude_services`, and inline literal secret values
+  are valid only for `type: local`.
+- `simpled test` reads `testspec.yaml`: it brings a local deployment up, runs a suite,
+  and tears it down. A suite's `deployment:` is a name or an inline block that
+  `extends:` one.
 
 ## Do not
 
-- Do not hand-edit anything under `manifests/`, `docker-deploy/`, or `local_env/` — those are
-  generated and overwritten on the next run. Change the spec instead.
+- Do not hand-edit anything under `manifests/`, `docker-deploy/`, `local_env/` or
+  `test_env/` — those are generated and overwritten on the next run. Change the spec
+  instead.
 - Do not commit resolved secret values. Use `env:`, `file:`, or `aws:` sources.

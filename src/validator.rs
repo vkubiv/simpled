@@ -121,6 +121,16 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         }
     }
 
+    for svc_name in &deployment.exclude_services {
+        if !available_services.contains(svc_name) {
+            return Err(anyhow!(
+                "Deployment {} excludes service {} which is not defined in application",
+                env_name,
+                svc_name
+            ));
+        }
+    }
+
     // Validate `depends_on` references and reject dependency cycles. A cycle has
     // no valid start order, and the deploy scripts walk these edges to decide what
     // must be running before a job runs.
@@ -466,5 +476,36 @@ deployments:
             let err = validate(&env, &app_spec(APP), "staging").unwrap_err().to_string();
             assert!(err.contains("'staging' not found") && err.contains("prod"), "{err}");
         }
+    }
+
+    #[test]
+    fn an_excluded_service_must_exist() {
+        let spec = app_spec(vec![service("api", &[])]);
+        let env = crate::test_support::env_spec(
+            r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  infra:
+    primary_host: web
+    application:
+      name: shop
+    exclude_services: [api, worker]
+    services:
+      api:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+"#,
+            std::path::Path::new("."),
+        );
+        let err = validate(&env, &spec, "infra").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Deployment infra excludes service worker which is not defined in application"
+        );
     }
 }

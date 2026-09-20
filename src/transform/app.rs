@@ -231,15 +231,7 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
         .environment
         .unwrap_or_default()
         .into_iter()
-        .map(|s| {
-            if s == "$all" {
-                ServiceEnvOption::All
-            } else if let Some((k, v)) = s.split_once('=') {
-                ServiceEnvOption::WithValue(k.trim().to_string(), v.trim().to_string())
-            } else {
-                ServiceEnvOption::Simple(s)
-            }
-        })
+        .map(parse_service_env_option)
         .collect();
 
     let configs = yaml
@@ -317,7 +309,19 @@ fn convert_healthcheck(yaml: HealthcheckYaml) -> Result<Healthcheck> {
     })
 }
 
-fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSecret>> {
+/// One entry of a service's `environment:` list: `$all`, a bare name to forward,
+/// or `NAME=value`.
+pub fn parse_service_env_option(s: String) -> ServiceEnvOption {
+    if s == "$all" {
+        ServiceEnvOption::All
+    } else if let Some((k, v)) = s.split_once('=') {
+        ServiceEnvOption::WithValue(k.trim().to_string(), v.trim().to_string())
+    } else {
+        ServiceEnvOption::Simple(s)
+    }
+}
+
+pub fn convert_service_secrets(yaml: Vec<ServiceSecretYaml>) -> Result<Vec<ServiceSecret>> {
     let mut secrets = Vec::new();
     for s in yaml {
         match s {

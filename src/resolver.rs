@@ -59,6 +59,7 @@ pub fn resolve(
         secrets: secrets.specs,
         services: resolved_services,
         volumes: app_spec.volumes.clone(),
+        host_environment: undockerized_values,
     };
 
     Ok(EnvironmentResolvedSpec {
@@ -330,6 +331,7 @@ impl ServiceResolver<'_> {
                 .filter(|ports| !ports.is_empty())
                 .unwrap_or_else(|| app_service.ports.clone()),
             working_dir: deployment_service.and_then(|s| s.working_dir.clone()),
+            excluded: deployment.exclude_services.contains(&app_service.name),
         })
     }
 

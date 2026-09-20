@@ -456,6 +456,7 @@ fn generate_swarm(
         name: None,
         services: stack_services,
         networks: compose_network(),
+        volumes: HashMap::new(),
     };
 
     let compose_path = &app_dir.join("docker-compose.yaml");
@@ -477,6 +478,7 @@ fn generate_swarm(
             name: None,
             services: dep_services,
             networks: compose_network(),
+            volumes: HashMap::new(),
         };
 
         let deps_path = app_dir.join(DEPS_COMPOSE_FILE);
@@ -1433,6 +1435,7 @@ mod tests {
                 },
             },
             working_dir: None,
+            excluded: false,
         }
     }
 
@@ -1514,6 +1517,7 @@ mod tests {
                 secrets: vec![],
                 services,
                 volumes: vec![],
+                host_environment: vec![],
             },
         }
     }

@@ -3,32 +3,59 @@ use crate::resolved_spec::*;
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Where a compose file is written and how its project is named.
+pub struct ComposeTarget {
+    pub dir: PathBuf,
+    pub project: String,
+    /// A test run: Docker-managed volumes, no fixed container names, so it never
+    /// collides with the developer's own `local_env` stack or its data.
+    pub isolated: bool,
+}
+
+impl ComposeTarget {
+    pub fn local(spec: &EnvironmentResolvedSpec) -> Self {
+        ComposeTarget {
+            dir: PathBuf::from("local_env"),
+            project: local_project_name(&spec.current_deployment.application_name),
+            isolated: false,
+        }
+    }
+
+    pub fn test(spec: &EnvironmentResolvedSpec) -> Self {
+        ComposeTarget {
+            dir: PathBuf::from("test_env"),
+            project: test_project_name(&spec.current_deployment.application_name),
+            isolated: true,
+        }
+    }
+}
+
 pub fn run(spec: &EnvironmentResolvedSpec, exclude: &[String]) -> Result<()> {
-    run_filtered(spec, |s| !exclude.iter().any(|e| e == &s.full_name))
+    run_filtered(spec, |s| !s.excluded && !exclude.iter().any(|e| e == &s.full_name))
 }
 
 pub fn run_only_extra(spec: &EnvironmentResolvedSpec) -> Result<()> {
-    run_filtered(spec, |s| !s.is_app_service)
+    run_filtered(spec, |s| !s.is_app_service && !s.excluded)
 }
 
 pub fn generate_config(spec: &EnvironmentResolvedSpec) -> Result<()> {
-    write_compose(spec, |_| true)
+    write_compose(spec, &ComposeTarget::local(spec), |s| !s.excluded)
 }
 
 fn run_filtered<F>(spec: &EnvironmentResolvedSpec, filter: F) -> Result<()>
 where
-    F: Fn(&crate::resolved_spec::ServiceResolvedSpec) -> bool,
+    F: Fn(&ServiceResolvedSpec) -> bool,
 {
-    write_compose(spec, &filter)?;
+    let target = ComposeTarget::local(spec);
+    write_compose(spec, &target, &filter)?;
 
-    let output_dir = Path::new("local_env");
     println!("Running docker compose up...");
 
     let status = Command::new("docker")
-        .current_dir(output_dir)
+        .current_dir(&target.dir)
         .args(["compose", "up", "--remove-orphans"])
         .status()
         .context("Failed to run docker compose")?;
@@ -40,24 +67,25 @@ where
     Ok(())
 }
 
-fn write_compose<F>(spec: &EnvironmentResolvedSpec, filter: F) -> Result<()>
+/// Writes `target.dir/docker-compose.yaml` for the services `filter` keeps, plus
+/// every service's env and secret files. Host-run services (`working_dir`) get
+/// theirs whether or not they are in the compose file.
+pub fn write_compose<F>(spec: &EnvironmentResolvedSpec, target: &ComposeTarget, filter: F) -> Result<()>
 where
-    F: Fn(&crate::resolved_spec::ServiceResolvedSpec) -> bool,
+    F: Fn(&ServiceResolvedSpec) -> bool,
 {
-    let output_dir = Path::new("local_env");
-    fs::create_dir_all(output_dir).context("Failed to create local_env directory")?;
+    let output_dir: &Path = &target.dir;
+    fs::create_dir_all(output_dir).with_context(|| format!("Failed to create {:?}", output_dir))?;
 
     println!("Starting services for deployment: {}", spec.current_deployment.name);
 
     let mut services_map = HashMap::new();
 
     for service in spec.current_deployment.services.iter() {
-        // Host-run services (working_dir set) get their `.env` and secrets even
-        // when they are excluded from the generated compose (e.g. only-extra).
         write_working_dir(service, spec)?;
 
         if filter(service) {
-            let docker_service = prepare_service(service, spec, output_dir)?;
+            let docker_service = prepare_service_with(service, spec, output_dir, target.isolated)?;
             services_map.insert(service.full_name.clone(), docker_service);
         }
     }
@@ -99,10 +127,23 @@ where
         }
     }
 
+    // An isolated run declares its named volumes so compose creates and, with
+    // `down --volumes`, removes them.
+    let volumes = if target.isolated {
+        spec.current_deployment
+            .volumes
+            .iter()
+            .map(|name| (name.clone(), DockerVolume::default()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     let compose = DockerCompose {
-        name: Some(local_project_name(&spec.current_deployment.application_name)),
+        name: Some(target.project.clone()),
         services: services_map,
         networks: HashMap::new(),
+        volumes,
     };
 
     let compose_path = output_dir.join("docker-compose.yaml");

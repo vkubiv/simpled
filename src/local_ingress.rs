@@ -10,6 +10,34 @@ use std::collections::BTreeMap;
 use std::net::TcpListener as StdTcpListener;
 use std::process::{self, Command};
 use std::thread;
+use tokio::sync::watch;
+
+/// The running local gateway. `simpled local run` keeps it for the life of the
+/// process; `simpled test` stops it between suites so the next one can bind the
+/// same ports.
+pub struct IngressHandle {
+    shutdown: Option<watch::Sender<bool>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl IngressHandle {
+    fn idle() -> Self {
+        IngressHandle {
+            shutdown: None,
+            thread: None,
+        }
+    }
+
+    /// Closes every listener and waits for the serving thread to finish.
+    pub fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// A local gateway domain is written as "hostname" or "hostname:port".
 fn split_domain(domain: &str) -> (&str, u16) {
@@ -155,7 +183,7 @@ fn shutdown_stack_and_exit(message: &str) -> ! {
 /// this function returns so that a bind failure (e.g. the port is already in
 /// use) is reported to the caller *before* any docker compose services are
 /// started, rather than orphaning them.
-pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> Result<()> {
+pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> Result<IngressHandle> {
     let current_deployment = current_deployment.to_string();
 
     // A local run binds real sockets on the host, and a port can only be bound
@@ -241,7 +269,7 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
     }
 
     if routers.is_empty() {
-        return Ok(());
+        return Ok(IngressHandle::idle());
     }
 
     // Bind every port synchronously and up-front. `std::net::TcpListener::bind`
@@ -275,7 +303,8 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
     // the caller can start the services in the foreground. From here on a
     // failure means docker compose is (about to be) running, so we tear it down
     // instead of leaving orphaned containers behind.
-    thread::spawn(move || {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let thread = thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => shutdown_stack_and_exit(&format!("Failed to create tokio runtime for local ingress: {}", e)),
@@ -294,8 +323,12 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
                 };
 
                 println!("Local ingress listening on {}", bind_addr);
+                let mut shutdown = shutdown_rx.clone();
                 handles.push(tokio::spawn(async move {
-                    if let Err(e) = axum::serve(listener, app).await {
+                    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                        let _ = shutdown.wait_for(|stop| *stop).await;
+                    });
+                    if let Err(e) = server.await {
                         shutdown_stack_and_exit(&format!("Error serving ingress on {}: {}", bind_addr, e));
                     }
                 }));
@@ -308,7 +341,10 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
         });
     });
 
-    Ok(())
+    Ok(IngressHandle {
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    })
 }
 
 #[cfg(test)]

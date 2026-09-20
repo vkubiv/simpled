@@ -64,6 +64,13 @@ fn load_app_spec_from_tar_gz(path: &Path, env_spec: Option<&spec::DeploymentEnvi
 }
 
 pub fn load_env_spec(root: &Path, selected_deployment: Option<&str>) -> Result<spec::DeploymentEnvironmentSpec> {
+    let yaml = load_env_spec_yaml(root)?;
+    transform::convert_env_spec(yaml, root, selected_deployment).context("Failed to process env spec")
+}
+
+/// The env spec as written, with `type` defaulted for a `localenv.yaml`, before
+/// any conversion. `simpled test` adds a suite's inline deployment at this stage.
+pub fn load_env_spec_yaml(root: &Path) -> Result<spec_yaml::DeploymentEnvironmentSpecYaml> {
     let candidates: &[(&str, bool)] = &[
         ("envspec.yaml", false),
         ("envspec.yml", false),
@@ -94,9 +101,7 @@ pub fn load_env_spec(root: &Path, selected_deployment: Option<&str>) -> Result<s
         }
     }
 
-    let env_spec =
-        transform::convert_env_spec(yaml, root, selected_deployment).context("Failed to process env spec")?;
-    Ok(env_spec)
+    Ok(yaml)
 }
 
 #[cfg(test)]

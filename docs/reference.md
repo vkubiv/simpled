@@ -519,6 +519,7 @@ deployments:
 | `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
 | `defaults` | object | no | Default replica count and resource limits applied to all services. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
+| `exclude_services` | list | no | Services this deployment does not start. Only valid for `local`. See [exclude_services](#exclude_services). |
 
 ¹ Required unless supplied by an `extends` base, or omitted on an `abstract` template.
 
@@ -528,7 +529,7 @@ A deployment may inherit from another deployment in the same env spec with `exte
 
 Merge rules, applied to the base (the deployment named by `extends`) and the child (the deployment declaring it):
 
-- **Scalar fields** (`primary_host`, `application`, `defaults`, `secrets_folder`) are taken from the base unless the child sets them, in which case the child's value replaces the base's entirely.
+- **Scalar fields** (`primary_host`, `application`, `defaults`, `secrets_folder`, `exclude_services`) are taken from the base unless the child sets them, in which case the child's value replaces the base's entirely. `exclude_services` is a list but follows this rule on purpose: a full list reads as "what this deployment leaves out", and a child can bring back a service its base excluded.
 - **Map fields** (`configs`, `secrets`, `services`) are unioned. Keys that appear only in the base or only in the child are kept as-is; a key present in both takes the child's value. For `services`, a shared key is merged field-by-field, so a child can override just `replicas` on a service while inheriting its `host`, `prefix`, and `resources` from the base.
 - **Environment lists** (`environment`, `undockerized_environment`) are merged per variable. The base's variables are all inherited in order; a variable the child redefines takes the child's value in place, and variables only the child declares are appended. So a child listing two variables overrides exactly those two and keeps the rest. A `.env` file path cannot be merged with a list — if either side uses one, the child's value replaces the base's entirely.
 
@@ -643,6 +644,100 @@ deployments:
 `working_dir` is not valid for `k8s` or `docker` environments.
 
 Two services in the same deployment cannot share a `working_dir`: each one writes its own `.env` and secrets there, so they would overwrite each other. `simpled` rejects the spec with an error naming both services. Paths are compared after normalization, so `./api`, `api` and `api/` all count as the same directory. Different deployments may reuse a directory, since only one runs at a time.
+
+#### exclude_services
+
+Local only. Services (app or extra) this deployment does not start. What `simpled local run --exclude` does from the command line, declared once in the spec, so that "infrastructure only" or "everything but the SPAs" is a deployment you name rather than a list of flags you repeat:
+
+```yaml
+# localenv.yaml
+deployments:
+  local:
+    primary_host: web
+    application:
+      name: myapp
+    services:
+      api:
+        host: web
+        prefix: /api
+        ports:
+          - "4001:80"
+        working_dir: ../api
+      web:
+        host: web
+        prefix: /
+        ports:
+          - "4000:80"
+  infra:
+    extends: local
+    exclude_services: [api, web]   # gateway + extra services only
+```
+
+An excluded service keeps everything except its container: its gateway routes still point at its host port, and a `working_dir` still receives its `.env` and secrets, since exclusion is how a service is handed to the developer to run by hand. Every name must be a service of the application; an unknown one is rejected, as is a name listed twice. `--exclude` on the command line adds to the list.
+
+Under [extends](#extends) the child's list replaces the base's. `exclude_services` is not valid for `k8s` or `docker` environments.
+
+---
+
+## testspec.yaml
+
+The suites `simpled test` runs against a local deployment. Optional; only projects with a `localenv.yaml` and something to run against it need one.
+
+```yaml
+suites:
+  suite-name:
+    deployment: deployment-name    # or a deployment block, see below
+    working_dir: ./e2e
+    environment:
+      - VAR_FROM_DEPLOYMENT
+      - SUITE_VAR=${VAR_FROM_DEPLOYMENT}/api
+      - $all
+    secrets:
+      - db_password:
+          variable: PGPASSWORD
+      - api_key                    # a file at working_dir/secrets/api_key
+    wait_for:
+      - http://localhost:4080/api/health
+    timeout: 2m
+    run: npm test
+```
+
+### Suite fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `deployment` | string \| object | no | The deployment in `localenv.yaml` to run against, or a deployment block of the suite's own. Omitted, the env spec's only deployment is used. See [deployment](#deployment). |
+| `working_dir` | string | no | Directory the suite runs from, relative to `testspec.yaml`. Its `.env` and secrets are written there, like a host-run service's. Default: the spec's directory. |
+| `environment` | list | no | The [service `environment` grammar](#service-fields): a bare name forwards the deployment's value, `NAME=value` sets one (with `${VAR}` substituted from the deployment), `$all` forwards everything. |
+| `secrets` | list | no | The [service `secrets` grammar](#secret-mount-options): `variable:` goes into `.env`, `path:` or a bare name is written as a file under `working_dir`. Every name must be a secret the deployment provides. |
+| `wait_for` | list | no | URLs polled after the stack is up until each answers with any status below 500. |
+| `timeout` | string | no | Compose-style duration for the whole start: every `docker compose up --wait` phase, every job, and `wait_for`. Default `120s`. |
+| `run` | string | yes | The command, run through `sh -c` (or `cmd /C` on Windows) in `working_dir`. Its exit status is the suite's. |
+
+Variables are taken from the deployment as a process on this machine sees it: `environment` with `undockerized_environment` applied on top, `.env.local` included, and `$secret(...)` expanded. Forwarding a name the deployment does not define is an error naming the suite and the deployment, as is a `${VAR}` reference to one. A variable that `undockerized_environment` also sets must be overridden there as well, or the containers and the suite see different values.
+
+The suite's variables are written to `working_dir/.env` for its own tooling and set on the process that runs `run`.
+
+### deployment
+
+A string names a deployment in `localenv.yaml`. A block declares one, with every field a `localenv.yaml` deployment takes, and is registered under the suite's name, so it must not collide with an existing deployment and cannot be `abstract`. The usual shape extends the everyday deployment and changes what the tests need:
+
+```yaml
+suites:
+  e2e:
+    deployment:
+      extends: local
+      exclude_services: [admin, frontend, storefront]
+      environment:
+        - NODE_ENV=test
+      secrets:
+        firebase_service_account:
+          file: ../secrets/firebase_service_account_e2e
+    working_dir: ./e2e
+    run: npm test
+```
+
+Because it is an ordinary deployment, the [extends](#extends) merge rules apply unchanged, and the block can be moved into `localenv.yaml` verbatim when it stops being test-only.
 
 ---
 
@@ -781,6 +876,9 @@ Options:
                            Pass 0.0.0.0 to reach it from another device.
 ```
 
+`--exclude` adds to the deployment's own [`exclude_services`](#exclude_services),
+and every name must be a service of the application.
+
 An env spec may define multiple deployments, but only one can run locally at a
 time. When a single deployment is defined it is used automatically; when more
 than one is defined you must pick one with `--deployment <name>`.
@@ -817,6 +915,34 @@ Options:
   --deployment <NAME>  Deployment to generate config for. Required when the env
                        spec defines more than one deployment.
 ```
+
+### `simpled test`
+
+Brings a local deployment up, runs a suite from [testspec.yaml](#testspecyaml) against it, tears it down, and exits with the suite's status.
+
+```
+simpled test [SUITE] [OPTIONS]
+
+Options:
+  --path <PATH>        Path to the project directory (default: current dir)
+  --keep               Leave the stack running after the suite, to debug a failure
+  --no-up              Run the suite against whatever is already up: no compose,
+                       no gateway, no readiness wait
+  --logs               Print the services' logs after every suite, not only a
+                       failing one
+```
+
+Without `SUITE` every suite runs, in name order, and the exit code is the first failing suite's. One run, in order:
+
+1. The suite's deployment is validated and resolved like `local run` would, and the suite's own variables and secrets are checked against it.
+2. `working_dir/.env` and the suite's secret files are written.
+3. The compose file goes to `test_env/`, as project `<application.name>_test`, with the named volumes as Docker volumes. The developer's `local_env/` stack and its data are never touched, and a stopped one does not block the run.
+4. The gateway is bound. A port held by a forgotten `local run` fails here, before anything is started.
+5. The stack starts in the phases a deploy uses, all within `timeout`: the services the jobs depend on with `docker compose up --wait`, then each job to completion (a job that exits non-zero fails the suite with its exit code), then the remaining services with `--wait`. Then each `wait_for` URL is polled.
+6. `run` executes in `working_dir` with the suite's variables in its environment.
+7. The services' logs are printed when the suite failed (or always, with `--logs`), then `docker compose down --volumes` removes the containers and the data. Ctrl-C during the run does the same before exiting.
+
+`--keep` skips the teardown and prints the `docker compose down` command to run later. `--no-up` skips steps 3 to 5 and 7 entirely, for a developer who already has the backend running from an IDE.
 
 ### `simpled docs`
 
@@ -914,3 +1040,5 @@ The compose file sets its project name to `<application.name>_local`, so several
 | `<service>/.env` | Per-service environment variable file |
 | `<service>/undockerized.env` | Variables for services run outside Docker (unless the service sets `working_dir`) |
 | `<working_dir>/.env` | Environment and secrets for a host-run service that sets `working_dir` |
+
+`simpled test` writes the same layout to `test_env/`, as project `<application.name>_test`, plus the suite's `.env` and secret files in its `working_dir`. Keep `local_env/` and `test_env/` out of version control.

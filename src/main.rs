@@ -13,10 +13,12 @@ mod local_ingress;
 mod resolved_spec;
 mod resolver;
 mod run_local;
+mod run_test;
 mod secret_fetch;
 mod spec;
 mod spec_loader;
 mod spec_yaml;
+mod test_spec;
 #[cfg(test)]
 mod test_support;
 mod transform;
@@ -62,6 +64,29 @@ enum Commands {
     Local {
         #[command(subcommand)]
         command: LocalCommands,
+    },
+
+    /// Bring a local deployment up, run a test suite from testspec.yaml against
+    /// it, tear it down, and exit with the suite's status
+    Test {
+        /// Suite to run. Every suite, in name order, when omitted.
+        suite: Option<String>,
+
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Leave the stack running after the suite, to debug a failure
+        #[arg(long)]
+        keep: bool,
+
+        /// Run the suite against whatever is already up: no compose, no
+        /// gateway, no readiness wait
+        #[arg(long)]
+        no_up: bool,
+
+        /// Print the services' logs after every suite, not only a failing one
+        #[arg(long)]
+        logs: bool,
     },
 
     /// Print the documentation embedded in this binary
@@ -241,6 +266,24 @@ fn main() -> Result<()> {
         Commands::Local { command } => {
             local(command)?;
         }
+        Commands::Test {
+            suite,
+            path,
+            keep,
+            no_up,
+            logs,
+        } => {
+            let root = path.as_ref().map(Path::new).unwrap_or(Path::new("."));
+            let options = run_test::TestOptions {
+                keep: *keep,
+                no_up: *no_up,
+                logs: *logs,
+            };
+            let code = run_test::run(root, suite.as_deref(), &options)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::Docs { args, section, outline } => {
             docs_command(args, section, *outline)?;
         }
@@ -417,6 +460,29 @@ fn local(command: &LocalCommands) -> Result<()> {
     // 3. Resolve
     let resolved_spec = resolver::resolve(&env_spec, &app_spec, &deployment.name).context("Resolution failed")?;
 
+    for excluded in &exclude {
+        if !resolved_spec
+            .current_deployment
+            .services
+            .iter()
+            .any(|s| &s.full_name == excluded)
+        {
+            let mut names: Vec<&str> = resolved_spec
+                .current_deployment
+                .services
+                .iter()
+                .map(|s| s.full_name.as_str())
+                .collect();
+            names.sort();
+            bail!(
+                "--exclude names service '{}', which deployment '{}' does not have. Services: {}",
+                excluded,
+                deployment.name,
+                names.join(", ")
+            );
+        }
+    }
+
     // 4. Generate
     match env_spec.env_type {
         spec::DeploymentEnvType::K8S => return Err(anyhow!("Environment type should be local")),
@@ -427,7 +493,9 @@ fn local(command: &LocalCommands) -> Result<()> {
                 run_local::generate_config(&resolved_spec)?;
             }
             LocalCommands::Run { bind, .. } | LocalCommands::OnlyExtra { bind, .. } => {
-                local_ingress::run(
+                // Kept for the life of the run: the gateway only stops when
+                // `stop()` is called, but naming the handle says it is owned here.
+                let _ingress = local_ingress::run(
                     resolved_spec.ingress.clone(),
                     &resolved_spec.current_deployment.name,
                     bind,

@@ -80,6 +80,9 @@ pub fn convert_env_spec(
             if any_service_has_working_dir(&concrete) {
                 return Err(anyhow!("working_dir cannot be set for K8S environment"));
             }
+            if concrete.values().any(|d| d.exclude_services.is_some()) {
+                return Err(anyhow!("exclude_services cannot be set for K8S environment"));
+            }
             DeploymentEnvType::K8S
         }
         DeploymentEnvTypeYaml::Docker => {
@@ -94,6 +97,9 @@ pub fn convert_env_spec(
             }
             if any_service_has_working_dir(&concrete) {
                 return Err(anyhow!("working_dir cannot be set for Docker environment"));
+            }
+            if concrete.values().any(|d| d.exclude_services.is_some()) {
+                return Err(anyhow!("exclude_services cannot be set for Docker environment"));
             }
             DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode,
@@ -251,6 +257,9 @@ fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> De
         defaults: child.defaults.clone().or_else(|| base.defaults.clone()),
         services: merge_opt_map(base.services.as_ref(), child.services.as_ref(), merge_service),
         secrets_folder: child.secrets_folder.clone().or_else(|| base.secrets_folder.clone()),
+        // Replaced, not unioned: a full list reads as "what this deployment leaves
+        // out", and a child can bring a service back that its base excluded.
+        exclude_services: child.exclude_services.clone().or_else(|| base.exclude_services.clone()),
     }
 }
 
@@ -665,6 +674,20 @@ fn convert_deployment(
         services.insert(k.clone(), convert_deployment_service(v, k, &defaults)?);
     }
 
+    let exclude_services = yaml.exclude_services.clone().unwrap_or_default();
+    if let Some(dup) = exclude_services
+        .iter()
+        .enumerate()
+        .find(|(i, s)| exclude_services[..*i].contains(s))
+        .map(|(_, s)| s)
+    {
+        return Err(anyhow!(
+            "Deployment '{}' lists service '{}' twice in exclude_services",
+            name,
+            dup
+        ));
+    }
+
     Ok(DeploymentSpec {
         primary_host,
         name,
@@ -675,6 +698,7 @@ fn convert_deployment(
         secrets,
         defaults,
         services,
+        exclude_services,
     })
 }
 
@@ -1433,5 +1457,90 @@ deployments:
         let spec = convert_env_spec(local_env_yaml(), tempfile::tempdir().unwrap().path(), None).unwrap();
         assert!(service(&spec, "web").volumes.is_empty());
         assert!(service(&spec, "web").command.is_none());
+    }
+
+    const LOCAL_WITH_EXCLUSIONS: &str = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:4090
+deployments:
+  local:
+    primary_host: web
+    application:
+      name: app
+    services:
+      api:
+        host: web
+        prefix: /api
+        ports:
+          - "4001:80"
+      web:
+        host: web
+        prefix: /
+        ports:
+          - "4000:80"
+  infra:
+    extends: local
+    exclude_services: [api, web]
+  api-only:
+    extends: infra
+    exclude_services: [web]
+"#;
+
+    #[test]
+    fn exclude_services_is_inherited_and_replaced_under_extends() {
+        let root = tempfile::tempdir().unwrap();
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_WITH_EXCLUSIONS).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("infra")).unwrap();
+        assert_eq!(spec.deployments[0].exclude_services, vec!["api", "web"]);
+
+        // The child's list replaces the base's: `api` is back.
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_WITH_EXCLUSIONS).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("api-only")).unwrap();
+        assert_eq!(spec.deployments[0].exclude_services, vec!["web"]);
+
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(LOCAL_WITH_EXCLUSIONS).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("local")).unwrap();
+        assert!(spec.deployments[0].exclude_services.is_empty());
+    }
+
+    #[test]
+    fn exclude_services_is_local_only() {
+        let root = tempfile::tempdir().unwrap();
+        for env_type in ["k8s", "docker"] {
+            let raw = format!(
+                r#"
+type: {env_type}
+gateway:
+  hosts:
+    web: shop.example.com
+  tls:
+    disable: true
+registry:
+  myorg: registry.example.com
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: app
+    exclude_services: [api]
+"#
+            );
+            let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&raw).unwrap();
+            let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
+            assert!(err.contains("exclude_services cannot be set"), "{env_type}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_service_excluded_twice_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let raw = LOCAL_WITH_EXCLUSIONS.replace("exclude_services: [api, web]", "exclude_services: [api, api]");
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&raw).unwrap();
+        let err = convert_env_spec(yaml, root.path(), Some("infra"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "Deployment 'infra' lists service 'api' twice in exclude_services");
     }
 }

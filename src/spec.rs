@@ -424,6 +424,8 @@ pub struct DeploymentSpec {
     /// Per-service overrides, keyed by service name. Empty when the deployment
     /// sets none.
     pub services: HashMap<String, DeploymentServiceSpec>,
+    /// Local only: services this deployment does not start.
+    pub exclude_services: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

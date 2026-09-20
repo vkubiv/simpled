@@ -210,6 +210,22 @@ To regenerate the `local_env/` configuration files without starting anything:
 simpled local generate-config
 ```
 
+A set of services you leave out often is worth a deployment of its own, so the flags do not have to be repeated:
+
+```yaml
+# local/localenv.yaml
+deployments:
+  infra:
+    extends: local
+    exclude_services: [api]
+```
+
+```bash
+simpled local run --deployment infra
+```
+
+To run an end-to-end suite against the stack, describe it in `testspec.yaml` next to `localenv.yaml` and run `simpled test`; it brings the deployment up, runs the suite, tears everything down and exits with the suite's status. See the [reference](reference.md#testspecyaml).
+
 Check `local/local_env/backend-api/.env` for the environment variables simpled calculated for that service — you can source them before starting your process directly.
 
 ---

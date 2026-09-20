@@ -223,6 +223,11 @@ pub struct DeploymentSpecYaml {
     pub services: Option<HashMap<String, DeploymentServiceSpecYaml>>,
     // local-only: folder to load secret values from when a secret value is empty
     pub secrets_folder: Option<String>,
+    // local-only: services this deployment does not start. They keep their gateway
+    // routes and their `working_dir` files, since exclusion is how a service is
+    // handed to the developer to run by hand. Under `extends` a child's list
+    // replaces the base's.
+    pub exclude_services: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

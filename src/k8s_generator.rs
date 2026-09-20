@@ -675,6 +675,7 @@ mod tests {
                 secrets: vec![],
                 services: vec![],
                 volumes: vec![],
+                host_environment: vec![],
             },
         }
     }
@@ -858,6 +859,7 @@ mod tests {
                 },
             },
             working_dir: None,
+            excluded: false,
         }
     }
 
