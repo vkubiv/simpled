@@ -150,7 +150,7 @@ jobs:
 
       - name: Upload package (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}.pkg
           path: dist/${{ matrix.asset_name }}.pkg
@@ -167,7 +167,7 @@ jobs:
 
       - name: Upload tarball (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}.tar.gz
           path: dist/${{ matrix.asset_name }}.tar.gz
@@ -181,7 +181,7 @@ jobs:
 
       - name: Upload binary (Linux/Windows)
         if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}.tar.gz
           path: dist/${{ matrix.asset_name }}.tar.gz
