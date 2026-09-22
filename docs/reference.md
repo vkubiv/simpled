@@ -603,6 +603,17 @@ deployments:
             strip: true | false
         strip_prefix: true | false
         variant: variant-name
+        expose:
+          - "1337"         # gateway upstream port, not published on the host
+      service-on-two-hosts:
+        hosts:                      # instead of host/prefix/prefixes
+          hostname-alias:
+            prefix: /path
+            strip_prefix: false
+          other-alias:
+            prefixes:
+              "/path1":
+                strip: false
         replicas: 3
         resources:
           requests:
@@ -730,13 +741,82 @@ DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=myapp
 | Field | Type | Description |
 |-------|------|-------------|
 | `host` | string | Ingress host alias. Required for `public` services. |
+| `hosts` | map | Several host aliases for one service, each with its own `prefix`/`prefixes`/`strip_prefix`. Mutually exclusive with `host`/`prefix`/`prefixes`/`strip_prefix`. See [hosts](#hosts). |
 | `prefix` | string | URL path prefix. Required for `public` services (unless set via `export`). |
 | `prefixes` | map | Multiple prefix rules, each with optional `strip: bool`. Mutually exclusive with `prefix`. |
 | `strip_prefix` | bool | Whether to strip the prefix before forwarding to upstream. Default `true`. |
 | `variant` | string | Image variant to use (must be declared in `appspec.yaml`). |
 | `replicas` | int | Number of pod/container replicas. Overrides `defaults.replicas`. Applied on Kubernetes and Swarm; standalone Docker and local runs always start one container. |
 | `resources` | object | CPU/memory requests and limits. Overrides `defaults.resources`. Kubernetes only; Docker targets do not constrain containers. |
+| `ports` | list | Published host ports, `"external:internal"`. The gateway routes to `external`, so it must equal the container's port; use `expose` when no host port is wanted. |
+| `expose` | list | Container ports the gateway may route to **without** publishing them on the host. The first entry wins as the upstream port, ahead of `ports`. |
 | `working_dir` | string | Local only. Directory of a host-run (non-dockerized) service. See [working_dir](#working_dir). |
+
+#### expose
+
+The gateway needs to know which port a service listens on. It takes the first
+`expose` entry, then a published `ports` entry, then 80.
+
+Reach for `expose` whenever the container does not listen on 80 and you do not
+want the port on the host:
+
+```yaml
+services:
+  strapi:
+    host: website_admin
+    prefix: /
+    expose:
+      - "1337"        # traefik -> http://<stack>_strapi:1337, nothing published
+```
+
+`ports` would work too, but it also publishes the port on the host — and two
+deployments of one app on the same server (a dev and a prod stack side by side)
+would then collide on it. `expose` has no such limit. Note that a published
+port's *external* number is what the gateway routes to, so `"1338:1337"` does
+not redirect the gateway to 1337; it points it at a port the container never
+opened.
+
+#### hosts
+
+`host` puts a service on one alias. When that alias lists several domains, the
+service gets the *same* prefixes on all of them. `hosts` is for the other case: one
+service answering on two hosts under **different** paths.
+
+```yaml
+services:
+  strapi:
+    hosts:
+      website_admin:        # the CMS's own domain: everything
+        prefix: /
+        strip_prefix: false
+      website:              # the site's domain: only the media paths, so an
+        prefixes:           # <img> URL stays same-origin with the page
+          "/upload":
+            strip: false
+          "/api/translations":
+            strip: false
+  nextjs:
+    host: website           # the single-host form is unchanged
+    prefix: /
+```
+
+Each key is an alias from `gateway.hosts`, and each value takes the same
+`prefix` / `prefixes` / `strip_prefix` fields a service override takes. A
+service must claim at least one prefix on every alias it names — an alias with
+no prefix would not be reachable, and is rejected rather than ignored.
+
+Setting `hosts` together with any of `host`, `prefix`, `prefixes` or
+`strip_prefix` is an error: the two spellings disagree about which host a
+prefix belongs to.
+
+Routes are merged per domain across every service and deployment, and two
+services claiming the same path on the same domain is still an error (see
+[gateway](#gateway)). Longer prefixes win at request time, so a service holding
+`/` on a domain does not shadow another holding `/upload` there.
+
+`relative` environment variables are unaffected: they resolve against the
+deployment's `primary_host`, never against a service's own routing, which with
+several routes could not name a single base URL.
 
 #### working_dir
 

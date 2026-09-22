@@ -513,13 +513,23 @@ pub struct ResourceLimits {
 #[derive(Debug, Clone)]
 pub struct DeploymentServiceSpec {
     pub variant: Option<String>,
-    pub host: Option<String>,
-    pub prefixes: Vec<Prefix>,
+    /// Every (host alias, prefixes) pair this service is served on. The single
+    /// `host` + `prefix`/`prefixes` form yields exactly one route; the `hosts`
+    /// map yields one per alias, which is how a service reaches two domains
+    /// under different paths (a CMS on its own admin domain plus a couple of
+    /// prefixes on the site's domain, say). A non-public service has none.
+    pub routes: Vec<ServiceRoute>,
     /// Maximum request body, in bytes, for this service's routes. Overrides the
     /// gateway-wide default.
     pub body_limit: Option<u64>,
     pub resources: ResourcesSpec,
     pub ports: Vec<ServicePort>,
+    /// Ports the gateway may route to without publishing them on the host.
+    /// The upstream port of a service's routes is its first `expose` entry,
+    /// then its first published `ports` entry, then 80. Two deployments of the
+    /// same app on one server need this: they listen on the same container
+    /// port, and publishing it twice is a host port collision.
+    pub expose: Vec<String>,
     // Appended to the service's own volumes, never replacing them.
     pub volumes: Vec<ServiceVolume>,
     // Override the app spec's command / entrypoint for this deployment only.
@@ -527,6 +537,15 @@ pub struct DeploymentServiceSpec {
     pub entrypoint: Option<ServiceCommand>,
     // local-only: working directory of a host-run (non-dockerized) service.
     pub working_dir: Option<String>,
+}
+
+/// One host alias a service answers on, with the prefixes it claims there.
+/// `host` is `None` when the deployment named no alias, meaning the
+/// deployment's `primary_host`.
+#[derive(Debug, Clone)]
+pub struct ServiceRoute {
+    pub host: Option<String>,
+    pub prefixes: Vec<Prefix>,
 }
 
 #[derive(Debug, Clone)]

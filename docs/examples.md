@@ -451,6 +451,41 @@ services:
 
 With `strip: false`, the prefix is forwarded to the upstream service unchanged. Without it (or `strip: true`), the prefix is stripped before forwarding.
 
+All of these prefixes land on the one host named by `host`. When the same service also
+has to answer on a *second* domain under different paths, name the hosts instead:
+
+```yaml
+gateway:
+  hosts:
+    website:
+      - www.example.com
+      - example.com
+    website_admin: admin.example.com
+
+deployments:
+  website_prod:
+    primary_host: website
+    services:
+      headless-cms:
+        hosts:
+          website_admin:      # the CMS's own domain: the whole app
+            prefix: /
+            strip_prefix: false
+          website:            # the site's domain: only the media paths, so an
+            prefixes:         # <img> URL is same-origin with the page
+              "/upload":
+                strip: false
+              "/api/translations":
+                strip: false
+      frontend:
+        host: website
+        prefix: /
+```
+
+`frontend` holds `/` on `www.example.com` while `headless-cms` holds `/upload` there:
+routes merge per domain, and the longer prefix wins at request time. Claiming the *same*
+path twice on one domain is still rejected.
+
 ---
 
 ## Example 7 — Pinning service exports

@@ -261,15 +261,18 @@ impl ServiceResolver<'_> {
         let app_spec = self.app_spec;
         let deployment_service = deployment.services.get(&app_service.name);
 
-        let empty_prefixes = Vec::new();
-        let (variant_name, prefixes, resources) = match deployment_service {
-            Some(ds) => (ds.variant.as_deref().unwrap_or("default"), &ds.prefixes, &ds.resources),
-            None => ("default", &empty_prefixes, &deployment.defaults),
+        let empty_routes = Vec::new();
+        let (variant_name, routes, resources) = match deployment_service {
+            Some(ds) => (ds.variant.as_deref().unwrap_or("default"), &ds.routes, &ds.resources),
+            None => ("default", &empty_routes, &deployment.defaults),
         };
 
-        let host_name = deployment_service
-            .and_then(|ds| ds.host.clone())
-            .unwrap_or_else(|| deployment.primary_host.clone());
+        // `relative` environment variables resolve against the deployment's
+        // primary host, not against wherever a given service happens to be
+        // routed. A service can answer on several hosts, so its own routing
+        // cannot supply a single base URL; the deployment's does, and it is the
+        // same answer for every service in the deployment.
+        let host_name = deployment.primary_host.clone();
         let host_domain_name = self
             .env_spec
             .ingress
@@ -283,15 +286,31 @@ impl ServiceResolver<'_> {
 
         // Check Public Service uniqueness
         if let ServiceType::Public = app_service.service_type {
-            for prefix in prefixes {
-                let key = (host_name.to_string(), prefix.prefix.clone());
-                if !self.public_routes.insert(key) {
-                    return Err(anyhow!(
-                        "Duplicate host+prefix combination for public service {}: {}{}",
-                        app_service.name,
-                        host_name,
-                        prefix.prefix
-                    ));
+            for route in routes {
+                let route_host = route.host.clone().unwrap_or_else(|| deployment.primary_host.clone());
+                // Each route's alias must exist, or the service would simply be
+                // left out of the generated ingress and silently unreachable.
+                // The relative-env lookup below no longer covers this: it
+                // resolves the deployment's primary host, not the service's.
+                if !self
+                    .env_spec
+                    .ingress
+                    .hosts
+                    .iter()
+                    .any(|host_spec| host_spec.name == route_host)
+                {
+                    return Err(anyhow!("Host {} not found in ingress spec", route_host));
+                }
+                for prefix in &route.prefixes {
+                    let key = (route_host.clone(), prefix.prefix.clone());
+                    if !self.public_routes.insert(key) {
+                        return Err(anyhow!(
+                            "Duplicate host+prefix combination for public service {}: {}{}",
+                            app_service.name,
+                            route_host,
+                            prefix.prefix
+                        ));
+                    }
                 }
             }
         }
@@ -375,7 +394,14 @@ impl ServiceResolver<'_> {
             configs: service_configs,
             secrets: service_secrets,
             volumes: service_volumes,
-            expose: app_service.expose.clone(),
+            // The app declares the ports its image listens on; a deployment
+            // may add more for the gateway to reach without publishing them.
+            expose: app_service
+                .expose
+                .iter()
+                .chain(deployment_service.iter().flat_map(|ds| ds.expose.iter()))
+                .cloned()
+                .collect(),
             command: deployment_service
                 .and_then(|s| s.command.clone())
                 .or_else(|| app_service.command.clone()),
@@ -436,7 +462,7 @@ fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppS
             continue;
         }
         if let Some(ds) = deployment.services.get(&app_service.name) {
-            if ds.prefixes.is_empty() {
+            if ds.routes.iter().all(|route| route.prefixes.is_empty()) {
                 return Err(anyhow!(
                     "Public service '{}' in deployment '{}' has no prefixes configured and will not be reachable via ingress.",
                     app_service.name,
@@ -503,13 +529,15 @@ fn build_ingress_rules(env_spec: &DeploymentEnvironmentSpec) -> Vec<IngressRule>
                 let mut dep_services: Vec<_> = dep.services.iter().collect();
                 dep_services.sort_by(|a, b| a.0.cmp(b.0));
                 for (service_name, ds) in dep_services {
-                    let host = ds.host.as_deref().unwrap_or(&dep.primary_host);
-                    if host != host_spec.name {
-                        continue;
-                    }
-                    // Port 80 when the service publishes it, otherwise its
-                    // first port, otherwise 80.
-                    let port = if ds.ports.iter().any(|p| p.external == 80) {
+                    // Which port the gateway talks to. `expose` comes first:
+                    // it names the container's port without publishing it, so a
+                    // service listening on 1337 is routable on a server that
+                    // already hosts another deployment of the same app. Then
+                    // port 80 when the service publishes it, otherwise its
+                    // first published port, otherwise 80.
+                    let port = if let Some(exposed) = ds.expose.first().and_then(|p| p.parse::<u16>().ok()) {
+                        exposed
+                    } else if ds.ports.iter().any(|p| p.external == 80) {
                         80
                     } else {
                         ds.ports.first().map(|p| p.external).unwrap_or(80)
@@ -520,15 +548,24 @@ fn build_ingress_rules(env_spec: &DeploymentEnvironmentSpec) -> Vec<IngressRule>
                     // sees one effective number per route.
                     let body_limit = ds.body_limit.or(env_spec.ingress.body_limit);
 
-                    for prefix in &ds.prefixes {
-                        service_rules.push(IngressToServiceRule {
-                            service_name: service_name.clone(),
-                            deployment_name: dep.name.clone(),
-                            port,
-                            prefix: prefix.prefix.clone(),
-                            strip_prefix: prefix.strip,
-                            body_limit,
-                        });
+                    // A service can be served on several aliases, each with its
+                    // own prefixes; only the routes naming THIS alias belong in
+                    // this host group's rules.
+                    for route in &ds.routes {
+                        let host = route.host.as_deref().unwrap_or(&dep.primary_host);
+                        if host != host_spec.name {
+                            continue;
+                        }
+                        for prefix in &route.prefixes {
+                            service_rules.push(IngressToServiceRule {
+                                service_name: service_name.clone(),
+                                deployment_name: dep.name.clone(),
+                                port,
+                                prefix: prefix.prefix.clone(),
+                                strip_prefix: prefix.strip,
+                                body_limit,
+                            });
+                        }
                     }
                 }
             }
@@ -1131,7 +1168,7 @@ mod tests {
         //! `resolve` on specs written as YAML: the happy path once, then every
         //! way a spec can be rejected during resolution.
         use super::*;
-        use crate::test_support::{app_spec, env_spec};
+        use crate::test_support::{app_spec, env_spec, try_env_spec};
 
         const APP: &str = r#"
 name: shop
@@ -1188,6 +1225,13 @@ deployments:
 
         fn error(app: &str, env_yaml: &str) -> String {
             resolve_yaml(app, env_yaml).unwrap_err().to_string()
+        }
+
+        /// Errors raised while *converting* the env spec, before resolution —
+        /// `resolve_yaml` cannot reach these, since its helper unwraps first.
+        fn convert_error(env_yaml: &str) -> String {
+            let root = tempfile::tempdir().unwrap();
+            try_env_spec(env_yaml, root.path()).unwrap_err().to_string()
         }
 
         #[test]
@@ -1279,6 +1323,120 @@ deployments:
             let services = "      api:\n        host: nope\n        prefix: /";
             let err = error(APP, &env("k8s", REGISTRY, services, ""));
             assert!(err.contains("Host nope not found in ingress spec"), "{err}");
+        }
+
+        #[test]
+        fn a_service_is_routed_on_every_host_it_names() {
+            // The case this exists for: a CMS on its own admin domain, plus a
+            // prefix on the site's domain so uploads stay same-origin.
+            let services = "      api:
+        hosts:
+          admin:
+            prefix: /
+            strip_prefix: false
+          web:
+            prefixes:
+              \"/upload\":
+                strip: false";
+            let resolved = resolve_yaml(APP, &env("k8s", REGISTRY, services, "")).unwrap();
+
+            let rule = |domain: &str| {
+                resolved
+                    .ingress
+                    .rules
+                    .iter()
+                    .find(|r| r.domain_name == domain)
+                    .unwrap_or_else(|| panic!("no rule for {domain}"))
+            };
+
+            let admin = rule("admin.example.com");
+            assert_eq!(admin.services.len(), 1);
+            assert_eq!(admin.services[0].service_name, "api");
+            assert_eq!(admin.services[0].prefix, "/");
+
+            // The site's domain keeps only what it was given: the "/" route did
+            // not leak across from the admin host.
+            let site = rule("shop.example.com");
+            assert_eq!(site.services.len(), 1, "unexpected routes: {:?}", site.services);
+            assert_eq!(site.services[0].service_name, "api");
+            assert_eq!(site.services[0].prefix, "/upload");
+        }
+
+        #[test]
+        fn expose_routes_the_gateway_without_publishing_a_host_port() {
+            let services = "      api:
+        host: web
+        prefix: /
+        expose:
+          - \"1337\"";
+            let resolved = resolve_yaml(APP, &env("k8s", REGISTRY, services, "")).unwrap();
+
+            let route = &resolved
+                .ingress
+                .rules
+                .iter()
+                .find(|r| r.domain_name == "shop.example.com")
+                .unwrap()
+                .services[0];
+            assert_eq!(route.port, 1337, "gateway should talk to the exposed port");
+
+            let api = resolved
+                .current_deployment
+                .services
+                .iter()
+                .find(|s| s.full_name == "api")
+                .unwrap();
+            // The deployment's `expose` adds no published port: the service
+            // still publishes only what the app spec declared (80:8080).
+            assert_eq!(api.ports.len(), 1);
+            assert_eq!(api.ports[0].external, 80);
+            assert!(api.expose.contains(&"1337".to_string()));
+        }
+
+        #[test]
+        fn mixing_hosts_with_the_single_host_form_is_rejected() {
+            let services = "      api:
+        host: web
+        prefix: /
+        hosts:
+          web:
+            prefix: /";
+            let err = convert_error(&env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("both `hosts` and the single-host"), "{err}");
+        }
+
+        #[test]
+        fn a_host_named_without_a_prefix_is_rejected() {
+            let services = "      api:
+        hosts:
+          web: {}";
+            let err = convert_error(&env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("without a `prefix` or `prefixes`"), "{err}");
+        }
+
+        #[test]
+        fn an_unknown_host_among_several_is_rejected() {
+            let services = "      api:
+        hosts:
+          web:
+            prefix: /
+          nope:
+            prefix: /x";
+            let err = error(APP, &env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("Host nope not found in ingress spec"), "{err}");
+        }
+
+        #[test]
+        fn an_unknown_field_on_a_service_is_rejected() {
+            // `hosts` used to land here: unknown keys parsed and were dropped,
+            // so a typo produced wrong routing with no error at all.
+            let services = "      api:
+        host: web
+        prefix: /
+        prefixxes:
+          \"/x\": {}";
+            let err = convert_error(&env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("prefixxes"), "{err}");
         }
 
         #[test]

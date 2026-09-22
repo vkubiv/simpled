@@ -1,7 +1,7 @@
 use crate::spec::*;
 use crate::spec_yaml::*;
 use crate::{env_loader, spec};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -378,9 +378,13 @@ fn merge_service(base: &DeploymentServiceSpecYaml, child: &DeploymentServiceSpec
         prefix: child.prefix.clone().or_else(|| base.prefix.clone()),
         strip_prefix: child.strip_prefix.or(base.strip_prefix),
         prefixes: merge_opt_map(base.prefixes.as_ref(), child.prefixes.as_ref(), |_, c| c.clone()),
+        // Per-alias, like `prefixes`: a child redefining one host's routing
+        // leaves the other aliases the base declared in place.
+        hosts: merge_opt_map(base.hosts.as_ref(), child.hosts.as_ref(), |_, c| c.clone()),
         replicas: child.replicas.or(base.replicas),
         resources: child.resources.clone().or_else(|| base.resources.clone()),
         ports: child.ports.clone().or_else(|| base.ports.clone()),
+        expose: child.expose.clone().or_else(|| base.expose.clone()),
         // Volumes concatenate rather than replace: an `extends` child adding a
         // source mount should keep whatever the base already mounted.
         volumes: match (&base.volumes, &child.volumes) {
@@ -977,28 +981,91 @@ fn convert_limits(yaml: Option<&ResourceLimitsYaml>) -> ResourceLimits {
     }
 }
 
+/// Collects the prefixes of one route. `prefixes` entries default to
+/// `strip: false` (the path is forwarded as written); the single `prefix`
+/// defaults to stripping, which is the older spelling's documented default.
+fn collect_prefixes(
+    prefix: Option<&String>,
+    strip_prefix: Option<bool>,
+    prefixes: Option<&HashMap<String, PrefixOptionsYaml>>,
+) -> Vec<Prefix> {
+    let mut collected: Vec<Prefix> = prefixes
+        .map(|p| {
+            p.iter()
+                .map(|(k, v)| Prefix {
+                    prefix: k.clone(),
+                    strip: v.strip.unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(prefix) = prefix {
+        collected.push(Prefix {
+            prefix: prefix.clone(),
+            strip: strip_prefix.unwrap_or(true),
+        });
+    }
+
+    // serde_yaml hands back a HashMap, so sort to keep generated ingress
+    // configuration byte-identical across runs.
+    collected.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    collected
+}
+
+/// Turns a service override into its routes: either the `hosts` map (one route
+/// per alias) or the single-route `host` + `prefix`/`prefixes` form. Mixing the
+/// two is rejected rather than silently resolved — the two spellings disagree
+/// about which host a prefix belongs to.
+fn convert_service_routes(yaml: &DeploymentServiceSpecYaml, name: &str) -> Result<Vec<ServiceRoute>> {
+    let Some(hosts) = &yaml.hosts else {
+        return Ok(vec![ServiceRoute {
+            host: yaml.host.clone(),
+            prefixes: collect_prefixes(yaml.prefix.as_ref(), yaml.strip_prefix, yaml.prefixes.as_ref()),
+        }]);
+    };
+
+    if yaml.host.is_some() || yaml.prefix.is_some() || yaml.prefixes.is_some() || yaml.strip_prefix.is_some() {
+        bail!(
+            "Service '{}' sets both `hosts` and the single-host `host`/`prefix`/`prefixes`/`strip_prefix` fields; use one form or the other",
+            name
+        );
+    }
+    if hosts.is_empty() {
+        bail!(
+            "Service '{}' has an empty `hosts` map; name at least one host alias",
+            name
+        );
+    }
+
+    let mut aliases: Vec<_> = hosts.iter().collect();
+    aliases.sort_by(|a, b| a.0.cmp(b.0));
+
+    aliases
+        .into_iter()
+        .map(|(alias, route)| {
+            let prefixes = collect_prefixes(route.prefix.as_ref(), route.strip_prefix, route.prefixes.as_ref());
+            if prefixes.is_empty() {
+                bail!(
+                    "Service '{}' names host '{}' under `hosts` without a `prefix` or `prefixes`, so it would not be reachable there",
+                    name,
+                    alias
+                );
+            }
+            Ok(ServiceRoute {
+                host: Some(alias.clone()),
+                prefixes,
+            })
+        })
+        .collect()
+}
+
 fn convert_deployment_service(
     yaml: &DeploymentServiceSpecYaml,
     name: &str,
     defaults: &ResourcesSpec,
 ) -> Result<DeploymentServiceSpec> {
-    let mut prefixes = if let Some(p) = &yaml.prefixes {
-        p.iter()
-            .map(|(k, v)| Prefix {
-                prefix: k.clone(),
-                strip: v.strip.unwrap_or(false),
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    if let Some(prefix) = &yaml.prefix {
-        prefixes.push(Prefix {
-            prefix: prefix.clone(),
-            strip: yaml.strip_prefix.unwrap_or(true),
-        });
-    }
+    let routes = convert_service_routes(yaml, name)?;
 
     let resources = if let Some(res) = &yaml.resources {
         ResourcesSpec {
@@ -1034,11 +1101,11 @@ fn convert_deployment_service(
 
     Ok(DeploymentServiceSpec {
         variant: yaml.variant.clone(),
-        host: yaml.host.clone(),
-        prefixes,
+        routes,
         body_limit,
         resources,
         ports,
+        expose: yaml.expose.clone().unwrap_or_default(),
         volumes,
         command: yaml.command.clone().map(super::convert_service_command),
         entrypoint: yaml.entrypoint.clone().map(super::convert_service_command),

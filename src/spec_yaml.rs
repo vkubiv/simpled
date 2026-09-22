@@ -312,9 +312,16 @@ pub struct ResourceLimitsYaml {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentServiceSpecYaml {
     pub variant: Option<String>,
     pub host: Option<String>,
+    // Several host aliases for one service, each with its own prefixes: what a
+    // service needs when it answers on two domains under different paths. Maps
+    // an alias from `gateway.hosts` to the routing it gets there. Mutually
+    // exclusive with `host`/`prefix`/`prefixes`/`strip_prefix`, which are the
+    // single-route spelling of the same thing.
+    pub hosts: Option<HashMap<String, ServiceHostRouteYaml>>,
     // Maximum request body size for this service's routes, overriding the
     // gateway-wide `body_limit`. Same notation as the gateway's.
     pub body_limit: Option<String>,
@@ -325,6 +332,12 @@ pub struct DeploymentServiceSpecYaml {
     pub resources: Option<ResourcesSpecYaml>,
     // ports are a vector of strings in the form "external:internal"
     pub ports: Option<Vec<String>>,
+    // Container ports the gateway routes to but which are NOT published on the
+    // host, same meaning as an app service's `expose`. Use this instead of
+    // `ports` when the service listens on something other than 80 and the host
+    // port is not wanted — two deployments of one app on a single server cannot
+    // both publish it.
+    pub expose: Option<Vec<String>>,
 
     // Extra mounts for this service in this deployment, same form as a service's
     // own `volumes` in the app spec ("./host/path:/container/path" or
@@ -343,7 +356,18 @@ pub struct DeploymentServiceSpecYaml {
     pub working_dir: Option<String>,
 }
 
+/// The routing a service gets on one host alias, inside `hosts:`. Same fields
+/// as the service-level single-route form, minus the alias itself (the map key).
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceHostRouteYaml {
+    pub prefix: Option<String>,
+    pub strip_prefix: Option<bool>,
+    pub prefixes: Option<HashMap<String, PrefixOptionsYaml>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PrefixOptionsYaml {
     pub strip: Option<bool>,
 }

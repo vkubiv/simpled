@@ -39,6 +39,9 @@ Get these right and most specs validate on the first try.
 5. **Every `public` service needs `host` + `prefix`** in the deployment's `services:`,
    or an `export:` block in `appspec.yaml` as the default. `host` is a *gateway host
    alias*, not a domain — the alias is mapped to a real domain under `gateway.hosts`.
+   One alias may list several domains, which all get the same prefixes; a service that
+   needs *different* paths on different domains uses `hosts:` instead (see
+   `docs reference --section hosts`).
 6. **Named volumes must be declared** in the top-level `volumes:` list before a service
    mounts them. Host paths (`./x`, `/x`) need no declaration.
 7. **A service may only reference variables** that exist in the `environment:` block
@@ -182,6 +185,8 @@ one inline with `extends:`.
 | Situation | Use |
 |---|---|
 | Serves HTTP to the outside | `type: public` + `host`/`prefix` |
+| One service on two domains under different paths | `hosts:` on the deployment's service override |
+| Container listens on a port other than 80 | `expose:` on the service override (`ports:` also publishes it) |
 | Background worker, DB, cache | `type: internal` |
 | Migration, one-time setup | `type: job` + `depends_on: [db]` |
 | Image built and versioned with the app | `app_services` |
@@ -247,6 +252,8 @@ one inline with `extends:`.
   over `environment`). Override a variable in both lists if both set it.
 - `.env.local` next to `localenv.yaml` overrides `undockerized_environment` per
   developer. Keep it out of version control.
+- A service override is validated strictly: an unknown field is an error, not something
+  quietly dropped. A `prefixes` typo used to produce wrong routing in silence.
 - Only one deployment can run locally at a time; the ones you do not pick are dropped
   before validation, so they may freely share domains and ports.
 
