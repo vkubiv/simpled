@@ -194,6 +194,8 @@ one inline with `extends:`.
 | A local deployment that starts only some services | `exclude_services:` on the deployment (replaces `--exclude` flags) |
 | An end-to-end suite against the local stack | `testspec.yaml` suite with `deployment: {extends: local, ...}` + `simpled test` |
 | Secret already in the CI environment | `env: VAR` |
+| Many secrets already in the CI environment | `secrets_env_prefix: CI_SECRET_` on the deployment, and no source per secret |
+| Many secrets in one JSON document | `secrets_json: ./secrets.json` locally, `secrets_aws: prod/app/bundle` for real environments; each secret takes the field named after it |
 | Secret that must not pass through CI | `aws: path/to/secret` (resolved on the deploy target) |
 
 ## Error → fix
@@ -222,6 +224,16 @@ one inline with `extends:`.
   with `variable:` instead.
 - Secrets mount at `/secrets/<name>` by default; `path:` changes the location and
   `variable:` turns it into an environment variable instead.
+- A secret value keeps its interior newlines but loses the trailing ones, and must not
+  be empty after that: `echo "$KEY" > secrets/api_key` is fine, an empty file is an
+  error naming the secret.
+- A secret with no value goes through the fallback chain, in this order and skipping
+  what the deployment does not set: `secrets_folder` file, `secrets_json` field,
+  `secrets_env_prefix` variable (ignoring case), `secrets_aws` field. A secret that
+  sets `jq:` skips the two that hold one raw value.
+- `secrets_json` and `secrets_aws` default the filter to the field named after the
+  secret, so one document serves the whole list. An `aws:` written on the secret
+  itself is still read whole unless it sets `jq:`.
 - A `job` with no `depends_on` is treated as depending on *every* long-running service,
   which starts the whole stack before the migration. Always list its dependencies.
 - Give a job's dependency a `healthcheck`; without one "ready" only means the container

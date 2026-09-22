@@ -108,6 +108,46 @@ fn read_config_file(path: &Path) -> Result<ConfigResolvedFile> {
     Ok(ConfigResolvedFile { name, content })
 }
 
+/// A local deployment runs on this machine, so there is no deploy target to defer
+/// to and no artifact for the value to leak into — the lookup happens right here.
+/// Every other target gets the lookup written into its generated
+/// `fetch-secrets.sh` instead.
+fn resolve_aws_secret(env_spec: &DeploymentEnvironmentSpec, reference: &AwsSecretRef) -> Result<SecretResolvedValue> {
+    if env_spec.env_type == DeploymentEnvType::Local {
+        Ok(SecretResolvedValue::Literal(secret_fetch::fetch_locally(reference)?))
+    } else {
+        Ok(SecretResolvedValue::Deferred(reference.clone()))
+    }
+}
+
+/// The variable named by `name` whatever case it is written in, with the name it
+/// actually has. A `secrets_env_prefix` variable is spelled from a secret name,
+/// and the two conventions disagree: `openai_api_key` against `E2E_SECRET_OPENAI_API_KEY`.
+fn env_var_ignoring_case(name: &str) -> Result<Option<(String, String)>> {
+    let mut found: Option<(String, String)> = None;
+    for (key, value) in env::vars_os() {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if let Some((first, _)) = &found {
+            // Possible only where the environment is case-sensitive. Taking either
+            // one would make the deployed value depend on iteration order.
+            return Err(anyhow!(
+                "Environment variables {} and {} both match the secret variable {}. \
+                 Unset one of them.",
+                first,
+                key,
+                name
+            ));
+        }
+        found = Some((key.to_string(), value.to_string()));
+    }
+    Ok(found)
+}
+
 /// The deployment's secrets, plus the two views service resolution needs of them.
 struct ResolvedSecrets {
     specs: Vec<SecretResolvedSpec>,
@@ -133,32 +173,53 @@ fn resolve_secrets(
         let value = match &secret_spec.source {
             DeploymentSecretSource::EnvVariable(var_name) => {
                 let value = env::var(var_name).context(format!("Secret environment variable {} not set", var_name))?;
+                let value = trim_secret_value(&value);
                 if value.is_empty() {
                     return Err(anyhow!("Secret environment variable {} is empty", var_name));
                 }
-                SecretResolvedValue::Literal(value)
+                SecretResolvedValue::Literal(value.to_string())
+            }
+            // `secrets_env_prefix`, so the variable's name was derived rather than
+            // written down. Everything after the lookup is the `env:` source's.
+            DeploymentSecretSource::PrefixedEnvVariable(lookup) => {
+                match env_var_ignoring_case(&lookup.variable)? {
+                    Some((var_name, value)) => {
+                        let value = trim_secret_value(&value);
+                        if value.is_empty() {
+                            return Err(anyhow!("Secret environment variable {} is empty", var_name));
+                        }
+                        SecretResolvedValue::Literal(value.to_string())
+                    }
+                    // `secrets_aws` ends the chain: its lookup belongs on the deploy
+                    // target, so nothing after it could be tried here anyway.
+                    None => match &lookup.fallback {
+                        Some(reference) => resolve_aws_secret(env_spec, reference)?,
+                        None => {
+                            let mut tried = lookup.tried.clone();
+                            tried.push(format!("${} (not set)", lookup.variable));
+                            return Err(anyhow!(
+                                "Secret '{}' has no value. Tried: {}",
+                                secret_spec.secret_name,
+                                tried.join(", ")
+                            ));
+                        }
+                    },
+                }
             }
             DeploymentSecretSource::FilePath(path_str) => {
                 let path = Path::new(path_str);
                 if !path.exists() {
                     return Err(anyhow!("Secret file not found: {:?}", path_str));
                 }
-                SecretResolvedValue::Literal(
-                    fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?,
-                )
+                let content = fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?;
+                let value = trim_secret_value(&content);
+                if value.is_empty() {
+                    return Err(anyhow!("Secret file {:?} is empty", path_str));
+                }
+                SecretResolvedValue::Literal(value.to_string())
             }
             DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
-            // A local deployment runs on this machine, so there is no deploy
-            // target to defer to and no artifact for the value to leak into —
-            // the lookup happens right here. Every other target gets the lookup
-            // written into its generated `fetch-secrets.sh` instead.
-            DeploymentSecretSource::Aws(reference) => {
-                if env_spec.env_type == DeploymentEnvType::Local {
-                    SecretResolvedValue::Literal(secret_fetch::fetch_locally(reference)?)
-                } else {
-                    SecretResolvedValue::Deferred(reference.clone())
-                }
-            }
+            DeploymentSecretSource::Aws(reference) => resolve_aws_secret(env_spec, reference)?,
         };
         match &value {
             SecretResolvedValue::Literal(literal) => {
@@ -1280,6 +1341,68 @@ deployments:
             std::env::set_var("SIMPLED_TEST_EMPTY_SECRET", "");
             let err = error(&app, &env("k8s", REGISTRY, &secrets("SIMPLED_TEST_EMPTY_SECRET"), ""));
             assert!(err.contains("SIMPLED_TEST_EMPTY_SECRET is empty"), "{err}");
+        }
+
+        /// A secret file is written by a person or by CI, and both end it with a
+        /// newline that is not part of the value — one that a secret mounted as an
+        /// environment variable could not carry at all.
+        #[test]
+        fn a_secret_file_loses_its_trailing_newline_and_cannot_be_empty() {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("db"), "s3cr3t\n").unwrap();
+            fs::write(root.path().join("blank"), "\n").unwrap();
+
+            let app = format!("{APP}secrets:\n  - db_password\n");
+            let services = |file: &str| {
+                format!("      api:\n        host: web\n        prefix: /\n    secrets:\n      db_password:\n        file: {file}")
+            };
+            let resolve_file = |file: &str| {
+                resolve(
+                    &env_spec(&env("k8s", REGISTRY, &services(file), ""), root.path()),
+                    &app_spec(&app),
+                    "prod",
+                )
+            };
+
+            let spec = resolve_file("db").unwrap();
+            assert_eq!(spec.current_deployment.secrets[0].literal(), Some("s3cr3t"));
+
+            let err = resolve_file("blank").unwrap_err().to_string();
+            assert!(err.contains("is empty"), "{err}");
+        }
+
+        /// The variable's name is spelled from the secret's, and the two follow
+        /// different conventions, so the match ignores case.
+        #[test]
+        fn a_prefixed_secret_is_read_from_the_environment_whatever_case_it_is_in() {
+            let app = format!("{APP}secrets:\n  - db_password\n");
+            let prefixed = |prefix: &str| {
+                format!("      api:\n        host: web\n        prefix: /\n    secrets_env_prefix: {prefix}\n    secrets:\n      db_password:")
+            };
+            let resolve_prefix = |prefix: &str| resolve_yaml(&app, &env("k8s", REGISTRY, &prefixed(prefix), ""));
+
+            std::env::set_var("SIMPLED_TEST_PFX_DB_PASSWORD", "s3cr3t\n");
+            let spec = resolve_prefix("SIMPLED_TEST_PFX_").unwrap();
+            assert_eq!(spec.current_deployment.secrets[0].literal(), Some("s3cr3t"));
+
+            let err = resolve_prefix("SIMPLED_TEST_UNSET_PFX_").unwrap_err().to_string();
+            assert!(err.contains("$SIMPLED_TEST_UNSET_PFX_db_password (not set)"), "{err}");
+
+            std::env::set_var("SIMPLED_TEST_BLANK_PFX_DB_PASSWORD", "\n");
+            let err = resolve_prefix("SIMPLED_TEST_BLANK_PFX_").unwrap_err().to_string();
+            assert!(err.contains("is empty"), "{err}");
+        }
+
+        /// `secrets_aws` ends the chain. It is the one source that cannot be tried
+        /// while the deployment is prepared, so an unset variable defers to it.
+        #[test]
+        fn an_unset_prefixed_variable_falls_through_to_secrets_aws() {
+            let app = format!("{APP}secrets:\n  - db_password\n");
+            let services = "      api:\n        host: web\n        prefix: /\n    secrets_env_prefix: SIMPLED_TEST_NO_SUCH_PREFIX_\n    secrets_aws: prod/shop/bundle\n    secrets:\n      db_password:";
+            let spec = resolve_yaml(&app, &env("k8s", REGISTRY, services, "")).unwrap();
+            let deferred = spec.current_deployment.secrets[0].deferred().unwrap();
+            assert_eq!(deferred.secret_id, "prod/shop/bundle");
+            assert_eq!(deferred.jq.as_deref(), Some(".db_password"));
         }
 
         #[test]

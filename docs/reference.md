@@ -303,7 +303,115 @@ deployments:
 
 This keeps sensitive values out of the spec file while still having a simple, declarative local config. The `secrets/` directory can be git-ignored.
 
+`echo "$KEY" > secrets/api_key` is the normal way to write one of these files, and an editor adds the same trailing newline, so it is not part of the value: see [Whitespace and empty values](#whitespace-and-empty-values).
+
 `secrets_folder` is not valid for `k8s` or `docker` environments.
+
+---
+
+### secrets_env_prefix
+
+Resolves every valueless secret from the environment, so a deployment with twenty secrets does not need twenty `env:` lines:
+
+```yaml
+# localenv.yaml
+deployments:
+  myapp_local:
+    secrets_env_prefix: E2E_SECRET_
+    secrets:
+      openai_api_key:        # reads $E2E_SECRET_OPENAI_API_KEY
+      db_password:           # reads $E2E_SECRET_DB_PASSWORD
+      api_key: real-key      # used as-is, the environment is not consulted
+```
+
+The variable is the prefix plus the secret's own name, and **the match ignores case**: secrets are named in lower case and environment variables in upper, and both spellings — and anything between — find each other. Two variables that differ only in case are an error rather than a coin toss.
+
+Unlike `secrets_folder`, this is valid in every environment type. It is the same lookup a per-secret `env:` source does, with the name derived instead of written down, and it happens where the deployment is prepared.
+
+**With `secrets_folder`**, the folder is tried first: a file that exists wins, and the prefix covers every secret that has no file. That is what makes one value overridable locally — drop the file in, leave the variables alone:
+
+```yaml
+    secrets_folder: ./secrets
+    secrets_env_prefix: E2E_SECRET_
+    secrets:
+      openai_api_key:        # ./secrets/openai_api_key, else $E2E_SECRET_OPENAI_API_KEY
+```
+
+---
+
+### secrets_json
+
+One JSON document holding every secret, a field per secret:
+
+```json
+{ "openai_api_key": "sk-...", "db": { "password": "hunter2" } }
+```
+
+```yaml
+# localenv.yaml
+deployments:
+  myapp_local:
+    secrets_json: ./secrets.json
+    secrets:
+      openai_api_key:        # .openai_api_key
+      db_password:
+        jq: .db.password     # a field that is not named after the secret
+```
+
+The filter defaults to the field named after the secret, quoted when the name is not an identifier (`.["api-key"]` would be a subtraction to jq unquoted). A field the document does not have, or one whose value is `null`, is not an error here — it falls through to the next source in the chain below.
+
+**Only a field path** — `.a`, `.a.b`, `."a b"` — is understood. simpled resolves it itself, so a local stack needs no jq installed; a filter that does more than select a field belongs with an `aws` source, where jq runs on the deploy target.
+
+---
+
+### secrets_aws
+
+The same document, in AWS Secrets Manager, for every secret the deployment does not otherwise provide:
+
+```yaml
+# envspec.yaml
+deployments:
+  myapp_prod:
+    secrets_aws: prod/myapp/bundle
+    secrets:
+      openai_api_key:        # prod/myapp/bundle, .openai_api_key
+      db_password:
+        jq: .db.password
+      legacy_key:
+        aws: prod/myapp/legacy   # its own secret, read whole
+```
+
+It is an [`aws` source](#aws-secrets-manager) with the id filled in and `jq` defaulting to the secret's own name, so everything that section says applies — above all that the lookup happens on the deploy target, not where the deployment is prepared. One lookup is made per secret, so a bundle of twelve secrets is twelve `get-secret-value` calls at deploy time.
+
+A secret that writes its own `aws:` is read **whole** unless it also writes `jq:`. Only the deployment-wide documents default to a field, so a secret that holds a single value keeps working unchanged.
+
+Together, `secrets_json` for local and `secrets_aws` for the real environments let both specs list the secret names and nothing else.
+
+---
+
+### The fallback chain
+
+A secret with no value and no source of its own is looked for in each of these that the deployment configures, in this order:
+
+| | Source | Read |
+|--|--------|------|
+| 1 | [`secrets_folder`](#secrets_folder) | `<folder>/<name>`, the whole file |
+| 2 | [`secrets_json`](#secrets_json) | the field of the document |
+| 3 | [`secrets_env_prefix`](#secrets_env_prefix) | `<prefix><name>` in the environment, ignoring case |
+| 4 | [`secrets_aws`](#secrets_aws) | the field of the document, on the deploy target |
+
+A secret that sets `jq:` skips 1 and 3, which hold one raw value each and cannot select a field.
+
+The order puts the most specific first: a file dropped into the folder overrides the document for that one value, without touching anything else. `secrets_aws` is last because it is the only one that cannot be tried where the deployment is prepared.
+
+A value that is in none of them fails with every place that was consulted named at once:
+
+```
+Secret 'stripe_key' has no value. Tried: secrets/stripe_key (no such file),
+secrets.json (no .stripe_key), $CI_SECRET_stripe_key (not set)
+```
+
+A source that *has* the secret but holds nothing — an empty file, an empty field — is an error rather than a fall-through.
 
 ---
 
@@ -352,7 +460,8 @@ jq's own error output is discarded rather than printed: a parse error quotes the
 
 Notes:
 
-- `jq` is only valid together with `aws`, and `aws` cannot be combined with `env` or `file`.
+- `aws` cannot be combined with `env` or `file`, and `jq` goes with `aws`, [`secrets_json`](#secrets_json) or [`secrets_aws`](#secrets_aws) — never with `env` or `file`, which carry one raw value.
+- An `aws` source written on the secret itself is read whole unless it sets `jq`. The deployment-wide [`secrets_aws`](#secrets_aws) is the one that defaults to a field named after the secret.
 - `$secret(name)` cannot reference an `aws` secret: env files are written when the deployment is prepared, and the value does not exist yet. Mount the secret on the service with `variable:` instead.
 - For `local` deployments there is no deploy target to defer to, so the lookup runs on your machine while the environment is resolved.
 
@@ -517,6 +626,9 @@ deployments:
 | `configs` | map | no | Maps config names to directories containing the config files. |
 | `secrets` | map | no | Provides values for the secrets declared in `appspec.yaml`, from a literal, `env`, `file` or `aws`. See [AWS Secrets Manager](#aws-secrets-manager). |
 | `secrets_folder` | string | no | Path to a folder of secret files. Only valid for `local`. See [secrets_folder](#secrets_folder). |
+| `secrets_env_prefix` | string | no | Reads every valueless secret from `<prefix><secret name>` in the environment, ignoring case. See [secrets_env_prefix](#secrets_env_prefix). |
+| `secrets_json` | string | no | Path to a JSON document holding a field per secret. See [secrets_json](#secrets_json). |
+| `secrets_aws` | string | no | AWS Secrets Manager secret holding that same document, for secrets with no source of their own. See [secrets_aws](#secrets_aws). |
 | `defaults` | object | no | Default replica count and resource limits applied to all services. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
 | `exclude_services` | list | no | Services this deployment does not start. Only valid for `local`. See [exclude_services](#exclude_services). |
@@ -581,7 +693,8 @@ Each secret must match a name declared in `appspec.yaml`. Exactly one source mus
 | Form | Description |
 |------|-------------|
 | `secret_name: "literal"` | Inline string value. Local development only. |
-| `secret_name:` or `secret_name: ''` | No value — load from `secrets_folder` file. Requires `secrets_folder` to be set. |
+| `secret_name:` or `secret_name: ''` | No value — go through [the fallback chain](#the-fallback-chain). Requires the deployment to configure at least one of its sources. |
+| `secret_name:` + `jq: .path` | A field of the deployment's `secrets_json` or `secrets_aws` document. |
 | `secret_name:` + `env: VAR_NAME` | Read from the named shell environment variable at deploy time. |
 | `secret_name:` + `file: ./path` | Read from a file at deploy time. |
 
@@ -594,6 +707,12 @@ secrets:
   admin_cert:
     file: ./secrets/admin.pem    # read from file
 ```
+
+##### Whitespace and empty values
+
+Every source but an inline value loses the **trailing** newlines of what it read — the one `echo`, an editor or the AWS CLI appends, which is not part of the credential. It matters most for a secret mounted with `variable:`: an env file cannot carry a line break at all, so without this a file written the obvious way would fail the deployment with *contains a line break*. Interior newlines are kept, so a PEM key mounted as a file arrives intact.
+
+What is left after that must not be empty. A secret whose file is missing its value, or whose environment variable is unset or blank, stops the deployment by name instead of reaching a service as an empty credential and failing the first request that used it.
 
 #### undockerized_environment
 

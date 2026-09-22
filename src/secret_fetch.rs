@@ -10,7 +10,7 @@
 //! machine — performs the same lookup directly.
 
 use crate::resolved_spec::SecretResolvedSpec;
-use crate::spec::AwsSecretRef;
+use crate::spec::{trim_secret_value, AwsSecretRef};
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
 use std::io::Write;
@@ -371,7 +371,7 @@ pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
     let value =
         String::from_utf8(output.stdout).context("AWS Secrets Manager returned a value that is not valid UTF-8")?;
     // `--output text` terminates the value with a newline that is not part of it.
-    let value = value.trim_end_matches(['\n', '\r']).to_string();
+    let value = trim_secret_value(&value).to_string();
 
     // `--query SecretString` prints the literal `None` for a secret that holds
     // only binary data, and nothing at all for an empty string value. Both would
@@ -424,7 +424,7 @@ pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
     }
 
     let filtered = String::from_utf8(output.stdout).context("jq returned a value that is not valid UTF-8")?;
-    let filtered = filtered.trim_end_matches(['\n', '\r']).to_string();
+    let filtered = trim_secret_value(&filtered).to_string();
     if filtered.is_empty() {
         return Err(anyhow!(
             "The jq filter '{}' selected an empty value in secret '{}'.",

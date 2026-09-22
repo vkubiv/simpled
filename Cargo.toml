@@ -1,12 +1,15 @@
 [package]
 name = "simpled"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+# Reads the `secrets_json` document. A field path is resolved here rather than by
+# shelling out to jq, so a local stack needs nothing installed.
+serde_json = "1.0"
 anyhow = "1.0"
 semver = "1.0.27"
 tar = "0.4"

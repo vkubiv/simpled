@@ -223,6 +223,17 @@ pub struct DeploymentSpecYaml {
     pub services: Option<HashMap<String, DeploymentServiceSpecYaml>>,
     // local-only: folder to load secret values from when a secret value is empty
     pub secrets_folder: Option<String>,
+    // Resolves a secret that has no value from the environment: the variable is
+    // this prefix plus the secret's name, matched ignoring case. Consulted after
+    // `secrets_folder`, so a file still overrides the environment.
+    pub secrets_env_prefix: Option<String>,
+    // A JSON document holding many secrets at once: a secret with no value of its
+    // own takes the field named after it, or the one its `jq` selects. The shape
+    // `secrets_aws` fetches, kept in a file.
+    pub secrets_json: Option<String>,
+    // AWS Secrets Manager secret holding that same document, for every secret the
+    // deployment does not otherwise provide.
+    pub secrets_aws: Option<String>,
     // local-only: services this deployment does not start. They keep their gateway
     // routes and their `working_dir` files, since exclusion is how a service is
     // handed to the developer to run by hand. Under `extends` a child's list
@@ -237,7 +248,10 @@ pub struct DeploymentSecretSpecYaml {
     // AWS Secrets Manager secret name or ARN. Resolved on the deploy target, not
     // here, so the value never enters the generated deployment directory.
     pub aws: Option<String>,
-    // Optional jq filter for `aws` secrets that hold a JSON document.
+    // Filter for a secret that holds a JSON document: required by an `aws` source
+    // that is more than one value, and on its own it selects a field of the
+    // deployment's `secrets_json` or `secrets_aws` document. Defaults to the field
+    // named after the secret.
     pub jq: Option<String>,
 }
 

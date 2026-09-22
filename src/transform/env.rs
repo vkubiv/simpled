@@ -257,6 +257,12 @@ fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> De
         defaults: child.defaults.clone().or_else(|| base.defaults.clone()),
         services: merge_opt_map(base.services.as_ref(), child.services.as_ref(), merge_service),
         secrets_folder: child.secrets_folder.clone().or_else(|| base.secrets_folder.clone()),
+        secrets_env_prefix: child
+            .secrets_env_prefix
+            .clone()
+            .or_else(|| base.secrets_env_prefix.clone()),
+        secrets_json: child.secrets_json.clone().or_else(|| base.secrets_json.clone()),
+        secrets_aws: child.secrets_aws.clone().or_else(|| base.secrets_aws.clone()),
         // Replaced, not unioned: a full list reads as "what this deployment leaves
         // out", and a child can bring a service back that its base excluded.
         exclude_services: child.exclude_services.clone().or_else(|| base.exclude_services.clone()),
@@ -403,6 +409,201 @@ fn normalize_working_dir(dir: &str) -> PathBuf {
         .collect()
 }
 
+/// A path as it reads in a message: the `./` a spec writes is dropped, since the
+/// path is printed joined onto the spec's own directory and the segment is noise.
+fn path_for_message(path: &Path) -> String {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect::<PathBuf>()
+        .display()
+        .to_string()
+}
+
+/// Where a secret that names no source of its own is looked for, in this order.
+/// A place the deployment does not configure is skipped, and a value that is in
+/// none of them is reported against every one that was consulted.
+struct SecretFallbacks<'a> {
+    folder: Option<&'a Path>,
+    json_path: Option<&'a Path>,
+    /// The parsed `secrets_json` document, absent when the file is not there.
+    json: Option<&'a serde_json::Value>,
+    env_prefix: Option<&'a str>,
+    aws: Option<&'a str>,
+}
+
+impl SecretFallbacks<'_> {
+    /// Whether a jq filter has anything to select from.
+    fn has_document(&self) -> bool {
+        self.json_path.is_some() || self.aws.is_some()
+    }
+}
+
+/// The filter for a secret that writes none: the field named after it, which is
+/// what makes one `secrets_json` or `secrets_aws` document serve every secret.
+/// Quoted unless the name is an identifier — `.api-key` is a subtraction to jq.
+fn default_secret_filter(name: &str) -> String {
+    let plain = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        format!(".{}", name)
+    } else {
+        format!(".\"{}\"", name)
+    }
+}
+
+/// Reads one secret file: the whole file is the value.
+fn read_secret_file(name: &str, path: &Path) -> Result<String> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read secret '{}' from {:?}", name, path))?;
+    let value = trim_secret_value(&content);
+    if value.is_empty() {
+        return Err(anyhow!("Secret '{}' is empty in {}", name, path_for_message(path)));
+    }
+    Ok(value.to_string())
+}
+
+/// The field a path selects in the `secrets_json` document, or `None` when the
+/// document does not have it. Only a path — `.a`, `."a b"`, `.a.b` — is
+/// understood: anything a full jq program would do belongs with an `aws` source,
+/// where jq itself runs on the deploy target.
+fn json_field(doc: &serde_json::Value, filter: &str) -> Result<Option<String>> {
+    let path = parse_field_path(filter).ok_or_else(|| {
+        anyhow!(
+            "'{}' is not a field path. A secret read from secrets_json is selected by a path like .api_key or \
+             .db.password; a filter that does more than that works only with an aws source, where jq runs.",
+            filter
+        )
+    })?;
+    let mut value = doc;
+    for segment in &path {
+        match value.get(segment) {
+            Some(next) => value = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(match value {
+        // What jq would print: a string raw, anything else as its JSON.
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    })
+}
+
+/// `.a.b` and `."a.b"` as the segments they address, or `None` for a filter that
+/// is not a plain path. `.` on its own selects the whole document.
+fn parse_field_path(filter: &str) -> Option<Vec<String>> {
+    let mut rest = filter.strip_prefix('.')?;
+    let mut segments = Vec::new();
+    while !rest.is_empty() {
+        let segment = if let Some(quoted) = rest.strip_prefix('"') {
+            let end = quoted.find('"')?;
+            rest = &quoted[end + 1..];
+            quoted[..end].to_string()
+        } else {
+            let end = rest.find('.').unwrap_or(rest.len());
+            let (segment, tail) = rest.split_at(end);
+            if segment.is_empty()
+                || !segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return None;
+            }
+            rest = tail;
+            segment.to_string()
+        };
+        segments.push(segment);
+        if !rest.is_empty() {
+            rest = rest.strip_prefix('.')?;
+            if rest.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(segments)
+}
+
+fn load_secrets_json(path: &Path) -> Result<serde_json::Value> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read secrets_json {}", path_for_message(path)))?;
+    serde_json::from_str(&content).with_context(|| format!("secrets_json {} is not valid JSON", path_for_message(path)))
+}
+
+/// Resolves a secret the deployment gives no source for, against the fallbacks in
+/// their fixed order: the folder file, the `secrets_json` field, the prefixed
+/// environment variable, `secrets_aws`. `jq` is set only when the secret asks for
+/// a particular field, which the first and third of those cannot answer.
+fn find_fallback_source(name: &str, jq: Option<&str>, fallbacks: &SecretFallbacks) -> Result<DeploymentSecretSource> {
+    let filter = jq.map(str::to_string).unwrap_or_else(|| default_secret_filter(name));
+    let mut tried: Vec<String> = Vec::new();
+
+    // The folder is consulted first: dropping a file in is how one value is
+    // overridden locally, without touching the document or the environment.
+    if jq.is_none() {
+        if let Some(folder) = fallbacks.folder {
+            let path = folder.join(name);
+            if path.exists() {
+                return Ok(DeploymentSecretSource::Embedded(read_secret_file(name, &path)?));
+            }
+            tried.push(format!("{} (no such file)", path_for_message(&path)));
+        }
+    }
+
+    if let Some(path) = fallbacks.json_path {
+        match fallbacks.json {
+            Some(doc) => match json_field(doc, &filter)? {
+                Some(value) => {
+                    let value = trim_secret_value(&value);
+                    if value.is_empty() {
+                        return Err(anyhow!("Secret '{}' is empty in {}", name, path_for_message(path)));
+                    }
+                    return Ok(DeploymentSecretSource::Embedded(value.to_string()));
+                }
+                None => tried.push(format!("{} (no {})", path_for_message(path), filter)),
+            },
+            None => tried.push(format!("{} (no such file)", path_for_message(path))),
+        }
+    }
+
+    // Read from the environment when the deployment runs, the way a per-secret
+    // `env:` source is.
+    if jq.is_none() {
+        if let Some(prefix) = fallbacks.env_prefix {
+            return Ok(DeploymentSecretSource::PrefixedEnvVariable(PrefixedEnvSecret {
+                variable: format!("{}{}", prefix, name),
+                tried,
+                fallback: fallbacks.aws.map(|id| AwsSecretRef {
+                    secret_id: id.to_string(),
+                    jq: Some(filter),
+                }),
+            }));
+        }
+    }
+
+    if let Some(id) = fallbacks.aws {
+        return Ok(DeploymentSecretSource::Aws(AwsSecretRef {
+            secret_id: id.to_string(),
+            jq: Some(filter),
+        }));
+    }
+
+    if jq.is_some() && !fallbacks.has_document() {
+        return Err(anyhow!(
+            "Secret '{}' sets jq, which needs an aws source, secrets_json or secrets_aws to select from",
+            name
+        ));
+    }
+    if tried.is_empty() {
+        return Err(anyhow!(
+            "Secret '{}' has no value, and the deployment sets none of secrets_folder, secrets_json, \
+             secrets_env_prefix and secrets_aws",
+            name
+        ));
+    }
+    Err(anyhow!("Secret '{}' has no value. Tried: {}", name, tried.join(", ")))
+}
+
 fn any_service_has_working_dir(deployments: &HashMap<String, DeploymentSpecYaml>) -> bool {
     deployments.values().any(|d| {
         d.services
@@ -537,6 +738,21 @@ fn convert_deployment(
     env_type: &DeploymentEnvTypeYaml,
 ) -> Result<DeploymentSpec> {
     let secrets_folder = yaml.secrets_folder.as_deref().map(|s| root.join(s));
+    let secrets_env_prefix = yaml.secrets_env_prefix.as_deref();
+    let secrets_json_path = yaml.secrets_json.as_deref().map(|s| root.join(s));
+    // A document that is not there is one more place the secret was not found,
+    // not a failure of its own: the environment or `secrets_aws` may still have it.
+    let secrets_json = match &secrets_json_path {
+        Some(path) if path.exists() => Some(load_secrets_json(path)?),
+        _ => None,
+    };
+    let secret_fallbacks = SecretFallbacks {
+        folder: secrets_folder.as_deref(),
+        json_path: secrets_json_path.as_deref(),
+        json: secrets_json.as_ref(),
+        env_prefix: secrets_env_prefix,
+        aws: yaml.secrets_aws.as_deref(),
+    };
     let primary_host = yaml
         .primary_host
         .clone()
@@ -606,9 +822,9 @@ fn convert_deployment(
                             k
                         ));
                     }
-                    if v.jq.is_some() && v.aws.is_none() {
+                    if v.jq.is_some() && (v.env.is_some() || v.file.is_some()) {
                         return Err(anyhow!(
-                            "Secret {} sets jq, which is only valid together with an aws source",
+                            "Secret {} sets jq, which selects from a JSON document and not from an env or file source",
                             k
                         ));
                     }
@@ -617,12 +833,16 @@ fn convert_deployment(
                     } else if let Some(file) = &v.file {
                         DeploymentSecretSource::FilePath(root.join(file).to_string_lossy().into_owned())
                     } else if let Some(aws) = &v.aws {
+                        // An `aws` source with no filter is the whole secret, which is
+                        // how a secret that holds one value is read. Only the
+                        // deployment-wide documents default to a field.
                         DeploymentSecretSource::Aws(AwsSecretRef {
                             secret_id: aws.clone(),
                             jq: v.jq.clone(),
                         })
                     } else {
-                        return Err(anyhow!("Secret {} must have an env, file or aws source", k));
+                        // `jq:` on its own: the field of the deployment's document.
+                        find_fallback_source(k, v.jq.as_deref(), &secret_fallbacks)?
                     };
                     list.push(DeploymentSecretSpec {
                         secret_name: k.clone(),
@@ -630,20 +850,13 @@ fn convert_deployment(
                     });
                 }
                 DeploymentSecretSpecExYaml::Local(opt_value) => {
-                    let resolved = match opt_value.as_deref() {
-                        Some(v) if !v.is_empty() => v.to_string(),
-                        _ => {
-                            let folder = secrets_folder.as_ref().ok_or_else(|| {
-                                anyhow!("Secret '{}' has no value but secrets_folder is not configured", k)
-                            })?;
-                            let secret_path = folder.join(k);
-                            fs::read_to_string(&secret_path)
-                                .context(format!("Failed to read secret '{}' from {:?}", k, secret_path))?
-                        }
+                    let source = match opt_value.as_deref() {
+                        Some(v) if !v.is_empty() => DeploymentSecretSource::Embedded(v.to_string()),
+                        _ => find_fallback_source(k, None, &secret_fallbacks)?,
                     };
                     list.push(DeploymentSecretSpec {
                         secret_name: k.clone(),
-                        source: DeploymentSecretSource::Embedded(resolved),
+                        source,
                     });
                 }
             }
@@ -1423,6 +1636,240 @@ deployments:
             }
             other => panic!("unexpected source: {other:?}"),
         }
+    }
+
+    /// One file per secret is written with an editor or with `echo`, both of
+    /// which end the file with a newline that is not part of the credential.
+    #[test]
+    fn a_secrets_folder_value_loses_its_trailing_newline_and_cannot_be_empty() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("secrets")).unwrap();
+        fs::write(root.path().join("secrets/api_key"), "sk-live-abc\n").unwrap();
+        fs::write(root.path().join("secrets/blank"), "\n").unwrap();
+
+        let raw = |secret: &str| {
+            format!(
+                r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    secrets_folder: ./secrets
+    secrets:
+      {secret}:
+"#
+            )
+        };
+        let convert = |secret: &str| {
+            let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&raw(secret)).unwrap();
+            convert_env_spec(yaml, root.path(), None)
+        };
+
+        let spec = convert("api_key").unwrap();
+        match &spec.deployments[0].secrets[0].source {
+            DeploymentSecretSource::Embedded(value) => assert_eq!(value, "sk-live-abc"),
+            other => panic!("unexpected source: {other:?}"),
+        }
+
+        let err = convert("blank").unwrap_err().to_string();
+        assert!(err.contains("Secret 'blank' is empty"), "{err}");
+    }
+
+    /// `secrets_env_prefix` spares a deployment an `env:` source per secret. The
+    /// folder still wins, so one value can be overridden by dropping a file in.
+    #[test]
+    fn a_secret_falls_back_from_the_folder_to_the_prefixed_environment_variable() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("secrets")).unwrap();
+        fs::write(root.path().join("secrets/api_key"), "from-the-file").unwrap();
+
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    secrets_folder: ./secrets
+    secrets_env_prefix: E2E_SECRET_
+    secrets:
+      api_key:
+      db_password:
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+        let source = |name: &str| {
+            spec.deployments[0]
+                .secrets
+                .iter()
+                .find(|s| s.secret_name == name)
+                .map(|s| s.source.clone())
+                .unwrap()
+        };
+
+        match source("api_key") {
+            DeploymentSecretSource::Embedded(value) => assert_eq!(value, "from-the-file"),
+            other => panic!("unexpected source: {other:?}"),
+        }
+        // No ./secrets/db_password, so this one is read from the environment when
+        // the deployment is resolved — and names the file it did not find.
+        match source("db_password") {
+            DeploymentSecretSource::PrefixedEnvVariable(lookup) => {
+                assert_eq!(lookup.variable, "E2E_SECRET_db_password");
+                let tried = lookup.tried.join(", ").replace('\\', "/");
+                assert!(tried.ends_with("secrets/db_password (no such file)"), "{tried}");
+            }
+            other => panic!("unexpected source: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_secret_with_no_value_needs_a_folder_or_a_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    secrets:
+      api_key:
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
+        assert!(
+            err.contains("Secret 'api_key' has no value") && err.contains("secrets_env_prefix"),
+            "{err}"
+        );
+    }
+
+    /// One document holds every secret, which is the shape `secrets_aws` fetches:
+    /// each secret takes the field named after it unless it writes its own filter,
+    /// and what the document does not have falls through to the next source.
+    #[test]
+    fn secrets_json_gives_each_secret_the_field_named_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("secrets.json"),
+            r#"{"easypost_api_key": "ez-123", "easypost-label": "dashed", "db": {"password": "pg-456"}}"#,
+        )
+        .unwrap();
+
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    secrets_json: ./secrets.json
+    secrets_aws: prod/app/bundle
+    secrets:
+      easypost_api_key:
+      easypost-label:
+      db_password:
+        jq: .db.password
+      stripe_key:
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+        let source = |name: &str| {
+            spec.deployments[0]
+                .secrets
+                .iter()
+                .find(|s| s.secret_name == name)
+                .map(|s| s.source.clone())
+                .unwrap()
+        };
+        let embedded = |name: &str| match source(name) {
+            DeploymentSecretSource::Embedded(value) => value,
+            other => panic!("unexpected source for {name}: {other:?}"),
+        };
+
+        assert_eq!(embedded("easypost_api_key"), "ez-123");
+        // `.easypost-label` would be a subtraction to jq, so the default filter
+        // quotes a name that is not an identifier.
+        assert_eq!(embedded("easypost-label"), "dashed");
+        assert_eq!(embedded("db_password"), "pg-456");
+        // Not in the document: `secrets_aws` holds the same shape, and the field
+        // is the one the document did not have.
+        match source("stripe_key") {
+            DeploymentSecretSource::Aws(reference) => {
+                assert_eq!(reference.secret_id, "prod/app/bundle");
+                assert_eq!(reference.jq.as_deref(), Some(".stripe_key"));
+            }
+            other => panic!("unexpected source: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_secrets_json_filter_must_be_a_field_path() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("secrets.json"), r#"{"a": "1"}"#).unwrap();
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    secrets_json: ./secrets.json
+    secrets:
+      api_key:
+        jq: .a | ascii_downcase
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
+        assert!(err.contains("is not a field path"), "{err}");
+    }
+
+    /// Everything that was consulted is named, so a secret that is nowhere does
+    /// not have to be hunted for one source at a time.
+    #[test]
+    fn a_secret_in_none_of_the_fallbacks_names_all_of_them() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("secrets")).unwrap();
+        fs::write(root.path().join("secrets.json"), r#"{"other": "1"}"#).unwrap();
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  app_local:
+    primary_host: web
+    application:
+      name: app
+    secrets_folder: ./secrets
+    secrets_json: ./secrets.json
+    secrets:
+      api_key:
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let err = convert_env_spec(yaml, root.path(), None)
+            .unwrap_err()
+            .to_string()
+            .replace('\\', "/");
+        assert!(err.contains("secrets/api_key (no such file)"), "{err}");
+        assert!(err.contains("secrets.json (no .api_key)"), "{err}");
     }
 
     #[test]

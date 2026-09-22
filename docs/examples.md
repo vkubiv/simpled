@@ -176,6 +176,38 @@ deployments:
         file: ./firebase_admin.json   # file source still works alongside secrets_folder
 ```
 
+In CI the same values usually arrive as environment variables, and writing each one out to `secrets/` is the same list a third time. `secrets_env_prefix` derives the variable from the secret's name instead, ignoring case, and still lets a file override one value:
+
+```yaml
+# localenv.yaml
+deployments:
+  local:
+    secrets_folder: ./secrets       # tried first, may hold none of them
+    secrets_env_prefix: CI_SECRET_  # db_password -> $CI_SECRET_DB_PASSWORD
+```
+
+A third way to say it once: keep the values in one JSON document, a field per secret. `secrets_json` reads it from a file, `secrets_aws` fetches the same shape from AWS Secrets Manager on the deploy target, and the deployments differ in that one line:
+
+```yaml
+# localenv.yaml
+deployments:
+  local:
+    secrets_json: ./secrets.json      # { "db_password": "...", "sendgrid_apikey": "..." }
+    secrets:
+      db_password:
+      sendgrid_apikey:
+```
+
+```yaml
+# envspec.yaml — the same list, the same fields, fetched at deploy time
+deployments:
+  prod:
+    secrets_aws: prod/myapp/bundle
+    secrets:
+      db_password:
+      sendgrid_apikey:
+```
+
 **`infra-services.yaml`** — extra services (database, cache, mail) for local development:
 
 ```yaml

@@ -437,6 +437,11 @@ pub struct DeploymentSecretSpec {
 #[derive(Debug, Clone)]
 pub enum DeploymentSecretSource {
     EnvVariable(String),
+    /// `secrets_env_prefix`: the deployment names no variable per secret, the
+    /// name is derived from the secret's own. Read like `EnvVariable`, except
+    /// that the match ignores case — secret names are lower case and environment
+    /// variables are not.
+    PrefixedEnvVariable(PrefixedEnvSecret),
     FilePath(String),
     Embedded(String),
     /// AWS Secrets Manager. Unlike the other sources this one is *not* read when
@@ -444,6 +449,36 @@ pub enum DeploymentSecretSource {
     /// the value is fetched on the machine that runs the deploy. That keeps the
     /// value out of the directory that is shipped to the target.
     Aws(AwsSecretRef),
+}
+
+/// A secret value as it comes out of its source, without the newline whatever
+/// wrote it appended. Every source is a file or a command's output — a
+/// `secrets_folder` entry, a `file:` source, the AWS CLI — and all of them end
+/// the value with a line break that is not part of the credential. That break is
+/// load-bearing: a secret mounted as an environment variable cannot carry one at
+/// all (`docker run --env-file` reads to the end of the line), so without this a
+/// plain `echo "$KEY" > secrets/api_key` fails the whole deployment.
+///
+/// Only trailing breaks go: a genuinely multi-line secret, a PEM key mounted as
+/// a file, keeps its interior newlines.
+pub fn trim_secret_value(value: &str) -> &str {
+    value.trim_end_matches(['\n', '\r'])
+}
+
+/// A secret to look up in the environment under a name it was not given
+/// explicitly. See [`DeploymentSecretSource::PrefixedEnvVariable`].
+#[derive(Debug, Clone)]
+pub struct PrefixedEnvSecret {
+    /// `secrets_env_prefix` + the secret's name: the variable to look for.
+    pub variable: String,
+    /// The sources ruled out before this one — a folder file that is not there, a
+    /// `secrets_json` field the document does not have. Carried so that a secret
+    /// which is in none of them is reported against all of them at once.
+    pub tried: Vec<String>,
+    /// `secrets_aws`: where to look when the variable is not set either. The AWS
+    /// lookup cannot be attempted where this is decided — for anything but a local
+    /// deployment it happens on the deploy target — so it ends the chain.
+    pub fallback: Option<AwsSecretRef>,
 }
 
 #[derive(Debug, Clone)]
