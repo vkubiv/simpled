@@ -261,7 +261,14 @@ pub fn prepare_service_with(
             match &secret_option.mount {
                 SecretMount::EnvVariable(var_name) => {
                     let value = match secret_spec.literal() {
-                        Some(literal) => literal.to_string(),
+                        // Compose and `docker stack deploy` interpolate `$` in
+                        // `environment:` values, so a password containing one
+                        // either fails the deploy ("invalid interpolation
+                        // format") or is silently mangled. `$$` is compose's
+                        // escape for a literal `$`.
+                        Some(literal) => literal.replace('$', "$$"),
+                        // Deliberately unescaped: this one IS an interpolation,
+                        // resolved from the variable fetch-secrets.sh exports.
                         None => format!("${{{}}}", secret_spec.shell_var()),
                     };
                     environment.insert(var_name.clone(), value);
@@ -594,6 +601,27 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(out.path().join("api/data/b.json")).unwrap(), "2");
             assert_eq!(service.env_file, vec!["./api/.env"]);
+        }
+
+        #[test]
+        fn a_dollar_in_a_literal_env_secret_is_escaped_for_compose() {
+            let mut api = resolved_service("api", ServiceType::Public, &[]);
+            api.secrets = vec![ServiceSecret {
+                name: "shop-db_password".to_string(),
+                mount: SecretMount::EnvVariable("DB_PASSWORD".to_string()),
+            }];
+            let mut deployment = resolved_deployment(vec![]);
+            deployment.secrets = vec![SecretResolvedSpec {
+                name: "shop-db_password".to_string(),
+                value: SecretResolvedValue::Literal("pa$word$$x${Y}".to_string()),
+            }];
+            let spec = resolved_env(swarm(), deployment);
+
+            let out = tempfile::tempdir().unwrap();
+            let service = prepare_service(&api, &spec, out.path()).unwrap();
+
+            // Every `$` doubled, so compose reads the value back verbatim.
+            assert_eq!(service.environment["DB_PASSWORD"], "pa$$word$$$$x$${Y}");
         }
 
         #[test]

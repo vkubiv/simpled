@@ -156,10 +156,13 @@ fn local_config_covers_compose_env_files_and_working_dirs() {
     let api_env = read(&local_env.join("api").join(".env"));
     assert!(api_env.contains("PUBLIC_URL='http://localhost:8080'"), "{}", api_env);
     assert!(api_env.contains("DB_HOST='primary-db'"), "{}", api_env);
-    // The secret is inlined by compose too, so it goes through `environment:`.
+    // The secret is inlined by compose too, so it goes through `environment:`,
+    // with every `$` doubled: compose interpolates that block, and reads `$$`
+    // back as one `$`. The container therefore receives the secret verbatim,
+    // `local pa$$ 'word'`. Unescaped, it used to receive `local pa$ 'word'`.
     assert_eq!(
         parsed["services"]["api"]["environment"]["DB_PASSWORD"].as_str(),
-        Some("local pa$$ 'word'"),
+        Some("local pa$$$$ 'word'"),
         "{}",
         compose
     );
