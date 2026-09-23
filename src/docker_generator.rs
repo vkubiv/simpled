@@ -548,12 +548,24 @@ fn generate_swarm(
         volume_dirs.push(format!("{}/volumes/{}", deployment.name, volume));
     }
 
-    // Service-level relative path mounts (e.g. `./data:/var/lib/...`).
+    // Absolute host paths (e.g. `/var/lib/app_db:/var/lib/mysql`) have the same
+    // problem: Swarm rejects the task outright when a bind source is missing,
+    // and `docker stack deploy --detach=false` then waits on a service that can
+    // never converge. They are kept apart from the relative ones because an
+    // absolute path may already exist as something other than a directory —
+    // `/var/run/docker.sock` is a socket — and `mkdir -p` fails on that, which
+    // under `set -e` would abort the deploy. So an absolute path is only created
+    // when nothing is there yet, the same thing `docker run -v` does.
+    let mut absolute_dirs: Vec<String> = Vec::new();
+
+    // Service-level path mounts: relative (`./data:/var/lib/...`) and absolute.
     for service in &deployment.services {
         for volume in &service.volumes {
             if let ServiceVolumeType::Path(from_path) = &volume.name {
                 if let Some(rel) = from_path.strip_prefix("./") {
                     volume_dirs.push(format!("{}/{}", deployment.name, rel));
+                } else if from_path.starts_with('/') {
+                    absolute_dirs.push(from_path.clone());
                 }
             }
         }
@@ -561,11 +573,16 @@ fn generate_swarm(
 
     volume_dirs.sort();
     volume_dirs.dedup();
+    absolute_dirs.sort();
+    absolute_dirs.dedup();
 
-    if !volume_dirs.is_empty() {
+    if !volume_dirs.is_empty() || !absolute_dirs.is_empty() {
         writeln!(deploy_sh, "echo 'Ensuring volume directories exist...'")?;
         for dir in &volume_dirs {
             writeln!(deploy_sh, "mkdir -p \"{}\"", dir)?;
+        }
+        for dir in &absolute_dirs {
+            writeln!(deploy_sh, "[ -e \"{0}\" ] || mkdir -p \"{0}\"", dir)?;
         }
     }
 
@@ -1403,7 +1420,7 @@ mod tests {
     };
     use crate::spec::{
         AwsSecretRef, DeploymentEnvType, Healthcheck, HealthcheckTest, ResourceLimits, ResourcesSpec,
-        ServiceConfigOption, ServiceSecret, ServiceType,
+        ServiceConfigOption, ServiceSecret, ServiceType, ServiceVolume,
     };
 
     fn service(name: &str, service_type: ServiceType, depends_on: &[&str]) -> ServiceResolvedSpec {
@@ -1724,6 +1741,55 @@ mod tests {
         generate(spec, &docker_spec, dir.path()).unwrap();
         let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
         (dir, script)
+    }
+
+    #[test]
+    fn swarm_creates_missing_absolute_bind_sources_but_leaves_existing_paths_alone() {
+        let mut db = service("db", ServiceType::Internal, &[]);
+        db.volumes = vec![
+            ServiceVolume {
+                name: ServiceVolumeType::Path("/var/lib/app_db".to_string()),
+                mount_path: "/var/lib/mysql".to_string(),
+            },
+            ServiceVolume {
+                name: ServiceVolumeType::Path("./data".to_string()),
+                mount_path: "/data".to_string(),
+            },
+        ];
+        let mut ui = service("ui", ServiceType::Internal, &[]);
+        // A socket, not a directory: `mkdir -p` would fail on it.
+        ui.volumes = vec![ServiceVolume {
+            name: ServiceVolumeType::Path("/var/run/docker.sock".to_string()),
+            mount_path: "/var/run/docker.sock".to_string(),
+        }];
+        let (_dir, script) = generate_swarm_to_temp(&spec(vec![db, ui]));
+
+        assert!(
+            script.contains("[ -e \"/var/lib/app_db\" ] || mkdir -p \"/var/lib/app_db\""),
+            "{}",
+            script
+        );
+        assert!(
+            script.contains("[ -e \"/var/run/docker.sock\" ] || mkdir -p \"/var/run/docker.sock\""),
+            "{}",
+            script
+        );
+        // Absolute paths are never created unconditionally.
+        assert!(
+            !script.contains(
+                "
+mkdir -p \"/var/"
+            ),
+            "{}",
+            script
+        );
+        // Relative mounts keep the plain form, under the deployment directory.
+        assert!(script.contains("mkdir -p \"prod/data\""), "{}", script);
+
+        // All of it has to happen before the stack is deployed.
+        let ensure = script.find("[ -e \"/var/lib/app_db\" ]").unwrap();
+        let deploy = script.find("docker stack deploy").unwrap();
+        assert!(ensure < deploy, "{}", script);
     }
 
     #[test]

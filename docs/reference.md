@@ -229,6 +229,12 @@ volumes:
 
 Host paths (`./relative` or `/absolute`) do not need to be declared.
 
+On Docker Swarm, a bind source that does not exist makes Swarm reject the task,
+so the generated `deploy.sh` creates every host path a deployment mounts before
+the stack starts: relative paths under the deployment directory, absolute paths
+only when nothing is there yet. An existing path of any kind — a directory, a
+file, a socket such as `/var/run/docker.sock` — is left as it is.
+
 ---
 
 ## envspec.yaml / localenv.yaml
