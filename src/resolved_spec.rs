@@ -8,6 +8,7 @@ pub struct EnvironmentResolvedSpec {
     pub env_type: DeploymentEnvType,
     pub ingress: IngressResolvedSpec,
     pub current_deployment: DeploymentResolvedSpec,
+    pub ports: crate::ports::LocalPorts,
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,19 @@ pub struct IngressResolvedSpec {
     pub domains: Vec<String>,
     pub rules: Vec<IngressRule>,
     pub redirects: Vec<RedirectRule>,
+    /// Where `/.well-known/simpled/version` is answered, one entry per domain.
+    pub version_routes: Vec<VersionRoute>,
+    /// Local only: the current deployment's version document, which the local
+    /// gateway answers with itself.
+    pub version_document: Option<String>,
+}
+
+/// One domain's version endpoint, served by the version service of the
+/// deployment that owns the domain.
+#[derive(Debug, Clone)]
+pub struct VersionRoute {
+    pub domain_name: String,
+    pub deployment_name: String,
 }
 
 /// One source domain bounced to one destination. The spec allows several sources

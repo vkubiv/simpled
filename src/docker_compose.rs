@@ -334,7 +334,8 @@ pub fn prepare_service_with(
 
     Ok(DockerService {
         image: service.image.clone(),
-        container_name: (is_local && !isolated).then(|| service.full_name.clone()),
+        // Container names are global to the Docker daemon, so only instance 0 claims them.
+        container_name: (is_local && !isolated && spec.ports.instance() == 0).then(|| service.full_name.clone()),
         entrypoint: service.entrypoint.clone(),
         command: service.command.clone(),
         healthcheck: service.healthcheck.clone(),

@@ -10,6 +10,7 @@ mod docs;
 mod env_loader;
 mod k8s_generator;
 mod local_ingress;
+mod ports;
 mod resolved_spec;
 mod resolver;
 mod run_local;
@@ -24,6 +25,7 @@ mod test_support;
 mod transform;
 mod updater;
 mod validator;
+mod version_endpoint;
 
 #[derive(Parser)]
 #[command(name = "simpled", version)]
@@ -87,6 +89,12 @@ enum Commands {
         /// Print the services' logs after every suite, not only a failing one
         #[arg(long)]
         logs: bool,
+
+        /// Instance to run the stack as: a number, or `auto` for the first one
+        /// whose named ports are all free. Defaults to SIMPLED_INSTANCE, then
+        /// .simpled-instance, then 0.
+        #[arg(long)]
+        instance: Option<String>,
     },
 
     /// Print the documentation embedded in this binary
@@ -157,6 +165,11 @@ enum LocalCommands {
         /// another device.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// Instance to run: a number, shifting every named port by
+        /// `instance * port_step`. Defaults to SIMPLED_INSTANCE, then
+        /// .simpled-instance, then 0.
+        #[arg(long)]
+        instance: Option<String>,
     },
     /// Run the gateway and only extra services (no app services)
     OnlyExtra {
@@ -172,6 +185,11 @@ enum LocalCommands {
         /// another device.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// Instance to run: a number, shifting every named port by
+        /// `instance * port_step`. Defaults to SIMPLED_INSTANCE, then
+        /// .simpled-instance, then 0.
+        #[arg(long)]
+        instance: Option<String>,
     },
     /// Regenerate local_env configuration without running the gateway or docker compose
     GenerateConfig {
@@ -181,6 +199,11 @@ enum LocalCommands {
         /// Deployment to generate config for. Required when the env spec defines more than one.
         #[arg(long)]
         deployment: Option<String>,
+        /// Instance to run: a number, shifting every named port by
+        /// `instance * port_step`. Defaults to SIMPLED_INSTANCE, then
+        /// .simpled-instance, then 0.
+        #[arg(long)]
+        instance: Option<String>,
     },
 }
 
@@ -272,12 +295,14 @@ fn main() -> Result<()> {
             keep,
             no_up,
             logs,
+            instance,
         } => {
             let root = path.as_ref().map(Path::new).unwrap_or(Path::new("."));
             let options = run_test::TestOptions {
                 keep: *keep,
                 no_up: *no_up,
                 logs: *logs,
+                instance: instance.clone(),
             };
             let code = run_test::run(root, suite.as_deref(), &options)?;
             if code != 0 {
@@ -342,7 +367,7 @@ fn prepare_deployment_command(
     github_tag_prefix: &Option<String>,
 ) -> Result<()> {
     // 1. Load specs
-    let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name))?;
+    let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
 
     // Find deployment to get app name
     let deployment = env_spec.deployment(deployment_name)?;
@@ -435,12 +460,35 @@ fn select_deployment<'a>(
 }
 
 fn local(command: &LocalCommands) -> Result<()> {
-    let (root, deployment_name) = match command {
-        LocalCommands::Run { path, deployment, .. }
-        | LocalCommands::OnlyExtra { path, deployment, .. }
-        | LocalCommands::GenerateConfig { path, deployment } => {
-            (path.as_ref().map(Path::new).unwrap_or(Path::new(".")), deployment)
+    let (root, deployment_name, instance_flag) = match command {
+        LocalCommands::Run {
+            path,
+            deployment,
+            instance,
+            ..
         }
+        | LocalCommands::OnlyExtra {
+            path,
+            deployment,
+            instance,
+            ..
+        }
+        | LocalCommands::GenerateConfig {
+            path,
+            deployment,
+            instance,
+        } => (
+            path.as_ref().map(Path::new).unwrap_or(Path::new(".")),
+            deployment,
+            instance,
+        ),
+    };
+
+    let instance = match ports::choose_instance(root, instance_flag.as_deref())? {
+        ports::InstanceChoice::Fixed(n) => n,
+        ports::InstanceChoice::Auto => bail!(
+            "`auto` picks an instance only for `simpled test`; a local stack needs a fixed one so its URLs stay put"
+        ),
     };
 
     let exclude = match command {
@@ -448,7 +496,7 @@ fn local(command: &LocalCommands) -> Result<()> {
         _ => Vec::new(),
     };
 
-    let env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref())?;
+    let env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref(), instance)?;
     let app_spec = spec_loader::load_app_spec_from_dir(root, Some(&env_spec))?;
 
     let deployment = select_deployment(&env_spec, deployment_name.as_deref())?;
@@ -459,6 +507,13 @@ fn local(command: &LocalCommands) -> Result<()> {
 
     // 3. Resolve
     let resolved_spec = resolver::resolve(&env_spec, &app_spec, &deployment.name).context("Resolution failed")?;
+    if instance > 0 {
+        println!(
+            "Instance {}: {}",
+            instance,
+            run_local::ComposeTarget::local(&resolved_spec).describe()
+        );
+    }
 
     for excluded in &exclude {
         if !resolved_spec
@@ -499,6 +554,7 @@ fn local(command: &LocalCommands) -> Result<()> {
                     resolved_spec.ingress.clone(),
                     &resolved_spec.current_deployment.name,
                     bind,
+                    &run_local::ComposeTarget::local(&resolved_spec).dir,
                 )?;
                 match command {
                     LocalCommands::Run { .. } => {

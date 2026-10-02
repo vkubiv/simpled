@@ -524,6 +524,30 @@ Redirect sources are included in the gateway's certificate, since the redirect i
 
 A domain may not appear under both `hosts` and `redirects`, and a source may not be listed twice — both make routing ambiguous and are rejected.
 
+#### version endpoint
+
+Every gateway host answers `GET /.well-known/simpled/version` with what was last deployed behind it:
+
+```json
+{"application":"shop","version":"1.2.3","deployment":"prod","deployed_at":1790945826}
+```
+
+`deployed_at` is when `prepare-deployment` ran (Unix seconds), so a redeploy of the same version is visible too. A deploy pipeline can poll the endpoint until it reports the version it just shipped. The answer says the deployment's stack was updated, not that every service in it is healthy.
+
+There is nothing to configure. The gateway is shared by every deployment of an env spec and rewritten by each of their deploys, so it cannot hold the versions itself. Instead every deployment ships one extra service, `simpled-version-<deployment>` (nginx, a few MB of memory), and the gateway routes the path on each host to the deployment that owns that host:
+
+- a host only one deployment routes to belongs to that deployment;
+- a host several deployments route to belongs to the one whose `primary_host` it is, and gets no endpoint when that is none of them or more than one.
+
+| Target | How the path is routed |
+|---|---|
+| Docker, nginx | `location =` per server block. The service name is resolved per request through Docker's DNS, so a gateway that names a deployment not yet redeployed with this feature still starts, and answers 502 there until it is. |
+| Docker, Traefik | a `Host() && Path()` router per host |
+| Kubernetes | a separate Ingress, `<gateway>--simpled-version`, so the main Ingress's `rewrite-target` does not apply to it |
+| Local | answered by the local gateway itself, with no extra container |
+
+The service listens on 80 inside its network and publishes no host port on Docker.
+
 #### body_limit
 
 Maximum size of a request body the gateway will accept. Set it on `gateway` for every route, and on an individual service under `deployments[].services[]` to override that default:
@@ -741,6 +765,54 @@ For `local` environments, a `.env.local` file located next to `localenv.yaml` ov
 # .env.local — gitignored
 DB_CONNECTION_STRING=Host=localhost;Port=5432;Database=myapp
 ```
+
+#### ports and instances
+
+Local only. A local stack binds real host ports: the gateway's, and every service's published `ports`. To run several copies of one stack on a machine — two worktrees, or a test run next to your own stack — name the host ports once at the top of `localenv.yaml` and write `$port(name)` wherever one appears:
+
+```yaml
+# localenv.yaml
+ports:
+  web: 8080
+  api: 8081
+  db: 5432
+port_step: 3000      # optional
+
+gateway:
+  hosts:
+    web: localhost:$port(web)
+
+deployments:
+  local:
+    environment:
+      - PUBLIC_URL=http://localhost:$port(web)
+      - MACHINE_ID=dev-$instance()
+    undockerized_environment:
+      - DB_URL=postgres://localhost:$port(db)/app
+    services:
+      api:
+        ports:
+          - "$port(api):80"
+```
+
+`$port(name)` and `$instance()` are expanded in every string of the env spec, in the files under `application.extra` (so an extra service can publish `"$port(db):5432"`), in values read from files and `.env.local`, and in a [test suite](#testspecyaml)'s `environment` and `wait_for`. An unknown name is an error.
+
+An **instance** is a number; instance *N* shifts every named port by `N * port_step` and runs as its own compose project:
+
+| | instance 0 | instance N |
+|---|---|---|
+| ports | as written | `+ N * port_step` |
+| compose project | `<app>_local` | `<app>_local_N` |
+| output directory | `local_env/` | `local_env_N/` (its own `volumes/`, so its own data) |
+| `container_name` | the service name | left to compose (names are global to the Docker daemon) |
+
+The instance comes from `--instance`, then the `SIMPLED_INSTANCE` variable, then a `.simpled-instance` file next to `localenv.yaml` holding the number, then 0. The file is the convenient one for a worktree: write it once and every command there runs as that instance. Keep it out of version control.
+
+`port_step` defaults to the smallest multiple of 100 larger than the spread of the named ports, and must be larger than that spread, so no two instances share a port. Above instance 0 every published host port and every gateway port must be a named one: a literal port would be the same in every instance, and is rejected by name. Only host ports move — an address inside the compose network (`db:5432`) stays as written.
+
+A host-run service writes its `.env` into its `working_dir`, which every instance in one checkout shares — run instances from separate worktrees when they include host-run services.
+
+Some things outside the stack do not follow an instance: a tunnel or OAuth redirect registered against a fixed port, and anything else keyed to the machine. `$instance()` is there to tell instances apart in such values.
 
 #### service overrides
 
@@ -1079,6 +1151,7 @@ Options:
                            more than one deployment.
   --bind <ADDR>            Address the gateway listens on (default: 127.0.0.1).
                            Pass 0.0.0.0 to reach it from another device.
+  --instance <N>           Run as instance N (see ports and instances)
 ```
 
 `--exclude` adds to the deployment's own [`exclude_services`](#exclude_services),
@@ -1106,6 +1179,7 @@ Options:
   --deployment <NAME>  Deployment to run. Required when the env spec defines
                        more than one deployment.
   --bind <ADDR>        Address the gateway listens on (default: 127.0.0.1)
+  --instance <N>       Run as instance N (see ports and instances)
 ```
 
 ### `simpled local generate-config`
@@ -1119,6 +1193,7 @@ Options:
   --path <PATH>        Path to the project directory (default: current dir)
   --deployment <NAME>  Deployment to generate config for. Required when the env
                        spec defines more than one deployment.
+  --instance <N>       Generate for instance N (see ports and instances)
 ```
 
 ### `simpled test`
@@ -1135,17 +1210,21 @@ Options:
                        no gateway, no readiness wait
   --logs               Print the services' logs after every suite, not only a
                        failing one
+  --instance <N|auto>  Run as instance N, or `auto`: the lowest instance whose
+                       named ports are all free (not with --no-up)
 ```
 
 Without `SUITE` every suite runs, in name order, and the exit code is the first failing suite's. One run, in order:
 
 1. The suite's deployment is validated and resolved like `local run` would, and the suite's own variables and secrets are checked against it.
 2. `working_dir/.env` and the suite's secret files are written.
-3. The compose file goes to `test_env/`, as project `<application.name>_test`, with the named volumes as Docker volumes. The developer's `local_env/` stack and its data are never touched, and a stopped one does not block the run.
+3. The compose file goes to `test_env/`, as project `<application.name>_test` (`test_env_N/` and `<application.name>_test_N` for instance N), with the named volumes as Docker volumes. The developer's `local_env/` stack and its data are never touched, and a stopped one does not block the run.
 4. The gateway is bound. A port held by a forgotten `local run` fails here, before anything is started.
 5. The stack starts in the phases a deploy uses, all within `timeout`: the services the jobs depend on with `docker compose up --wait`, then each job to completion (a job that exits non-zero fails the suite with its exit code), then the remaining services with `--wait`. Then each `wait_for` URL is polled.
 6. `run` executes in `working_dir` with the suite's variables in its environment.
 7. The services' logs are printed when the suite failed (or always, with `--logs`), then `docker compose down --volumes` removes the containers and the data. Ctrl-C during the run does the same before exiting.
+
+`--instance auto` lets suites from several worktrees run at once: each takes the first instance whose ports nothing holds. Two runs that start at the same moment can still pick the same one; the loser fails when it binds the gateway, before anything is started.
 
 `--keep` skips the teardown and prints the `docker compose down` command to run later. `--no-up` skips steps 3 to 5 and 7 entirely, for a developer who already has the backend running from an IDE.
 
@@ -1246,4 +1325,4 @@ The compose file sets its project name to `<application.name>_local`, so several
 | `<service>/undockerized.env` | Variables for services run outside Docker (unless the service sets `working_dir`) |
 | `<working_dir>/.env` | Environment and secrets for a host-run service that sets `working_dir` |
 
-`simpled test` writes the same layout to `test_env/`, as project `<application.name>_test`, plus the suite's `.env` and secret files in its `working_dir`. Keep `local_env/` and `test_env/` out of version control.
+`simpled test` writes the same layout to `test_env/`, as project `<application.name>_test`, plus the suite's `.env` and secret files in its `working_dir`. Keep `local_env*/` and `test_env*/` (the instance directories included) out of version control.

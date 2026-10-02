@@ -52,6 +52,21 @@ pub fn resolve(
 
     check_public_services_are_routed(deployment, app_spec)?;
 
+    let version_document = crate::version_endpoint::document(
+        &deployment.application.name,
+        &app_spec.version.to_string(),
+        &deployment.name,
+    );
+    let mut resolved_services = resolved_services;
+    let is_local = env_spec.env_type == DeploymentEnvType::Local;
+    if !is_local {
+        resolved_services.push(crate::version_endpoint::service(
+            &deployment.name,
+            &version_document,
+            &env_spec.env_type,
+        ));
+    }
+
     let current_deployment = DeploymentResolvedSpec {
         name: deployment.name.clone(),
         application_name: deployment.application.name.clone(),
@@ -62,11 +77,71 @@ pub fn resolve(
         host_environment: undockerized_values,
     };
 
-    Ok(EnvironmentResolvedSpec {
-        ingress: resolve_ingress(env_spec)?,
+    let mut ingress = resolve_ingress(env_spec)?;
+    if is_local {
+        ingress.version_document = Some(version_document);
+    }
+    let resolved = EnvironmentResolvedSpec {
+        ingress,
         current_deployment,
         env_type: env_spec.env_type.clone(),
-    })
+        ports: env_spec.ports.clone(),
+    };
+    check_ports_follow_instance(&resolved)?;
+    Ok(resolved)
+}
+
+/// Above instance 0 a literal host port would be the same in every instance, so
+/// each one the stack binds must come from `$port(name)`.
+fn check_ports_follow_instance(spec: &EnvironmentResolvedSpec) -> Result<()> {
+    let instance = spec.ports.instance();
+    if instance == 0 {
+        return Ok(());
+    }
+    let named = spec.ports.effective();
+    let hint = "write it as $port(name) so every instance gets its own";
+
+    for service in &spec.current_deployment.services {
+        for port in &service.ports {
+            if !named.contains(&port.external) {
+                return Err(anyhow!(
+                    "Service '{}' publishes host port {}, which is not a named port; instance {} would collide with instance 0 — {}",
+                    service.full_name,
+                    port.external,
+                    instance,
+                    hint
+                ));
+            }
+        }
+    }
+
+    let gateway_domains = spec
+        .ingress
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.services
+                .iter()
+                .any(|s| s.deployment_name == spec.current_deployment.name)
+        })
+        .map(|rule| rule.domain_name.as_str())
+        .chain(spec.ingress.redirects.iter().map(|r| r.from_domain.as_str()));
+    for domain in gateway_domains {
+        let port = domain
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(80);
+        if !named.contains(&port) {
+            return Err(anyhow!(
+                "Gateway host '{}' listens on port {}, which is not a named port; instance {} would collide with instance 0 — {}",
+                domain,
+                port,
+                instance,
+                hint
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reads every config file the deployment provides. Names are prefixed with the
@@ -511,6 +586,8 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         rules,
         redirects,
         tls,
+        version_routes: crate::version_endpoint::routes(env_spec),
+        version_document: None,
     })
 }
 

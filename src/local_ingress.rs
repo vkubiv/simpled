@@ -8,6 +8,7 @@ use axum::Router;
 use axum_reverse_proxy::ReverseProxy;
 use std::collections::BTreeMap;
 use std::net::TcpListener as StdTcpListener;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::thread;
 use tokio::sync::watch;
@@ -159,12 +160,12 @@ async fn apply_redirects(
 /// `docker compose up` is started attached from `run_local`, but the containers
 /// are owned by the docker daemon, so an abrupt `process::exit` from this
 /// (background) ingress thread would orphan them. We therefore run
-/// `docker compose down` in the generated `local_env` directory before exiting.
-fn shutdown_stack_and_exit(message: &str) -> ! {
+/// `docker compose down` in the generated compose directory before exiting.
+fn shutdown_stack_and_exit(compose_dir: &Path, message: &str) -> ! {
     eprintln!("{}", message);
     eprintln!("Bringing down the local docker compose stack...");
     let _ = Command::new("docker")
-        .current_dir("local_env")
+        .current_dir(compose_dir)
         .args(["compose", "down", "--remove-orphans"])
         .status();
     process::exit(1);
@@ -183,7 +184,13 @@ fn shutdown_stack_and_exit(message: &str) -> ! {
 /// this function returns so that a bind failure (e.g. the port is already in
 /// use) is reported to the caller *before* any docker compose services are
 /// started, rather than orphaning them.
-pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> Result<IngressHandle> {
+pub fn run(
+    spec: IngressResolvedSpec,
+    current_deployment: &str,
+    bind: &str,
+    compose_dir: &Path,
+) -> Result<IngressHandle> {
+    let compose_dir: PathBuf = compose_dir.to_path_buf();
     let current_deployment = current_deployment.to_string();
 
     // A local run binds real sockets on the host, and a port can only be bound
@@ -272,6 +279,24 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
         return Ok(IngressHandle::idle());
     }
 
+    // The gateway is the only thing running locally that knows the deployment's
+    // version, so it answers the endpoint itself on every port it serves.
+    if let Some(document) = spec.version_document.clone() {
+        for (app, _) in routers.values_mut() {
+            let document = document.clone();
+            let route = axum::routing::get(move || async move {
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::CACHE_CONTROL, "no-store"),
+                    ],
+                    document,
+                )
+            });
+            *app = std::mem::take(app).route(crate::version_endpoint::PATH, route);
+        }
+    }
+
     // Bind every port synchronously and up-front. `std::net::TcpListener::bind`
     // fails immediately if the port is already in use, so this surfaces a bind
     // error to the caller before docker compose is started. The listeners are
@@ -307,7 +332,10 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
     let thread = thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
-            Err(e) => shutdown_stack_and_exit(&format!("Failed to create tokio runtime for local ingress: {}", e)),
+            Err(e) => shutdown_stack_and_exit(
+                &compose_dir,
+                &format!("Failed to create tokio runtime for local ingress: {}", e),
+            ),
         };
 
         rt.block_on(async move {
@@ -316,20 +344,24 @@ pub fn run(spec: IngressResolvedSpec, current_deployment: &str, bind: &str) -> R
             for (bind_addr, std_listener, app) in bound {
                 let listener = match tokio::net::TcpListener::from_std(std_listener) {
                     Ok(listener) => listener,
-                    Err(e) => shutdown_stack_and_exit(&format!(
-                        "Failed to register local ingress listener on {}: {}",
-                        bind_addr, e
-                    )),
+                    Err(e) => shutdown_stack_and_exit(
+                        &compose_dir,
+                        &format!("Failed to register local ingress listener on {}: {}", bind_addr, e),
+                    ),
                 };
 
                 println!("Local ingress listening on {}", bind_addr);
                 let mut shutdown = shutdown_rx.clone();
+                let compose_dir = compose_dir.clone();
                 handles.push(tokio::spawn(async move {
                     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                         let _ = shutdown.wait_for(|stop| *stop).await;
                     });
                     if let Err(e) = server.await {
-                        shutdown_stack_and_exit(&format!("Error serving ingress on {}: {}", bind_addr, e));
+                        shutdown_stack_and_exit(
+                            &compose_dir,
+                            &format!("Error serving ingress on {}: {}", bind_addr, e),
+                        );
                     }
                 }));
             }
@@ -361,6 +393,42 @@ mod tests {
 
     fn response(host: Option<&str>, uri: &str) -> Option<(StatusCode, String)> {
         redirect_response(&redirects(), host, &uri.parse().unwrap())
+    }
+
+    #[test]
+    fn the_gateway_answers_the_version_endpoint_itself() {
+        let port = StdTcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let spec = IngressResolvedSpec {
+            name: "gateway".to_string(),
+            tls: None,
+            domains: vec![],
+            rules: vec![crate::resolved_spec::IngressRule {
+                domain_name: format!("localhost:{}", port),
+                services: vec![crate::resolved_spec::IngressToServiceRule {
+                    service_name: "web".to_string(),
+                    deployment_name: "dev".to_string(),
+                    port: 1,
+                    prefix: "/".to_string(),
+                    strip_prefix: false,
+                    body_limit: None,
+                }],
+            }],
+            redirects: vec![],
+            version_routes: vec![],
+            version_document: Some(r#"{"version":"1.2.3"}"#.to_string()),
+        };
+        let handle = run(spec, "dev", "127.0.0.1", Path::new("local_env")).unwrap();
+
+        let response =
+            reqwest::blocking::get(format!("http://localhost:{}{}", port, crate::version_endpoint::PATH)).unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.text().unwrap(), r#"{"version":"1.2.3"}"#);
+        handle.stop();
     }
 
     #[test]

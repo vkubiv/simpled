@@ -4,6 +4,7 @@ use crate::resolved_spec::{
 };
 use crate::secret_fetch::{self, sh_quote, FetchScript};
 use crate::spec::{parse_duration_secs, Healthcheck, SecretMount, ServiceType};
+use crate::version_endpoint;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
@@ -477,8 +478,43 @@ fn generate_ingress(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) 
         }
     }
 
+    generate_version_ingress(&resolved_spec.ingress, &mut file)?;
     generate_redirect_ingresses(&resolved_spec.ingress, &mut file)?;
 
+    Ok(())
+}
+
+/// The version endpoints get an Ingress of their own: the main one may carry a
+/// `rewrite-target` that would rewrite this path too. The certificate stays with
+/// the main Ingress, which already lists every host.
+fn generate_version_ingress(ingress: &IngressResolvedSpec, file: &mut File) -> Result<()> {
+    if ingress.version_routes.is_empty() {
+        return Ok(());
+    }
+    writeln!(file, "---")?;
+    writeln!(file, "apiVersion: networking.k8s.io/v1")?;
+    writeln!(file, "kind: Ingress")?;
+    writeln!(file, "metadata:")?;
+    writeln!(file, "  name: {}--simpled-version", ingress.name)?;
+    writeln!(file, "spec:")?;
+    writeln!(file, "  ingressClassName: nginx")?;
+    writeln!(file, "  rules:")?;
+    for route in &ingress.version_routes {
+        writeln!(file, "  - host: {}", route.domain_name)?;
+        writeln!(file, "    http:")?;
+        writeln!(file, "      paths:")?;
+        writeln!(file, "      - path: {}", version_endpoint::PATH)?;
+        writeln!(file, "        pathType: Exact")?;
+        writeln!(file, "        backend:")?;
+        writeln!(file, "          service:")?;
+        writeln!(
+            file,
+            "            name: {}",
+            k8s_name(&version_endpoint::service_name(&route.deployment_name))
+        )?;
+        writeln!(file, "            port:")?;
+        writeln!(file, "              number: 80")?;
+    }
     Ok(())
 }
 
@@ -606,6 +642,8 @@ mod tests {
 
     fn ingress(redirects: Vec<RedirectRule>, tls: Option<IngressTlsResolvedSpec>) -> IngressResolvedSpec {
         IngressResolvedSpec {
+            version_routes: vec![],
+            version_document: None,
             name: "gateway".to_string(),
             tls,
             domains: vec!["www.somesite.com".to_string()],
@@ -644,8 +682,11 @@ mod tests {
 
     fn spec_with_limits(limits: &[(&str, &str, Option<u64>)]) -> EnvironmentResolvedSpec {
         EnvironmentResolvedSpec {
+            ports: Default::default(),
             env_type: crate::spec::DeploymentEnvType::K8S,
             ingress: IngressResolvedSpec {
+                version_routes: vec![],
+                version_document: None,
                 name: "gateway".to_string(),
                 tls: Some(IngressTlsResolvedSpec {
                     secret: Some("tls".to_string()),

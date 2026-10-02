@@ -48,7 +48,12 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
             for extra_file in &deployment.application.extra {
                 let content = fs::read_to_string(extra_file)
                     .with_context(|| format!("Failed to read extra spec file {}", extra_file))?;
-                let extra_yaml: ExtraAppSpecYaml = serde_yaml::from_str(&content)
+                let mut extra_value: serde_yaml::Value = serde_yaml::from_str(&content)
+                    .with_context(|| format!("Failed to parse extra spec file {}", extra_file))?;
+                env.ports
+                    .expand_yaml(&mut extra_value)
+                    .with_context(|| format!("In extra spec file {}", extra_file))?;
+                let extra_yaml: ExtraAppSpecYaml = serde_yaml::from_value(extra_value)
                     .with_context(|| format!("Failed to parse extra spec file {}", extra_file))?;
 
                 if let Some(services) = extra_yaml.extra_services {

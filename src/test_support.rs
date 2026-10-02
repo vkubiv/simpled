@@ -83,8 +83,11 @@ pub fn resolved_deployment(services: Vec<ServiceResolvedSpec>) -> DeploymentReso
 
 pub fn resolved_env(env_type: DeploymentEnvType, deployment: DeploymentResolvedSpec) -> EnvironmentResolvedSpec {
     EnvironmentResolvedSpec {
+        ports: Default::default(),
         env_type,
         ingress: IngressResolvedSpec {
+            version_routes: vec![],
+            version_document: None,
             name: "gateway".to_string(),
             tls: None,
             domains: vec![],

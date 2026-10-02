@@ -17,17 +17,31 @@ pub struct ComposeTarget {
 
 impl ComposeTarget {
     pub fn local(spec: &EnvironmentResolvedSpec) -> Self {
+        let suffix = spec.ports.suffix();
         ComposeTarget {
-            dir: PathBuf::from("local_env"),
-            project: local_project_name(&spec.current_deployment.application_name),
+            dir: PathBuf::from(format!("local_env{}", suffix)),
+            project: format!(
+                "{}{}",
+                local_project_name(&spec.current_deployment.application_name),
+                suffix
+            ),
             isolated: false,
         }
     }
 
+    pub fn describe(&self) -> String {
+        format!("compose project {}, written to {}", self.project, self.dir.display())
+    }
+
     pub fn test(spec: &EnvironmentResolvedSpec) -> Self {
+        let suffix = spec.ports.suffix();
         ComposeTarget {
-            dir: PathBuf::from("test_env"),
-            project: test_project_name(&spec.current_deployment.application_name),
+            dir: PathBuf::from(format!("test_env{}", suffix)),
+            project: format!(
+                "{}{}",
+                test_project_name(&spec.current_deployment.application_name),
+                suffix
+            ),
             isolated: true,
         }
     }

@@ -348,6 +348,7 @@ pub struct DeploymentEnvironmentSpec {
     pub ingress: IngressSpec,
     pub registry: HashMap<String, String>,
     pub deployments: Vec<DeploymentSpec>,
+    pub ports: crate::ports::LocalPorts,
 }
 
 impl DeploymentEnvironmentSpec {

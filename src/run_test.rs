@@ -12,7 +12,7 @@ use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
 use crate::run_local::{write_compose, ComposeTarget};
 use crate::spec::{DeploymentEnvType, EnvVariable, ServiceEnvOption, ServiceSecret};
 use crate::test_spec::{self, SuiteDeployment, TestSuite};
-use crate::{resolver, spec_loader, transform, validator};
+use crate::{ports, resolver, spec_loader, transform, validator};
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -28,6 +28,8 @@ pub struct TestOptions {
     pub no_up: bool,
     /// Print the services' logs after every suite, not only a failing one.
     pub logs: bool,
+    /// `--instance`: a number or `auto`, when given.
+    pub instance: Option<String>,
 }
 
 /// Set by the Ctrl-C handler. The running child gets the signal too and exits on
@@ -41,6 +43,18 @@ const LOG_TAIL_LINES: &str = "200";
 /// Runs the named suite, or every suite in name order, and returns the exit code
 /// to end the process with: the first failing suite's, or 0.
 pub fn run(root: &Path, suite_name: Option<&str>, options: &TestOptions) -> Result<i32> {
+    let instance = match ports::choose_instance(root, options.instance.as_deref())? {
+        ports::InstanceChoice::Fixed(n) => n,
+        ports::InstanceChoice::Auto if options.no_up => {
+            bail!("--instance auto looks for free ports to bring a stack up on; with --no-up name the instance that is running")
+        }
+        ports::InstanceChoice::Auto => {
+            let n = ports::read_declared(root)?.first_free_instance()?;
+            println!("Using instance {}, the first with all its named ports free", n);
+            n
+        }
+    };
+
     let suites = test_spec::load_test_spec(root)?;
     let selected: Vec<&TestSuite> = match suite_name {
         Some(name) => vec![suites.iter().find(|s| s.name == name).ok_or_else(|| {
@@ -56,7 +70,7 @@ pub fn run(root: &Path, suite_name: Option<&str>, options: &TestOptions) -> Resu
 
     let mut first_failure = 0;
     for suite in selected {
-        let code = run_suite(root, suite, options)?;
+        let code = run_suite(root, suite, instance, options)?;
         if code == 0 {
             println!("Suite '{}' passed", suite.name);
         } else {
@@ -72,10 +86,10 @@ pub fn run(root: &Path, suite_name: Option<&str>, options: &TestOptions) -> Resu
     Ok(first_failure)
 }
 
-fn run_suite(root: &Path, suite: &TestSuite, options: &TestOptions) -> Result<i32> {
+fn run_suite(root: &Path, suite: &TestSuite, instance: u32, options: &TestOptions) -> Result<i32> {
     println!("Running suite '{}'", suite.name);
 
-    let resolved = resolve_suite_deployment(root, suite)?;
+    let resolved = resolve_suite_deployment(root, suite, instance)?;
     let deployment_name = resolved.current_deployment.name.clone();
 
     if !suite.working_dir.is_dir() {
@@ -104,7 +118,7 @@ fn run_suite(root: &Path, suite: &TestSuite, options: &TestOptions) -> Result<i3
 
     // Bound before compose starts, so a port held by a forgotten `local run`
     // fails here with nothing to clean up.
-    let ingress = local_ingress::run(resolved.ingress.clone(), &deployment_name, "127.0.0.1")?;
+    let ingress = local_ingress::run(resolved.ingress.clone(), &deployment_name, "127.0.0.1", &target.dir)?;
     install_interrupt_handler();
 
     let stack = Stack {
@@ -115,7 +129,14 @@ fn run_suite(root: &Path, suite: &TestSuite, options: &TestOptions) -> Result<i3
     let deadline = Instant::now() + suite.timeout;
     let outcome = stack
         .up(&resolved, deadline)
-        .and_then(|()| wait_for_urls(&suite.wait_for, deadline))
+        .and_then(|()| {
+            let urls = suite
+                .wait_for
+                .iter()
+                .map(|url| resolved.ports.expand(url))
+                .collect::<Result<Vec<_>>>()?;
+            wait_for_urls(&urls, deadline)
+        })
         .and_then(|()| run_command(suite, &env_vars));
 
     let failed = !matches!(outcome, Ok(0));
@@ -137,8 +158,9 @@ fn run_suite(root: &Path, suite: &TestSuite, options: &TestOptions) -> Result<i3
 
 /// The env spec with the suite's deployment selected: a named one, the only one,
 /// or the suite's own block registered under the suite's name.
-fn resolve_suite_deployment(root: &Path, suite: &TestSuite) -> Result<EnvironmentResolvedSpec> {
+fn resolve_suite_deployment(root: &Path, suite: &TestSuite, instance: u32) -> Result<EnvironmentResolvedSpec> {
     let mut env_yaml = spec_loader::load_env_spec_yaml(root)?;
+    env_yaml.instance = instance;
 
     if let SuiteDeployment::Inline(dep) = &suite.deployment {
         if env_yaml.deployments.contains_key(&suite.name) {
@@ -219,7 +241,11 @@ fn resolve_suite_environment(suite: &TestSuite, resolved: &EnvironmentResolvedSp
                 set(value.clone());
             }
             ServiceEnvOption::WithValue(name, raw) => {
-                let value = resolver::resolve_variable_in_string(raw, host_env).with_context(|| {
+                let raw = resolved
+                    .ports
+                    .expand(raw)
+                    .with_context(|| format!("Suite '{}' variable {}", suite.name, name))?;
+                let value = resolver::resolve_variable_in_string(&raw, host_env).with_context(|| {
                     format!(
                         "Suite '{}' sets {} from a variable deployment '{}' does not define",
                         suite.name, name, deployment

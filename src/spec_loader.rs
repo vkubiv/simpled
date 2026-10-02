@@ -63,8 +63,13 @@ fn load_app_spec_from_tar_gz(path: &Path, env_spec: Option<&spec::DeploymentEnvi
     bail!("appspec.yaml not found in archive {:?}", path);
 }
 
-pub fn load_env_spec(root: &Path, selected_deployment: Option<&str>) -> Result<spec::DeploymentEnvironmentSpec> {
-    let yaml = load_env_spec_yaml(root)?;
+pub fn load_env_spec(
+    root: &Path,
+    selected_deployment: Option<&str>,
+    instance: u32,
+) -> Result<spec::DeploymentEnvironmentSpec> {
+    let mut yaml = load_env_spec_yaml(root)?;
+    yaml.instance = instance;
     transform::convert_env_spec(yaml, root, selected_deployment).context("Failed to process env spec")
 }
 
@@ -178,16 +183,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = "gateway:\n  hosts:\n    web: localhost:8080\ndeployments:\n  dev:\n    primary_host: web\n    application:\n      name: shop\n";
         fs::write(dir.path().join("localenv.yaml"), body).unwrap();
-        let spec = load_env_spec(dir.path(), None).unwrap();
+        let spec = load_env_spec(dir.path(), None, 0).unwrap();
         assert_eq!(spec.env_type, spec::DeploymentEnvType::Local);
 
         let other = tempfile::tempdir().unwrap();
         fs::write(other.path().join("envspec.yaml"), body).unwrap();
-        let err = load_env_spec(other.path(), None).unwrap_err().to_string();
+        let err = load_env_spec(other.path(), None, 0).unwrap_err().to_string();
         assert!(err.contains("'type' field is required"), "{err}");
 
         let none = tempfile::tempdir().unwrap();
-        let err = load_env_spec(none.path(), None).unwrap_err().to_string();
+        let err = load_env_spec(none.path(), None, 0).unwrap_err().to_string();
         assert!(err.contains("Could not find envspec.yaml"), "{err}");
     }
 }

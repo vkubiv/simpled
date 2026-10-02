@@ -2,6 +2,7 @@ use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
+use crate::version_endpoint;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -1006,10 +1007,12 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
                 lineage
             )?;
 
+            generate_version_location(&mut file, ingress, domain)?;
             generate_locations(&mut file, services)?;
 
             writeln!(file, "}}")?;
         } else {
+            generate_version_location(&mut file, ingress, domain)?;
             generate_locations(&mut file, services)?;
             writeln!(file, "}}")?;
         }
@@ -1069,6 +1072,26 @@ fn generate_nginx_redirects(file: &mut File, ingress: &IngressResolvedSpec) -> R
         }
     }
 
+    Ok(())
+}
+
+/// The version endpoint of the deployment owning `domain`. Its service belongs to
+/// that deployment's stack, which may not have been deployed yet, so the name is
+/// resolved per request through Docker's DNS: a fixed `proxy_pass` host that does
+/// not resolve would keep nginx from starting at all.
+fn generate_version_location(file: &mut File, ingress: &IngressResolvedSpec, domain: &str) -> Result<()> {
+    let Some(route) = ingress.version_routes.iter().find(|r| r.domain_name == domain) else {
+        return Ok(());
+    };
+    writeln!(file, "    location = {} {{", version_endpoint::PATH)?;
+    writeln!(file, "        resolver 127.0.0.11 valid=10s ipv6=off;")?;
+    writeln!(
+        file,
+        "        set $simpled_version {};",
+        version_endpoint::service_name(&route.deployment_name)
+    )?;
+    writeln!(file, "        proxy_pass http://$simpled_version;")?;
+    writeln!(file, "    }}")?;
     Ok(())
 }
 
@@ -1357,6 +1380,28 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         }
     }
 
+    for route in &ingress.version_routes {
+        writeln!(file, "    {}:", traefik_version_name(&route.domain_name))?;
+        writeln!(
+            file,
+            "      rule: \"Host(`{}`) && Path(`{}`)\"",
+            route.domain_name,
+            version_endpoint::PATH
+        )?;
+        writeln!(file, "      service: {}", traefik_version_name(&route.domain_name))?;
+        if has_tls {
+            writeln!(file, "      entryPoints:")?;
+            writeln!(file, "        - websecure")?;
+            writeln!(file, "      tls:")?;
+            if use_le {
+                writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
+            }
+        } else {
+            writeln!(file, "      entryPoints:")?;
+            writeln!(file, "        - web")?;
+        }
+    }
+
     for redirect in &ingress.redirects {
         let name = traefik_redirect_name(&redirect.from_domain);
         writeln!(file, "    {}:", name)?;
@@ -1394,6 +1439,18 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         }
     }
 
+    for route in &ingress.version_routes {
+        writeln!(file, "    {}:", traefik_version_name(&route.domain_name))?;
+        writeln!(file, "      loadBalancer:")?;
+        writeln!(file, "        servers:")?;
+        writeln!(
+            file,
+            "          - url: \"http://{}_{}:80/\"",
+            route.deployment_name,
+            version_endpoint::service_name(&route.deployment_name)
+        )?;
+    }
+
     if !ingress.redirects.is_empty() {
         // Every router must name a service. The redirect middleware answers
         // before the request is forwarded, so this address is never dialled.
@@ -1404,6 +1461,10 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
     }
 
     Ok(())
+}
+
+fn traefik_version_name(domain: &str) -> String {
+    format!("simpled-version-{}", domain.replace(['.', ':'], "-"))
 }
 
 /// Traefik router/middleware names may not contain dots.
@@ -1516,11 +1577,14 @@ mod tests {
 
     fn spec(services: Vec<ServiceResolvedSpec>) -> EnvironmentResolvedSpec {
         EnvironmentResolvedSpec {
+            ports: Default::default(),
             env_type: DeploymentEnvType::Docker(DockerSpecificSpec {
                 ingress_type: DockerIngressType::Nginx,
                 swarm_mode: true,
             }),
             ingress: IngressResolvedSpec {
+                version_routes: vec![],
+                version_document: None,
                 name: "gateway".to_string(),
                 tls: None,
                 domains: vec![],
@@ -1541,6 +1605,8 @@ mod tests {
 
     fn ingress_with_redirect(tls: Option<IngressTlsResolvedSpec>) -> IngressResolvedSpec {
         IngressResolvedSpec {
+            version_routes: vec![],
+            version_document: None,
             name: "gateway".to_string(),
             tls,
             domains: vec!["www.somesite.com".to_string(), "somesite.com".to_string()],
@@ -1565,6 +1631,8 @@ mod tests {
 
     fn ingress_with_limits(limits: &[(&str, &str, Option<u64>)]) -> IngressResolvedSpec {
         IngressResolvedSpec {
+            version_routes: vec![],
+            version_document: None,
             name: "gateway".to_string(),
             tls: None,
             domains: vec!["somesite.com".to_string()],

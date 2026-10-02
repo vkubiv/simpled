@@ -144,6 +144,13 @@ pub struct DeploymentEnvironmentSpecYaml {
     pub ingress: Option<IngressSpecYaml>,
     pub registry: Option<HashMap<String, String>>,
     pub deployments: HashMap<String, DeploymentSpecYaml>,
+    // local-only: host ports by name, referenced as `$port(name)`. An instance
+    // shifts all of them by `instance * port_step`.
+    pub ports: Option<std::collections::BTreeMap<String, u16>>,
+    pub port_step: Option<u32>,
+    // The instance being run, chosen on the command line rather than written in the file.
+    #[serde(skip)]
+    pub instance: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -14,6 +14,7 @@ pub fn convert_env_spec(
     root: &Path,
     selected_deployment: Option<&str>,
 ) -> Result<DeploymentEnvironmentSpec> {
+    let (yaml, ports) = expand_ports(yaml)?;
     let env_type_yaml = yaml
         .env_type
         .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
@@ -63,7 +64,19 @@ pub fn convert_env_spec(
 
     let mut deployments = Vec::new();
     for (name, dep) in &concrete {
-        deployments.push(convert_deployment(name.clone(), dep, root, &env_type_yaml)?);
+        let mut deployment = convert_deployment(name.clone(), dep, root, &env_type_yaml)?;
+        // Values read from files and `.env.local` were not part of the document
+        // expanded above.
+        for var in deployment
+            .environment
+            .iter_mut()
+            .chain(deployment.undockerized_environment.iter_mut())
+        {
+            var.value = ports
+                .expand(&var.value)
+                .with_context(|| format!("Variable {} in deployment '{}'", var.name, name))?;
+        }
+        deployments.push(deployment);
     }
 
     let env_type = match env_type_yaml {
@@ -184,7 +197,33 @@ pub fn convert_env_spec(
         ingress,
         registry,
         deployments,
+        ports,
     })
+}
+
+/// Expands `$port(name)` and `$instance()` throughout a local env spec, and
+/// returns the port table they were expanded against.
+fn expand_ports(
+    yaml: DeploymentEnvironmentSpecYaml,
+) -> Result<(DeploymentEnvironmentSpecYaml, crate::ports::LocalPorts)> {
+    if !matches!(yaml.env_type, Some(DeploymentEnvTypeYaml::Local)) {
+        if yaml.ports.is_some() || yaml.port_step.is_some() {
+            bail!("ports and port_step can only be set for a Local environment");
+        }
+        if yaml.instance != 0 {
+            bail!("An instance can only be chosen for a Local environment");
+        }
+        return Ok((yaml, crate::ports::LocalPorts::default()));
+    }
+
+    let instance = yaml.instance;
+    let ports = crate::ports::LocalPorts::new(yaml.ports.clone().unwrap_or_default(), yaml.port_step, instance)?;
+    let mut value = serde_yaml::to_value(&yaml).context("Failed to re-read the env spec")?;
+    ports.expand_yaml(&mut value)?;
+    let mut expanded: DeploymentEnvironmentSpecYaml =
+        serde_yaml::from_value(value).context("Failed to re-read the env spec after expanding $port()")?;
+    expanded.instance = instance;
+    Ok((expanded, ports))
 }
 
 /// Resolves `extends` inheritance for every deployment, returning a map of fully
