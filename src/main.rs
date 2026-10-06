@@ -46,20 +46,8 @@ enum Commands {
     PrepareDeployment {
         deployment_name: String,
 
-        #[arg(long, alias = "app-bundle")]
-        bundle: Option<String>,
-
-        #[arg(long, alias = "app-version")]
-        version: Option<String>,
-
-        #[arg(long)]
-        download_bundle_from: Option<String>,
-
-        #[arg(long)]
-        github_repo: Option<String>,
-
-        #[arg(long)]
-        github_tag_prefix: Option<String>,
+        #[command(flatten)]
+        bundle: bundle_repo::BundleArgs,
     },
 
     /// Used for local development and tests
@@ -95,6 +83,12 @@ enum Commands {
         /// .simpled-instance, then 0.
         #[arg(long)]
         instance: Option<String>,
+
+        /// Run the app services from a released bundle: the images CI published
+        /// for its version, through the env spec's `registry:`, instead of the
+        /// local `:latest` ones
+        #[command(flatten)]
+        bundle: bundle_repo::BundleArgs,
     },
 
     /// Print the documentation embedded in this binary
@@ -170,6 +164,12 @@ enum LocalCommands {
         /// .simpled-instance, then 0.
         #[arg(long)]
         instance: Option<String>,
+
+        /// Run the app services from a released bundle: the images CI published
+        /// for its version, through the env spec's `registry:`, instead of the
+        /// local `:latest` ones
+        #[command(flatten)]
+        bundle: bundle_repo::BundleArgs,
     },
     /// Run the gateway and only extra services (no app services)
     OnlyExtra {
@@ -204,6 +204,11 @@ enum LocalCommands {
         /// .simpled-instance, then 0.
         #[arg(long)]
         instance: Option<String>,
+
+        /// Generate for the app services of a released bundle, as `local run
+        /// --app-bundle` runs them
+        #[command(flatten)]
+        bundle: bundle_repo::BundleArgs,
     },
 }
 
@@ -272,19 +277,8 @@ fn main() -> Result<()> {
         Commands::PrepareDeployment {
             deployment_name,
             bundle,
-            version,
-            download_bundle_from,
-            github_repo,
-            github_tag_prefix,
         } => {
-            prepare_deployment_command(
-                deployment_name,
-                bundle,
-                version,
-                download_bundle_from,
-                github_repo,
-                github_tag_prefix,
-            )?;
+            prepare_deployment_command(deployment_name, bundle)?;
         }
         Commands::Local { command } => {
             local(command)?;
@@ -296,6 +290,7 @@ fn main() -> Result<()> {
             no_up,
             logs,
             instance,
+            bundle,
         } => {
             let root = path.as_ref().map(Path::new).unwrap_or(Path::new("."));
             let options = run_test::TestOptions {
@@ -303,6 +298,7 @@ fn main() -> Result<()> {
                 no_up: *no_up,
                 logs: *logs,
                 instance: instance.clone(),
+                bundle: bundle.clone(),
             };
             let code = run_test::run(root, suite.as_deref(), &options)?;
             if code != 0 {
@@ -358,51 +354,16 @@ fn version_command() -> Result<()> {
     Ok(())
 }
 
-fn prepare_deployment_command(
-    deployment_name: &str,
-    bundle: &Option<String>,
-    version: &Option<String>,
-    download_bundle_from: &Option<String>,
-    github_repo: &Option<String>,
-    github_tag_prefix: &Option<String>,
-) -> Result<()> {
+fn prepare_deployment_command(deployment_name: &str, bundle: &bundle_repo::BundleArgs) -> Result<()> {
     // 1. Load specs
     let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
 
-    // Find deployment to get app name
-    let deployment = env_spec.deployment(deployment_name)?;
+    let app_name = &env_spec.deployment(deployment_name)?.application.name;
+    let bundle_path = bundle
+        .locate(app_name, Path::new("."))?
+        .context("Either --app-bundle or --download-bundle-from must be specified")?;
 
-    let app_name = &deployment.application.name;
-
-    let bundle_path_str = if let Some(source) = download_bundle_from {
-        if source == "github-release" {
-            let ver = version
-                .as_ref()
-                .context("--app-version is required when downloading from github-release")?;
-            let repo = github_repo
-                .as_ref()
-                .context("--github-repo is required when downloading from github-release")?;
-
-            bundle_repo::gh_release::download(repo, ver, app_name, github_tag_prefix.as_deref())?
-        } else {
-            bail!(
-                "Unknown download source: {}. Only 'github-release' is supported.",
-                source
-            );
-        }
-    } else {
-        if version.is_some() {
-            bail!("Deploying by version without download is not implemented yet. Use --app-bundle to specify file.");
-        }
-        bundle
-            .as_ref()
-            .context("Either --app-bundle or --download-bundle-from must be specified")?
-            .clone()
-    };
-
-    let bundle_path = Path::new(&bundle_path_str);
-
-    let app_spec = spec_loader::load_app_spec(bundle_path, Some(&env_spec))?;
+    let app_spec = spec_loader::load_app_spec(&bundle_path, Some(&env_spec))?;
 
     // 2. Validate
     validator::validate(&env_spec, &app_spec, deployment_name).context("Validation failed")?;
@@ -477,6 +438,7 @@ fn local(command: &LocalCommands) -> Result<()> {
             path,
             deployment,
             instance,
+            ..
         } => (
             path.as_ref().map(Path::new).unwrap_or(Path::new(".")),
             deployment,
@@ -495,11 +457,16 @@ fn local(command: &LocalCommands) -> Result<()> {
         LocalCommands::Run { exclude, .. } => exclude.clone().unwrap_or_default(),
         _ => Vec::new(),
     };
+    let bundle = match command {
+        LocalCommands::Run { bundle, .. } | LocalCommands::GenerateConfig { bundle, .. } => bundle.clone(),
+        LocalCommands::OnlyExtra { .. } => bundle_repo::BundleArgs::default(),
+    };
 
-    let env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref(), instance)?;
-    let app_spec = spec_loader::load_app_spec_from_dir(root, Some(&env_spec))?;
+    let mut env_spec = spec_loader::load_env_spec(root, deployment_name.as_deref(), instance)?;
+    let selected = select_deployment(&env_spec, deployment_name.as_deref())?.name.clone();
+    let app_spec = spec_loader::load_local_app_spec(root, &mut env_spec, &selected, &bundle)?;
 
-    let deployment = select_deployment(&env_spec, deployment_name.as_deref())?;
+    let deployment = env_spec.deployment(&selected)?;
 
     validator::validate(&env_spec, &app_spec, &deployment.name).context("Validation failed")?;
 

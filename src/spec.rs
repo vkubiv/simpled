@@ -349,6 +349,10 @@ pub struct DeploymentEnvironmentSpec {
     pub registry: HashMap<String, String>,
     pub deployments: Vec<DeploymentSpec>,
     pub ports: crate::ports::LocalPorts,
+    /// A local deployment run from a released bundle: app services take the
+    /// images CI published for its version, through `registry`, instead of
+    /// `:latest` from the local Docker cache.
+    pub published_images: bool,
 }
 
 impl DeploymentEnvironmentSpec {

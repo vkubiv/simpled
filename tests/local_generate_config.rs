@@ -177,3 +177,52 @@ fn local_config_covers_compose_env_files_and_working_dirs() {
     assert!(worker_env.contains("DB_PASSWORD=local pa$$ 'word'"), "{}", worker_env);
     assert!(!local_env.join("worker").join("undockerized.env").exists());
 }
+
+#[test]
+fn a_released_bundle_runs_the_images_published_for_its_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let localenv = format!("registry:\n  myorg: registry.example.com/\n{}", LOCALENV);
+    fs::write(root.join("localenv.yaml"), localenv).unwrap();
+    fs::write(root.join("appspec.yaml"), APPSPEC).unwrap();
+    // The bundle CI released: another version of the same app.
+    fs::create_dir_all(root.join("release")).unwrap();
+    fs::write(
+        root.join("release").join("appspec.yaml"),
+        APPSPEC.replace("1.2.3", "1.4.0"),
+    )
+    .unwrap();
+
+    let generate = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_simpled"))
+            .current_dir(root)
+            .args(["local", "generate-config"])
+            .args(extra)
+            .output()
+            .expect("simpled runs");
+        assert!(
+            output.status.success(),
+            "generate-config failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let compose = read(&root.join("local_env").join("docker-compose.yaml"));
+        serde_yaml::from_str::<serde_yaml::Value>(&compose).unwrap()
+    };
+
+    // The registry only matters once a bundle is named.
+    let parsed = generate(&[]);
+    assert_eq!(parsed["services"]["api"]["image"].as_str(), Some("myorg/api:latest"));
+
+    let parsed = generate(&["--app-bundle", "release"]);
+    assert_eq!(
+        parsed["services"]["api"]["image"].as_str(),
+        Some("registry.example.com/myorg/api:1.4.0")
+    );
+    assert_eq!(
+        parsed["services"]["migrate"]["image"].as_str(),
+        Some("registry.example.com/myorg/migrate:1.4.0")
+    );
+    // Extra services are the env's own and stay as written.
+    assert_eq!(parsed["services"]["primary-db"]["image"].as_str(), Some("postgres:16"));
+}

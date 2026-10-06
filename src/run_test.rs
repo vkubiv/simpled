@@ -30,6 +30,8 @@ pub struct TestOptions {
     pub logs: bool,
     /// `--instance`: a number or `auto`, when given.
     pub instance: Option<String>,
+    /// A released bundle to run instead of the appspec beside the env spec.
+    pub bundle: crate::bundle_repo::BundleArgs,
 }
 
 /// Set by the Ctrl-C handler. The running child gets the signal too and exits on
@@ -89,7 +91,7 @@ pub fn run(root: &Path, suite_name: Option<&str>, options: &TestOptions) -> Resu
 fn run_suite(root: &Path, suite: &TestSuite, instance: u32, options: &TestOptions) -> Result<i32> {
     println!("Running suite '{}'", suite.name);
 
-    let resolved = resolve_suite_deployment(root, suite, instance)?;
+    let resolved = resolve_suite_deployment(root, suite, instance, &options.bundle)?;
     let deployment_name = resolved.current_deployment.name.clone();
 
     if !suite.working_dir.is_dir() {
@@ -158,7 +160,12 @@ fn run_suite(root: &Path, suite: &TestSuite, instance: u32, options: &TestOption
 
 /// The env spec with the suite's deployment selected: a named one, the only one,
 /// or the suite's own block registered under the suite's name.
-fn resolve_suite_deployment(root: &Path, suite: &TestSuite, instance: u32) -> Result<EnvironmentResolvedSpec> {
+fn resolve_suite_deployment(
+    root: &Path,
+    suite: &TestSuite,
+    instance: u32,
+    bundle: &crate::bundle_repo::BundleArgs,
+) -> Result<EnvironmentResolvedSpec> {
     let mut env_yaml = spec_loader::load_env_spec_yaml(root)?;
     env_yaml.instance = instance;
 
@@ -197,7 +204,7 @@ fn resolve_suite_deployment(root: &Path, suite: &TestSuite, instance: u32) -> Re
         _ => suite.deployment_name().map(str::to_string),
     };
 
-    let env_spec = transform::convert_env_spec(env_yaml, root, selected.as_deref())
+    let mut env_spec = transform::convert_env_spec(env_yaml, root, selected.as_deref())
         .with_context(|| format!("Failed to process env spec for suite '{}'", suite.name))?;
     if env_spec.env_type != DeploymentEnvType::Local {
         bail!(
@@ -209,7 +216,7 @@ fn resolve_suite_deployment(root: &Path, suite: &TestSuite, instance: u32) -> Re
         .or_else(|| env_spec.deployments.first().map(|d| d.name.clone()))
         .ok_or_else(|| anyhow!("No deployment to run for suite '{}'", suite.name))?;
 
-    let app_spec = spec_loader::load_app_spec_from_dir(root, Some(&env_spec))?;
+    let app_spec = spec_loader::load_local_app_spec(root, &mut env_spec, &deployment_name, bundle)?;
     validator::validate(&env_spec, &app_spec, &deployment_name).context("Validation failed")?;
     resolver::resolve(&env_spec, &app_spec, &deployment_name).context("Resolution failed")
 }

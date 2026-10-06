@@ -126,9 +126,6 @@ pub fn convert_env_spec(
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for Local environment"));
             }
-            if !registry.is_empty() {
-                return Err(anyhow!("registry must be empty for Local environment"));
-            }
             if deployments.is_empty() {
                 return Err(anyhow!(
                     "For Local environment at least one deployment must be specified"
@@ -198,6 +195,7 @@ pub fn convert_env_spec(
         registry,
         deployments,
         ports,
+        published_images: false,
     })
 }
 

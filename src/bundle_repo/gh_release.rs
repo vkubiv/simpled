@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 struct Asset {
@@ -20,12 +20,19 @@ struct Release {
     assets: Vec<Asset>,
 }
 
-pub fn download(repo: &str, ver: &str, app_name: &str, tag_prefix: Option<&str>) -> Result<String> {
+/// Downloads the release asset into `dest_dir` and returns its path. A bundle
+/// already there is reused: a released version is never rebuilt.
+pub fn download(repo: &str, ver: &str, app_name: &str, tag_prefix: Option<&str>, dest_dir: &Path) -> Result<PathBuf> {
     // Release assets are named with the `-` form of the version, so accept either
     // spelling of a side-branch version: `1.0.2+big-refactor` or `1.0.2-big-refactor`.
     let ver = crate::spec::version_to_tag(ver);
     let filename = format!("{}.{}.tar.gz", app_name, ver);
     let tag = format!("{}{}", tag_prefix.unwrap_or(""), ver);
+    let dest = dest_dir.join(&filename);
+    if dest.is_file() {
+        println!("Using the downloaded bundle {}", dest.display());
+        return Ok(dest);
+    }
 
     // Check GITHUB_TOKEN
     let token =
@@ -80,10 +87,15 @@ pub fn download(repo: &str, ver: &str, app_name: &str, tag_prefix: Option<&str>)
         );
     }
 
-    let mut dest = File::create(Path::new(&filename)).context("Failed to create file")?;
-    response.copy_to(&mut dest).context("Failed to write content to file")?;
+    // Written aside and renamed, so an interrupted download is not reused.
+    std::fs::create_dir_all(dest_dir).with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+    let partial = dest_dir.join(format!("{}.part", filename));
+    let mut file = File::create(&partial).context("Failed to create file")?;
+    response.copy_to(&mut file).context("Failed to write content to file")?;
+    drop(file);
+    std::fs::rename(&partial, &dest).with_context(|| format!("Failed to move the bundle to {}", dest.display()))?;
 
-    Ok(filename)
+    Ok(dest)
 }
 
 pub fn upload(repo: &str, ver: &str, filename: &str, tag_prefix: Option<&str>) -> Result<()> {

@@ -520,11 +520,10 @@ impl ServiceResolver<'_> {
             return Ok(raw_image);
         }
 
-        if let DeploymentEnvType::Local = self.env_spec.env_type {
-            raw_image = format!("{}:latest", raw_image);
-        } else {
-            raw_image = format!("{}:{}", raw_image, version_to_tag(&self.app_spec.version.to_string()));
+        if self.env_spec.env_type == DeploymentEnvType::Local && !self.env_spec.published_images {
+            return Ok(format!("{}:latest", raw_image));
         }
+        raw_image = format!("{}:{}", raw_image, version_to_tag(&self.app_spec.version.to_string()));
         resolve_app_service_image(self.env_spec, raw_image)
     }
 }
@@ -739,16 +738,12 @@ fn resolve_app_service_image(env_spec: &DeploymentEnvironmentSpec, raw_image: St
             let registry_host = registry_host.strip_suffix('/').unwrap_or(registry_host);
             format!("{}/{}", registry_host, raw_image)
         } else {
-            if env_spec.env_type == DeploymentEnvType::Local {
-                raw_image
-            } else {
-                let available: Vec<_> = env_spec.registry.keys().collect();
-                return Err(anyhow!(
-                    "Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}",
-                    namespace,
-                    available
-                ));
-            }
+            let available: Vec<_> = env_spec.registry.keys().collect();
+            return Err(anyhow!(
+                "Docker registry host for namespace '{}' not found in environment spec. Available namespaces: {:?}",
+                namespace,
+                available
+            ));
         }
     } else {
         raw_image
@@ -1373,6 +1368,49 @@ deployments:
                 .find(|s| s.full_name == "api")
                 .unwrap();
             assert_eq!(api.image, "myorg/api:latest");
+        }
+
+        #[test]
+        fn a_local_deployment_of_a_released_bundle_uses_the_published_image() {
+            let local = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+registry:
+  myorg: registry.example.com/
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    services:
+      api:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+"#;
+            let root = tempfile::tempdir().unwrap();
+            let mut env = env_spec(local, root.path());
+            let image = |env: &DeploymentEnvironmentSpec| {
+                let spec = resolve(env, &app_spec(APP), "prod").unwrap();
+                let api = spec
+                    .current_deployment
+                    .services
+                    .iter()
+                    .find(|s| s.full_name == "api")
+                    .unwrap();
+                api.image.clone()
+            };
+            // The registry is ignored until the deployment runs a released bundle.
+            assert_eq!(image(&env), "myorg/api:latest");
+            env.published_images = true;
+            assert_eq!(image(&env), "registry.example.com/myorg/api:1.2.3");
+
+            env.registry.clear();
+            let err = resolve(&env, &app_spec(APP), "prod").unwrap_err().to_string();
+            assert!(err.contains("namespace 'myorg' not found"), "{err}");
         }
 
         #[test]

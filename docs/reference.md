@@ -251,7 +251,7 @@ Use `envspec.yaml` for Kubernetes and Docker environments. Use `localenv.yaml` f
 |-------|------|----------|-------------|
 | `type` | string | no | `k8s`, `docker`, or `local`. Required in `envspec.yaml`; defaults to `local` in `localenv.yaml`. |
 | `swarm_mode` | bool | no | Enable Docker Swarm mode. Only valid when `type: docker`. |
-| `registry` | map | no | Image registry prefix mappings. Not valid for `local`. |
+| `registry` | map | no | Image registry prefix mappings. In `localenv.yaml`, used only when running a [released bundle](#running-a-released-bundle-locally). |
 | `gateway` | object | yes | Gateway (load balancer) configuration. The deprecated alias `ingress` is still accepted with a warning. |
 | `deployments` | map | yes | Named deployment configurations. |
 
@@ -289,6 +289,38 @@ registry:
 ```
 
 An image `mycompany/api` becomes `registry.mycompany.com/mycompany/api` at deploy time.
+
+In a `localenv.yaml` the map is ignored until a run names a released bundle: app
+services normally run `mycompany/api:latest` from the local Docker cache.
+
+#### Running a released bundle locally
+
+`simpled test`, `simpled local run` and `simpled local generate-config` take the
+same bundle options as `prepare-deployment`. With one, the appspec comes from the
+bundle instead of the project directory, and every app service runs
+`<registry>/<image>:<bundle version>` — the image `app-bundle create --push-images`
+published — instead of `<image>:latest`. Extra services are unchanged.
+
+```yaml
+# localenv.yaml
+registry:
+  mycompany: 123456789012.dkr.ecr.us-east-2.amazonaws.com/
+```
+
+```bash
+simpled test e2e   --download-bundle-from github-release   --github-repo mycompany/myapp   --github-tag-prefix myapp-v   --app-version 1.4.0
+```
+
+This is how a repository that does not hold the app's source — a mobile client,
+another service — runs its tests against an exact release: it keeps its own
+`localenv.yaml` and `testspec.yaml` and names the version. The download goes to
+`.simpled-bundles/` beside the env spec and is reused on the next run; keep that
+directory out of version control. `GITHUB_TOKEN` must be able to read the
+release, and Docker must be logged in to the registry (for ECR:
+`aws ecr get-login-password | docker login --username AWS --password-stdin <host>`),
+since compose pulls the images on first use. An app image without a `registry`
+entry for its namespace is an error. The deployment's `application.version`
+requirement, when set, is checked against the bundle as in a deploy.
 
 ---
 
@@ -1111,7 +1143,7 @@ simpled prepare-deployment <DEPLOYMENT_NAME> [OPTIONS]
 
 Options:
   --app-bundle, --bundle <PATH>        Path to app bundle (.tar.gz or directory)
-  --app-version, --version <VERSION>   Expected app version (for verification)
+  --app-version, --version <VERSION>   Version to download, with --download-bundle-from
   --download-bundle-from <SOURCE>      Download bundle: github-release
   --github-repo <OWNER/REPO>           GitHub repository
   --github-tag-prefix <PREFIX>         Prefix for GitHub release tag
@@ -1152,7 +1184,15 @@ Options:
   --bind <ADDR>            Address the gateway listens on (default: 127.0.0.1).
                            Pass 0.0.0.0 to reach it from another device.
   --instance <N>           Run as instance N (see ports and instances)
+  --app-bundle <PATH>      Run a released bundle (.tar.gz or directory): app
+                           services take its version's published images
+  --app-version <VERSION>  With --download-bundle-from: the version to download
+  --download-bundle-from <SOURCE>, --github-repo <OWNER/REPO>,
+  --github-tag-prefix <PREFIX>
+                           As for prepare-deployment
 ```
+
+See [Running a released bundle locally](#running-a-released-bundle-locally).
 
 `--exclude` adds to the deployment's own [`exclude_services`](#exclude_services),
 and every name must be a service of the application.
@@ -1194,6 +1234,8 @@ Options:
   --deployment <NAME>  Deployment to generate config for. Required when the env
                        spec defines more than one deployment.
   --instance <N>       Generate for instance N (see ports and instances)
+  --app-bundle, --app-version, --download-bundle-from, --github-repo,
+  --github-tag-prefix  Generate for a released bundle, as `local run` does
 ```
 
 ### `simpled test`
@@ -1212,6 +1254,9 @@ Options:
                        failing one
   --instance <N|auto>  Run as instance N, or `auto`: the lowest instance whose
                        named ports are all free (not with --no-up)
+  --app-bundle, --app-version, --download-bundle-from, --github-repo,
+  --github-tag-prefix  Run the suite against a released bundle's published
+                       images (see Running a released bundle locally)
 ```
 
 Without `SUITE` every suite runs, in name order, and the exit code is the first failing suite's. One run, in order:

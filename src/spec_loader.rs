@@ -23,6 +23,29 @@ pub fn load_app_spec(
     bail!("Invalid app bundle can be either a directory or a tar.gz file");
 }
 
+/// The app spec a local deployment runs: the appspec beside the env spec, or a
+/// released bundle, whose app services then run the images published for it.
+pub fn load_local_app_spec(
+    root: &Path,
+    env_spec: &mut spec::DeploymentEnvironmentSpec,
+    deployment_name: &str,
+    bundle: &crate::bundle_repo::BundleArgs,
+) -> Result<spec::AppSpec> {
+    let app_name = env_spec.deployment(deployment_name)?.application.name.clone();
+    let Some(path) = bundle.locate(&app_name, &root.join(".simpled-bundles"))? else {
+        return load_app_spec_from_dir(root, Some(env_spec));
+    };
+    let app_spec = load_app_spec(&path, Some(env_spec))?;
+    env_spec.published_images = true;
+    println!(
+        "Running {} {} from its published images ({})",
+        app_spec.name,
+        app_spec.version,
+        path.display()
+    );
+    Ok(app_spec)
+}
+
 pub fn load_app_spec_from_dir(dir: &Path, env_spec: Option<&spec::DeploymentEnvironmentSpec>) -> Result<spec::AppSpec> {
     let path_yaml = dir.join("appspec.yaml");
     let path_yml = dir.join("appspec.yml");
