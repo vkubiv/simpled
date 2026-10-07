@@ -151,7 +151,16 @@ pub fn convert_env_spec(
                 svc_names.sort();
                 for svc_name in svc_names {
                     let svc_spec = &services[svc_name];
-                    if svc_spec.ports.is_empty() {
+                    // A listed service needs a host port when something reaches it
+                    // there: the gateway routes to `localhost:<port>`, and a host-run
+                    // service listens on one. An entry that only adds `depends_on`,
+                    // mounts or a command (a migration job, say) needs none.
+                    let routed = svc_spec
+                        .routes
+                        .iter()
+                        .any(|r| r.host.is_some() || !r.prefixes.is_empty());
+                    let reachable = routed || svc_spec.working_dir.is_some();
+                    if svc_spec.ports.is_empty() && reachable {
                         return Err(anyhow!(
                             "In Local environment, service {} must have at least one port",
                             svc_name
@@ -1749,6 +1758,43 @@ deployments:
         // The child's list replaces the base's, and an empty one is kept as such.
         let dev = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
         assert_eq!(service(&dev, "migrate").depends_on, Some(vec![]));
+    }
+
+    #[test]
+    fn a_local_entry_that_only_orders_a_job_needs_no_port() {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  dev:
+    primary_host: web
+    application:
+      name: app
+    services:
+      web:
+        host: web
+        ports:
+          - "8080:80"
+      migrate:
+        depends_on: [postgres]
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
+        assert_eq!(service(&spec, "migrate").depends_on, Some(vec!["postgres".to_string()]));
+
+        // Something the gateway routes to, or that runs on the host, still needs one.
+        let routed = raw.replace(
+            "        depends_on: [postgres]\n",
+            "        host: web\n        prefix: /m\n",
+        );
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&routed).unwrap();
+        let err = convert_env_spec(yaml, root.path(), Some("dev"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service migrate must have at least one port"), "{err}");
     }
 
     #[test]
