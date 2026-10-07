@@ -272,8 +272,10 @@ fn convert_service(name: String, yaml: ServiceSpecYaml, is_app_service: bool) ->
     let entrypoint = yaml.entrypoint.map(super::convert_service_command);
     let healthcheck = yaml.healthcheck.map(convert_healthcheck).transpose()?;
 
-    let depends_on = yaml.depends_on.unwrap_or_default();
-    if depends_on.iter().any(|d| d == &name) {
+    // Kept as an option: an absent key and an explicit empty list mean different
+    // things for a job (see `ServiceSpec::depends_on`).
+    let depends_on = yaml.depends_on.clone();
+    if depends_on.iter().flatten().any(|d| d == &name) {
         return Err(anyhow!("Service '{}' cannot depend on itself", name));
     }
 
@@ -447,6 +449,16 @@ environment:
     fn a_service_cannot_depend_on_itself() {
         let raw = "name: app\nversion: 1.0.0\napp_services:\n  api:\n    image: a\n    depends_on:\n      - api\n";
         assert!(convert_err(raw).contains("cannot depend on itself"));
+    }
+
+    #[test]
+    fn an_absent_depends_on_differs_from_an_empty_one() {
+        let absent = "name: app\nversion: 1.0.0\napp_services:\n  migrate:\n    type: job\n    image: a\n";
+        assert_eq!(convert(absent).unwrap().app_services[0].depends_on, None);
+
+        // `[]` is a statement: the job needs nothing from the stack.
+        let empty = format!("{absent}    depends_on: []\n");
+        assert_eq!(convert(&empty).unwrap().app_services[0].depends_on, Some(vec![]));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::spec::*;
 use anyhow::{anyhow, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -133,20 +133,32 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
 
     // Validate `depends_on` references and reject dependency cycles. A cycle has
     // no valid start order, and the deploy scripts walk these edges to decide what
-    // must be running before a job runs.
-    for service in app_spec.all_services() {
-        for dep in &service.depends_on {
+    // must be running before a job runs. The edges are the deployment's: its
+    // per-service `depends_on` replaces the app's where it is set.
+    let edges = effective_depends_on(app_spec, deployment);
+    for (name, deps) in &edges {
+        let overridden = deployment.services.get(*name).is_some_and(|s| s.depends_on.is_some());
+        for dep in *deps {
             if !available_services.contains(dep) {
-                return Err(anyhow!(
-                    "Service {} depends on {} which is not defined in application",
-                    service.name,
-                    dep
-                ));
+                return Err(if overridden {
+                    anyhow!(
+                        "Deployment {} makes service {} depend on {} which is not defined in application",
+                        env_name,
+                        name,
+                        dep
+                    )
+                } else {
+                    anyhow!(
+                        "Service {} depends on {} which is not defined in application",
+                        name,
+                        dep
+                    )
+                });
             }
         }
     }
 
-    if let Some(cycle) = find_depends_on_cycle(app_spec) {
+    if let Some(cycle) = find_depends_on_cycle(&edges) {
         return Err(anyhow!("Dependency cycle in depends_on: {}", cycle.join(" -> ")));
     }
 
@@ -194,13 +206,15 @@ fn validate_service_env_references(app_spec: &AppSpec) -> Result<()> {
 /// Depth-first search over `depends_on` edges. Returns the services on the first
 /// cycle found (starting and ending on the same name), or `None` when the graph
 /// is acyclic.
-fn find_depends_on_cycle(app_spec: &AppSpec) -> Option<Vec<String>> {
+fn find_depends_on_cycle(edges: &DependsOnEdges<'_>) -> Option<Vec<String>> {
     let mut done: HashSet<&str> = HashSet::new();
 
-    for service in app_spec.all_services() {
+    let mut names: Vec<&str> = edges.keys().copied().collect();
+    names.sort_unstable();
+    for name in names {
         // `path` doubles as the visit stack and as the reported cycle.
         let mut path: Vec<&str> = Vec::new();
-        if let Some(cycle) = visit(&service.name, app_spec, &mut path, &mut done) {
+        if let Some(cycle) = visit(name, edges, &mut path, &mut done) {
             return Some(cycle);
         }
     }
@@ -208,9 +222,29 @@ fn find_depends_on_cycle(app_spec: &AppSpec) -> Option<Vec<String>> {
     None
 }
 
+/// Service name -> the services it must wait for, as one deployment sees them.
+type DependsOnEdges<'a> = BTreeMap<&'a str, &'a [String]>;
+
+/// The `depends_on` of every service in `deployment`: the deployment's own list
+/// where it sets one, the app spec's otherwise, empty where neither does.
+fn effective_depends_on<'a>(app_spec: &'a AppSpec, deployment: &'a DeploymentSpec) -> DependsOnEdges<'a> {
+    app_spec
+        .all_services()
+        .map(|service| {
+            let deps = deployment
+                .services
+                .get(&service.name)
+                .and_then(|s| s.depends_on.as_deref())
+                .or(service.depends_on.as_deref())
+                .unwrap_or(&[]);
+            (service.name.as_str(), deps)
+        })
+        .collect()
+}
+
 fn visit<'a>(
     name: &'a str,
-    app_spec: &'a AppSpec,
+    edges: &DependsOnEdges<'a>,
     path: &mut Vec<&'a str>,
     done: &mut HashSet<&'a str>,
 ) -> Option<Vec<String>> {
@@ -224,9 +258,9 @@ fn visit<'a>(
     }
 
     path.push(name);
-    if let Some(service) = app_spec.all_services().find(|s| s.name == name) {
-        for dep in &service.depends_on {
-            if let Some(cycle) = visit(dep, app_spec, path, done) {
+    if let Some(deps) = edges.get(name) {
+        for dep in *deps {
+            if let Some(cycle) = visit(dep, edges, path, done) {
                 return Some(cycle);
             }
         }
@@ -256,8 +290,15 @@ mod tests {
             command: None,
             entrypoint: None,
             healthcheck: None,
-            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            depends_on: (!depends_on.is_empty()).then(|| depends_on.iter().map(|d| d.to_string()).collect()),
         }
+    }
+
+    /// The app spec's own edges, as a deployment that overrides nothing sees them.
+    fn edges(spec: &AppSpec) -> DependsOnEdges<'_> {
+        spec.all_services()
+            .map(|s| (s.name.as_str(), s.depends_on.as_deref().unwrap_or(&[])))
+            .collect()
     }
 
     fn app_spec(app_services: Vec<ServiceSpec>) -> AppSpec {
@@ -285,13 +326,13 @@ mod tests {
             service("migrate", &["primary-db"]),
             service("primary-db", &[]),
         ]);
-        assert_eq!(find_depends_on_cycle(&spec), None);
+        assert_eq!(find_depends_on_cycle(&edges(&spec)), None);
     }
 
     #[test]
     fn a_dependency_cycle_is_reported() {
         let spec = app_spec(vec![service("api", &["worker"]), service("worker", &["api"])]);
-        let cycle = find_depends_on_cycle(&spec).expect("cycle must be detected");
+        let cycle = find_depends_on_cycle(&edges(&spec)).expect("cycle must be detected");
         assert_eq!(cycle.first(), cycle.last());
         assert!(cycle.contains(&"api".to_string()) && cycle.contains(&"worker".to_string()));
     }
@@ -330,7 +371,7 @@ mod tests {
             service("cache-warm", &["primary-db"]),
             service("primary-db", &[]),
         ]);
-        assert_eq!(find_depends_on_cycle(&spec), None);
+        assert_eq!(find_depends_on_cycle(&edges(&spec)), None);
     }
 
     mod full_spec {
@@ -467,6 +508,45 @@ deployments:
             let app = format!("{APP}    depends_on:\n      - nope\n");
             let err = check(&app, "").unwrap_err().to_string();
             assert!(err.contains("api depends on nope which is not defined"), "{err}");
+        }
+
+        /// The env for `prod` with `api` given the deployment-side `depends_on` in `deps`.
+        fn env_with_api_depends_on(deps: &str) -> String {
+            k8s_env("").replace(
+                "        prefix: /\n",
+                &format!("        prefix: /\n        depends_on: {deps}\n"),
+            )
+        }
+
+        #[test]
+        fn a_deployment_depends_on_must_name_a_known_service_too() {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(&env_with_api_depends_on("[nope]"), root.path());
+            let err = validate(&env, &app_spec(APP), "prod").unwrap_err().to_string();
+            assert!(
+                err.contains("Deployment prod makes service api depend on nope which is not defined"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_deployment_depends_on_replaces_the_apps_for_validation() {
+            // The app names a service only some environments run in the stack;
+            // a deployment without it says so with an empty list and validates.
+            let app = format!("{APP}    depends_on:\n      - primary-db\n");
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(&env_with_api_depends_on("[]"), root.path());
+            validate(&env, &app_spec(&app), "prod").unwrap();
+        }
+
+        #[test]
+        fn a_cycle_through_a_deployment_depends_on_is_rejected() {
+            let app =
+                format!("{APP}  worker:\n    type: internal\n    image: myorg/worker\n    depends_on:\n      - api\n");
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(&env_with_api_depends_on("[worker]"), root.path());
+            let err = validate(&env, &app_spec(&app), "prod").unwrap_err().to_string();
+            assert!(err.contains("Dependency cycle in depends_on"), "{err}");
         }
 
         #[test]

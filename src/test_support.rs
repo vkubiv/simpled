@@ -62,7 +62,7 @@ pub fn resolved_service(name: &str, service_type: ServiceType, depends_on: &[&st
         command: None,
         entrypoint: None,
         healthcheck: None,
-        depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+        depends_on: (!depends_on.is_empty()).then(|| depends_on.iter().map(|d| d.to_string()).collect()),
         resources: resources(),
         working_dir: None,
         excluded: false,

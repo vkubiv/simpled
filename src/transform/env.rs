@@ -436,6 +436,7 @@ fn merge_service(base: &DeploymentServiceSpecYaml, child: &DeploymentServiceSpec
         command: child.command.clone().or_else(|| base.command.clone()),
         entrypoint: child.entrypoint.clone().or_else(|| base.entrypoint.clone()),
         working_dir: child.working_dir.clone().or_else(|| base.working_dir.clone()),
+        depends_on: child.depends_on.clone().or_else(|| base.depends_on.clone()),
     }
 }
 
@@ -1136,6 +1137,10 @@ fn convert_deployment_service(
 
     let body_limit = convert_body_limit(yaml.body_limit.as_deref(), &format!("service '{}'", name))?;
 
+    if yaml.depends_on.iter().flatten().any(|d| d == name) {
+        return Err(anyhow!("Service '{}' cannot depend on itself", name));
+    }
+
     Ok(DeploymentServiceSpec {
         variant: yaml.variant.clone(),
         routes,
@@ -1147,6 +1152,7 @@ fn convert_deployment_service(
         command: yaml.command.clone().map(super::convert_service_command),
         entrypoint: yaml.entrypoint.clone().map(super::convert_service_command),
         working_dir: yaml.working_dir.clone(),
+        depends_on: yaml.depends_on.clone(),
     })
 }
 
@@ -1696,6 +1702,78 @@ deployments:
         assert_eq!(web.volumes[0].mount_path, "/app/shared");
         assert_eq!(web.volumes[1].mount_path, "/app/src");
         assert!(matches!(&web.command, Some(ServiceCommand::Shell(s)) if s == "npm run dev"));
+    }
+
+    #[test]
+    fn deployment_service_depends_on_is_parsed_and_replaced_under_extends() {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  base:
+    abstract: true
+    primary_host: web
+    application:
+      name: app
+    services:
+      web:
+        host: web
+        ports:
+          - "8080:80"
+      migrate:
+        ports:
+          - "8081:80"
+        depends_on:
+          - postgres
+  staging:
+    extends: base
+  dev:
+    extends: base
+    services:
+      migrate:
+        depends_on: []
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let staging = convert_env_spec(yaml.clone(), root.path(), Some("staging")).unwrap();
+        assert_eq!(
+            service(&staging, "migrate").depends_on,
+            Some(vec!["postgres".to_string()])
+        );
+        // A service the deployment says nothing about keeps the app spec's list.
+        assert_eq!(service(&staging, "web").depends_on, None);
+
+        // The child's list replaces the base's, and an empty one is kept as such.
+        let dev = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
+        assert_eq!(service(&dev, "migrate").depends_on, Some(vec![]));
+    }
+
+    #[test]
+    fn a_deployment_cannot_make_a_service_depend_on_itself() {
+        let raw = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  dev:
+    primary_host: web
+    application:
+      name: app
+    services:
+      migrate:
+        depends_on:
+          - migrate
+"#;
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = convert_env_spec(yaml, root.path(), Some("dev"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Service 'migrate' cannot depend on itself"), "{err}");
     }
 
     /// `--path` points simpled at a project elsewhere, so a path written in the

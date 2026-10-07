@@ -484,7 +484,11 @@ impl ServiceResolver<'_> {
                 .and_then(|s| s.entrypoint.clone())
                 .or_else(|| app_service.entrypoint.clone()),
             healthcheck: app_service.healthcheck.clone(),
-            depends_on: app_service.depends_on.clone(),
+            // The deployment's list replaces the app's: what has to be up first
+            // depends on which dependencies the environment runs in the stack.
+            depends_on: deployment_service
+                .and_then(|s| s.depends_on.clone())
+                .or_else(|| app_service.depends_on.clone()),
             resources: resources.clone(),
             // A deployment entry that only sets routing (host, prefix, replicas)
             // must not wipe the ports the app spec declares.
@@ -1162,7 +1166,7 @@ mod tests {
             command: None,
             entrypoint: None,
             healthcheck: None,
-            depends_on: vec![],
+            depends_on: None,
         }
     }
 
@@ -1339,6 +1343,33 @@ deployments:
             assert_eq!(spec.ingress.rules.len(), 1);
             assert_eq!(spec.ingress.rules[0].domain_name, "shop.example.com");
             assert_eq!(spec.ingress.rules[0].services[0].service_name, "api");
+        }
+
+        #[test]
+        fn a_deployment_depends_on_replaces_the_app_specs() {
+            // The job names the database the app spec knows about; whether that
+            // database is in the stack is for each deployment to say.
+            let app = format!(
+                "{APP}  migrate:\n    type: job\n    image: myorg/migrate\n    depends_on:\n      - primary-db\n"
+            );
+            let find = |spec: &EnvironmentResolvedSpec, name: &str| {
+                spec.current_deployment
+                    .services
+                    .iter()
+                    .find(|s| s.full_name == name)
+                    .unwrap()
+                    .depends_on
+                    .clone()
+            };
+
+            let spec = resolve_yaml(&app, &env("k8s", REGISTRY, API_ROUTED, "")).unwrap();
+            assert_eq!(find(&spec, "migrate"), Some(vec!["primary-db".to_string()]));
+            assert_eq!(find(&spec, "api"), None);
+
+            // Managed database: the deployment declares the job needs nothing first.
+            let external = format!("{API_ROUTED}\n      migrate:\n        depends_on: []");
+            let spec = resolve_yaml(&app, &env("k8s", REGISTRY, &external, "")).unwrap();
+            assert_eq!(find(&spec, "migrate"), Some(vec![]));
         }
 
         #[test]

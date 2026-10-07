@@ -115,7 +115,7 @@ where
             continue;
         }
         let mut depends_on = HashMap::new();
-        for dep in &service.depends_on {
+        for dep in service.dependencies() {
             if !included.contains(dep) {
                 continue;
             }

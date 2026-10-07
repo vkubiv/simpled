@@ -80,7 +80,7 @@ pub fn service(deployment: &str, document: &str, env_type: &DeploymentEnvType) -
         ])),
         entrypoint: None,
         healthcheck: None,
-        depends_on: vec![],
+        depends_on: None,
         resources: ResourcesSpec {
             replicas: 1,
             requests: ResourceLimits {

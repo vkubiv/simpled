@@ -361,6 +361,10 @@ pub struct DeploymentServiceSpecYaml {
     // the undockerized environment is written there as `.env` and the service's
     // secrets are copied alongside it. Setting it for K8S/Docker is an error.
     pub working_dir: Option<String>,
+    // Replaces the app spec's `depends_on` for this deployment. An empty list
+    // means nothing in the stack has to be up first, which is how a job whose
+    // database is external (managed Postgres) is declared.
+    pub depends_on: Option<Vec<String>>,
 }
 
 /// The routing a service gets on one host alias, inside `hosts:`. Same fields

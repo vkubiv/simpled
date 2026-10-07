@@ -109,8 +109,10 @@ pub struct ServiceSpec {
     // Container health probe, same as docker-compose `healthcheck`.
     pub healthcheck: Option<Healthcheck>,
     // Names of services that must be started before this one, same as
-    // docker-compose `depends_on`.
-    pub depends_on: Vec<String>,
+    // docker-compose `depends_on`. `None` when the spec does not mention it,
+    // which for a job means "every long-running service"; `Some(vec![])` is an
+    // explicit "nothing in the stack" (the job's dependencies are external).
+    pub depends_on: Option<Vec<String>>,
 }
 
 // Overrides the default command/entrypoint of a service's image. Mirrors
@@ -542,6 +544,10 @@ pub struct DeploymentServiceSpec {
     pub entrypoint: Option<ServiceCommand>,
     // local-only: working directory of a host-run (non-dockerized) service.
     pub working_dir: Option<String>,
+    // Replaces the app spec's `depends_on` for this deployment only: the
+    // services that must be up first are an environment matter when the same
+    // dependency is a stack service in one environment and external in another.
+    pub depends_on: Option<Vec<String>>,
 }
 
 /// One host alias a service answers on, with the prefixes it claims there.

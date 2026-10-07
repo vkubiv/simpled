@@ -1500,7 +1500,7 @@ mod tests {
             command: None,
             entrypoint: None,
             healthcheck: None,
-            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            depends_on: (!depends_on.is_empty()).then(|| depends_on.iter().map(|d| d.to_string()).collect()),
             resources: ResourcesSpec {
                 replicas: 1,
                 requests: ResourceLimits {
@@ -1945,6 +1945,27 @@ mkdir -p \"/var/"
         let job = script.find("run_job 'prod_migrate'").unwrap();
         assert!(phase1 < job);
         assert!(script.contains("All services were started in phase 1"));
+        assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
+    }
+
+    #[test]
+    fn job_with_external_dependencies_runs_before_anything_starts() {
+        // An explicit empty list: the database is managed outside the stack, so
+        // the migration runs first and the whole stack follows it.
+        let mut migrate = service("migrate", ServiceType::Job, &[]);
+        migrate.depends_on = Some(vec![]);
+        let spec = spec(vec![service("api", ServiceType::Public, &[]), migrate]);
+        let (dir, script) = generate_swarm_to_temp(&spec);
+
+        let nothing_first = script
+            .find("No job dependencies declared, nothing to start first.")
+            .unwrap();
+        let job = script.find("run_job 'prod_migrate'").unwrap();
+        let stack = script
+            .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false")
+            .unwrap();
+        assert!(nothing_first < job && job < stack, "{}", script);
+        assert_eq!(script.matches("docker stack deploy -c prod/").count(), 1, "{}", script);
         assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
     }
 

@@ -108,7 +108,7 @@ extra_services:
 | `secrets` | list | no | Secrets to provide. See below. |
 | `ports` | list | no | Ports to expose. On Kubernetes they become the Service's ports; a service without ports gets no Service object. |
 | `volumes` | list | no | Volume mounts. Named volumes must be declared in the top-level `volumes:` list. |
-| `depends_on` | list | no | Services that must be running before this one starts. Drives the ordering of the generated Docker deploy scripts and the local compose file; ignored for Kubernetes. Cycles are rejected. |
+| `depends_on` | list | no | Services that must be running before this one starts. Drives the ordering of the generated Docker deploy scripts and the local compose file; ignored for Kubernetes. Cycles are rejected. For a `job`, leaving it out means every long-running service, and an explicit `[]` means nothing in the stack (its dependencies are external). A deployment may replace the list in `envspec.yaml`. |
 
 #### Service types
 
@@ -129,10 +129,39 @@ Docker deployment that contains at least one job runs in three phases:
    that fails aborts the deploy — nothing else is rolled out.
 3. **Deploy the rest of the stack**, once the migrations have been applied.
 
-A job that declares no `depends_on` is treated as depending on *every*
+A job that does not mention `depends_on` is treated as depending on *every*
 long-running service, so phase 1 starts the whole stack. Declare the dependencies
 explicitly (`depends_on: [primary-db]`) to keep phase 1 small and to guarantee that
-nothing serves traffic against a schema the migration has not touched yet.
+nothing serves traffic against a schema the migration has not touched yet. On a
+fresh database the fallback is also a deadlock: a service that cannot start without
+its tables keeps phase 1 from converging, so the migration never runs.
+
+An explicit empty list, `depends_on: []`, is the opposite statement: the job needs
+nothing from the stack, because what it talks to (a managed database, say) lives
+outside it. Phase 1 then starts nothing and the job runs first.
+
+Which of the two is right is usually an environment question — the same database is
+a stack service on the dev box and RDS in production — so a deployment can replace a
+service's list in `envspec.yaml`:
+
+```yaml
+# appspec.yaml: by itself the job needs nothing from the stack
+app_services:
+  migrate:
+    type: job
+    depends_on: []
+
+# envspec.yaml, dev: here the database is an extra service, start it first
+deployments:
+  dev:
+    services:
+      migrate:
+        depends_on: [primary-db]
+```
+
+The deployment's list replaces the app's (it is not merged), is validated against
+that deployment's services, and is inherited through `extends` like any other
+per-service field.
 
 Readiness in phase 1 means:
 
@@ -861,6 +890,7 @@ Some things outside the stack do not follow an instance: a tunnel or OAuth redir
 | `ports` | list | Published host ports, `"external:internal"`. The gateway routes to `external`, so it must equal the container's port; use `expose` when no host port is wanted. |
 | `expose` | list | Container ports the gateway may route to **without** publishing them on the host. The first entry wins as the upstream port, ahead of `ports`. |
 | `working_dir` | string | Local only. Directory of a host-run (non-dockerized) service. See [working_dir](#working_dir). |
+| `depends_on` | list | Replaces the app spec's `depends_on` for this deployment. `[]` means nothing in the stack has to be up first. See [Jobs and deployment ordering](#jobs-and-deployment-ordering). |
 
 #### expose
 

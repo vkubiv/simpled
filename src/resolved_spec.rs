@@ -145,7 +145,10 @@ pub struct ServiceResolvedSpec {
     pub healthcheck: Option<Healthcheck>,
 
     // full_names of the services that must be running before this one starts.
-    pub depends_on: Vec<String>,
+    // `None` when neither the app spec nor the deployment declares it; for a
+    // job that means every long-running service. `Some(vec![])` is an explicit
+    // "nothing in the stack": the dependencies are external to it.
+    pub depends_on: Option<Vec<String>>,
 
     // Replicas and CPU/memory for this service: the deployment's per-service
     // override when there is one, otherwise the deployment defaults.
@@ -274,7 +277,7 @@ impl DeploymentResolvedSpec {
         // Marked before recursing so a cycle (rejected by the validator, but the
         // generator must not hang on one) cannot loop forever.
         placed.push(&job.full_name);
-        for dep in &job.depends_on {
+        for dep in job.dependencies() {
             if let Some(dep_job) = jobs.iter().find(|j| &j.full_name == dep) {
                 self.place_job(dep_job, jobs, ordered, placed);
             }
@@ -296,23 +299,24 @@ impl DeploymentResolvedSpec {
     /// Long-running services that must be up before any job runs: the transitive
     /// closure of `depends_on` over every job, with jobs themselves removed.
     ///
-    /// A job that declares no `depends_on` is treated as depending on every
-    /// long-running service. Without that fallback, upgrading to phased deploys
-    /// would start running jobs before the database exists for specs written
-    /// before `depends_on` existed.
+    /// A job that does not mention `depends_on` at all is treated as depending
+    /// on every long-running service. Without that fallback, upgrading to phased
+    /// deploys would start running jobs before the database exists for specs
+    /// written before `depends_on` existed. An explicit empty list is the
+    /// opposite: nothing in the stack is needed, the dependencies are external.
     pub fn job_prerequisites(&self) -> Vec<&ServiceResolvedSpec> {
         let jobs = self.jobs_in_order();
         if jobs.is_empty() {
             return Vec::new();
         }
 
-        if jobs.iter().any(|j| j.depends_on.is_empty()) {
+        if jobs.iter().any(|j| j.depends_on.is_none()) {
             return self.long_running_services();
         }
 
         let mut needed: Vec<&str> = Vec::new();
         for job in &jobs {
-            for dep in &job.depends_on {
+            for dep in job.dependencies() {
                 self.collect_dependencies(dep, &mut needed);
             }
         }
@@ -335,9 +339,17 @@ impl DeploymentResolvedSpec {
             return;
         }
         needed.push(&service.full_name);
-        for dep in &service.depends_on {
+        for dep in service.dependencies() {
             self.collect_dependencies(dep, needed);
         }
+    }
+}
+
+impl ServiceResolvedSpec {
+    /// The declared dependencies, empty when none were declared. Callers that
+    /// must tell the two apart read `depends_on` directly.
+    pub fn dependencies(&self) -> &[String] {
+        self.depends_on.as_deref().unwrap_or(&[])
     }
 }
 
@@ -413,6 +425,16 @@ mod tests {
             resolved_service("primary-db", ServiceType::Internal, &[]),
         ]);
         assert_eq!(names(&deployment.job_prerequisites()), vec!["api", "primary-db"]);
+    }
+
+    #[test]
+    fn a_job_with_an_explicit_empty_depends_on_needs_nothing_from_the_stack() {
+        // The database is external to this deployment: nothing to start first.
+        let mut migrate = resolved_service("migrate", ServiceType::Job, &[]);
+        migrate.depends_on = Some(vec![]);
+        let deployment = resolved_deployment(vec![resolved_service("api", ServiceType::Public, &[]), migrate]);
+        assert!(deployment.job_prerequisites().is_empty());
+        assert_eq!(names(&deployment.jobs_in_order()), vec!["migrate"]);
     }
 
     #[test]

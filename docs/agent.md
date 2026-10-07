@@ -240,7 +240,10 @@ one inline with `extends:`.
   secret, so one document serves the whole list. An `aws:` written on the secret
   itself is still read whole unless it sets `jq:`.
 - A `job` with no `depends_on` is treated as depending on *every* long-running service,
-  which starts the whole stack before the migration. Always list its dependencies.
+  which starts the whole stack before the migration — and never runs it when a service
+  cannot start without the tables. Always list its dependencies; `depends_on: []` says it
+  needs nothing from the stack (external database). When the answer differs per
+  environment, set `depends_on` on the service in the deployment's `services:` instead.
 - Give a job's dependency a `healthcheck`; without one "ready" only means the container
   was started.
 - `secrets_folder`, `working_dir`, `exclude_services`, and inline literal secret values

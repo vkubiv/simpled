@@ -887,7 +887,7 @@ mod tests {
             command: None,
             entrypoint: None,
             healthcheck: None,
-            depends_on: vec![],
+            depends_on: None,
             resources: crate::spec::ResourcesSpec {
                 replicas: 1,
                 requests: crate::spec::ResourceLimits {
