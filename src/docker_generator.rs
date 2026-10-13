@@ -13,9 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DOCKER_NETWORK: &str = "common_network";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
 // would change the ingress underneath a deployment that touched nothing else.
-// nginx tracks a stable minor line; certbot is pinned exactly. Traefik stays
-// on v2 because v3 changes the configuration format.
-const NGINX_IMAGE: &str = "nginx:1.31-alpine";
+// nginx and certbot are pinned exactly. Traefik stays on v2 because v3
+// changes the configuration format.
+const NGINX_IMAGE: &str = "nginx:1.31.6-alpine";
 const TRAEFIK_IMAGE: &str = "traefik:v2.10";
 const CERTBOT_IMAGE: &str = "certbot/certbot:v5.8.0";
 const TRAEFIK_RESOLVER: &str = "myresolver";

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PATH: &str = "/.well-known/simpled/version";
-pub const IMAGE: &str = "nginx:1.31-alpine";
+pub const IMAGE: &str = "nginx:1.31.6-alpine";
 const PORT: u16 = 80;
 const CONF_VARIABLE: &str = "SIMPLED_VERSION_CONF";
 
