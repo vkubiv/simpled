@@ -183,6 +183,190 @@ namespace primary_db.Migrations
                     b.ToTable("confirmation_tokens");
                 });
 
+            modelBuilder.Entity("db.Entities.DeployEnvironmentEntity", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.Property<string>("Path")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("path");
+
+                    b.Property<int>("RepositoryId")
+                        .HasColumnType("integer")
+                        .HasColumnName("repository_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RepositoryId", "Path")
+                        .IsUnique();
+
+                    b.ToTable("environments");
+                });
+
+            modelBuilder.Entity("db.Entities.DeploymentEntity", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("ApplicationName")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("application_name");
+
+                    b.Property<string>("CheckError")
+                        .HasColumnType("text")
+                        .HasColumnName("check_error");
+
+                    b.Property<DateTime?>("CheckedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("checked_at");
+
+                    b.Property<int>("EnvironmentId")
+                        .HasColumnType("integer")
+                        .HasColumnName("environment_id");
+
+                    b.Property<int>("FailureCount")
+                        .HasColumnType("integer")
+                        .HasColumnName("failure_count");
+
+                    b.Property<DateTime?>("LiveDeployedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("live_deployed_at");
+
+                    b.Property<string>("LiveVersion")
+                        .HasColumnType("text")
+                        .HasColumnName("live_version");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.Property<string>("RepoVersion")
+                        .HasColumnType("text")
+                        .HasColumnName("repo_version");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.Property<DateTime?>("StatusSince")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("status_since");
+
+                    b.Property<string>("Url")
+                        .HasColumnType("text")
+                        .HasColumnName("url");
+
+                    b.Property<string>("VersionConstraint")
+                        .HasColumnType("text")
+                        .HasColumnName("version_constraint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EnvironmentId", "Name")
+                        .IsUnique();
+
+                    b.ToTable("deployments");
+                });
+
+            modelBuilder.Entity("db.Entities.DeploymentEventEntity", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("At")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("at");
+
+                    b.Property<int>("DeploymentId")
+                        .HasColumnType("integer")
+                        .HasColumnName("deployment_id");
+
+                    b.Property<string>("Details")
+                        .HasColumnType("text")
+                        .HasColumnName("details");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("kind");
+
+                    b.Property<string>("PreviousVersion")
+                        .HasColumnType("text")
+                        .HasColumnName("previous_version");
+
+                    b.Property<string>("Version")
+                        .HasColumnType("text")
+                        .HasColumnName("version");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DeploymentId", "At");
+
+                    b.ToTable("deployment_events");
+                });
+
+            modelBuilder.Entity("db.Entities.GitHubConnectionEntity", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("GitHubLogin")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("github_login");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.Property<int>("OrganizationId")
+                        .HasColumnType("integer")
+                        .HasColumnName("organization_id");
+
+                    b.Property<string>("TokenCiphertext")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("token_ciphertext");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OrganizationId", "Name")
+                        .IsUnique();
+
+                    b.ToTable("github_connections");
+                });
+
             modelBuilder.Entity("db.Entities.OrgInvitationEntity", b =>
                 {
                     b.Property<int>("Id")
@@ -379,6 +563,64 @@ namespace primary_db.Migrations
                     b.ToTable("project_teams");
                 });
 
+            modelBuilder.Entity("db.Entities.RepositoryEntity", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("DefaultBranch")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("default_branch");
+
+                    b.Property<int>("GitHubConnectionId")
+                        .HasColumnType("integer")
+                        .HasColumnName("github_connection_id");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.Property<string>("Owner")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("owner");
+
+                    b.Property<int>("ProjectId")
+                        .HasColumnType("integer")
+                        .HasColumnName("project_id");
+
+                    b.Property<string>("SyncError")
+                        .HasColumnType("text")
+                        .HasColumnName("sync_error");
+
+                    b.Property<DateTime?>("SyncedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("synced_at");
+
+                    b.Property<string>("SyncedRevision")
+                        .HasColumnType("text")
+                        .HasColumnName("synced_revision");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("GitHubConnectionId");
+
+                    b.HasIndex("ProjectId", "Owner", "Name")
+                        .IsUnique();
+
+                    b.ToTable("repositories");
+                });
+
             modelBuilder.Entity("db.Entities.TeamEntity", b =>
                 {
                     b.Property<int>("Id")
@@ -462,6 +704,50 @@ namespace primary_db.Migrations
                     b.Navigation("Account");
                 });
 
+            modelBuilder.Entity("db.Entities.DeployEnvironmentEntity", b =>
+                {
+                    b.HasOne("db.Entities.RepositoryEntity", "Repository")
+                        .WithMany("Environments")
+                        .HasForeignKey("RepositoryId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Repository");
+                });
+
+            modelBuilder.Entity("db.Entities.DeploymentEntity", b =>
+                {
+                    b.HasOne("db.Entities.DeployEnvironmentEntity", "Environment")
+                        .WithMany("Deployments")
+                        .HasForeignKey("EnvironmentId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Environment");
+                });
+
+            modelBuilder.Entity("db.Entities.DeploymentEventEntity", b =>
+                {
+                    b.HasOne("db.Entities.DeploymentEntity", "Deployment")
+                        .WithMany()
+                        .HasForeignKey("DeploymentId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Deployment");
+                });
+
+            modelBuilder.Entity("db.Entities.GitHubConnectionEntity", b =>
+                {
+                    b.HasOne("db.Entities.OrganizationEntity", "Organization")
+                        .WithMany()
+                        .HasForeignKey("OrganizationId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Organization");
+                });
+
             modelBuilder.Entity("db.Entities.OrgInvitationEntity", b =>
                 {
                     b.HasOne("db.Entities.AccountEntity", "InvitedBy")
@@ -530,6 +816,25 @@ namespace primary_db.Migrations
                     b.Navigation("Team");
                 });
 
+            modelBuilder.Entity("db.Entities.RepositoryEntity", b =>
+                {
+                    b.HasOne("db.Entities.GitHubConnectionEntity", "GitHubConnection")
+                        .WithMany()
+                        .HasForeignKey("GitHubConnectionId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("db.Entities.ProjectEntity", "Project")
+                        .WithMany()
+                        .HasForeignKey("ProjectId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("GitHubConnection");
+
+                    b.Navigation("Project");
+                });
+
             modelBuilder.Entity("db.Entities.TeamEntity", b =>
                 {
                     b.HasOne("db.Entities.OrganizationEntity", "Organization")
@@ -560,6 +865,11 @@ namespace primary_db.Migrations
                     b.Navigation("Team");
                 });
 
+            modelBuilder.Entity("db.Entities.DeployEnvironmentEntity", b =>
+                {
+                    b.Navigation("Deployments");
+                });
+
             modelBuilder.Entity("db.Entities.OrganizationEntity", b =>
                 {
                     b.Navigation("Members");
@@ -568,6 +878,11 @@ namespace primary_db.Migrations
             modelBuilder.Entity("db.Entities.ProjectEntity", b =>
                 {
                     b.Navigation("Teams");
+                });
+
+            modelBuilder.Entity("db.Entities.RepositoryEntity", b =>
+                {
+                    b.Navigation("Environments");
                 });
 
             modelBuilder.Entity("db.Entities.TeamEntity", b =>

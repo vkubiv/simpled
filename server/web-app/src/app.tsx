@@ -9,6 +9,7 @@ import { paths } from "./core/primitives/routes";
 import { CheckEmailRoute } from "./pages/check-email/check-email-route";
 import { ConfirmEmailRoute } from "./pages/confirm-email/confirm-email-route";
 import { ForgotPasswordRoute } from "./pages/forgot-password/forgot-password-route";
+import { GitHubRoute } from "./pages/github/github-route";
 import { InvitationRoute } from "./pages/invitation/invitation-route";
 import { MembersRoute } from "./pages/members/members-route";
 import { NewOrgRoute } from "./pages/new-org/new-org-route";
@@ -111,6 +112,7 @@ function OrgArea({ deps }: { deps: AppDeps }) {
           <Route path="teams/:teamId" element={<TeamRoute deps={deps} orgId={orgId} />} />
           <Route path="projects" element={<ProjectsRoute deps={deps} orgId={orgId} />} />
           <Route path="projects/:projectId" element={<ProjectRoute deps={deps} orgId={orgId} />} />
+          <Route path="github" element={<GitHubRoute deps={deps} orgId={orgId} />} />
           <Route path="settings" element={<OrgSettingsRoute deps={deps} orgId={orgId} />} />
           <Route path="*" element={<Navigate to={paths.org(orgId)} replace />} />
         </Routes>

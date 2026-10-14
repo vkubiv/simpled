@@ -26,9 +26,9 @@ src/
   app-deps.ts          AppDeps: client, session, authHandler, meRepository, orgRepository
   core/                no React
     auth/              AccountSession, sessionFetch, createAuthHandler
-    ops/               auth, org, invitation, team, project
+    ops/               auth, org, invitation, team, project, monitoring
     repositories/      MeRepository (account + organizations), OrgRepository (the organization shown)
-    primitives/        errors, forms (validators), load-status, roles, routes (paths)
+    primitives/        errors, forms (validators), load-status, roles, routes (paths), time (timeAgo)
   shell/               ShellController + ShellLayout: org switcher, nav, not-found
   pages/<page>/        <page>-model.ts, -controller.ts, -page.tsx, -route.tsx, -controller.test.ts
   components/ui.tsx    presentational pieces: AuthCard, Field, Notice, RoleBadge, Section, ...
@@ -36,8 +36,9 @@ src/
 ```
 
 Pages: `sign-in`, `register`, `check-email`, `confirm-email`, `forgot-password`, `reset-password`, `invitation`,
-`new-org`, and under `/orgs/:orgId`: `org-overview`, `projects`, `project`, `teams`, `team`, `members`,
-`org-settings`.
+`new-org`, and under `/orgs/:orgId`: `org-overview`, `projects`, `project`, `teams`, `team`, `members`, `github`,
+`org-settings`. `project-deployments` is not a route: `ProjectRoute` renders its own `<Subtree>` into the project
+page's `deployments` slot, and its controller re-reads the statuses every 15 s until disposed.
 
 ## Session
 

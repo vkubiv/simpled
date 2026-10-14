@@ -5,6 +5,7 @@ set windows-shell := ["cmd.exe", "/c"]
 build:
     docker build -f ./image/Dockerfile --no-cache -t simpled-server/primary:latest .
     docker build -f ./main-svc/Dockerfile -t simpled-server/main-svc:latest --build-arg BASE_IMAGE=simpled-server/primary:latest .
+    docker build -f ./monitor-svc/Dockerfile -t simpled-server/monitor-svc:latest --build-arg BASE_IMAGE=simpled-server/primary:latest .
     docker build -f ./db-setup/Dockerfile -t simpled-server/db-setup:latest --build-arg BASE_IMAGE=simpled-server/primary:latest .
 
 # Restore, build, unit tests.

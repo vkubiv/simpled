@@ -18,6 +18,17 @@ extra_services:
       timeout: 3s
       retries: 12
 
+  # Plays GitHub's API and the gateway of every monitored deployment (fakes/server.mjs); e2e tests script it
+  # through http://localhost:$port(fakes)/_fakes. No image to build: the script is mounted.
+  simpled-fakes:
+    type: internal
+    image: node:24.11.1-alpine
+    command: ["node", "/fakes/server.mjs"]
+    ports:
+      - "$port(fakes):3000"
+    volumes:
+      - ../fakes:/fakes:ro
+
   # Catches every email; the web UI and GET /api/mails are on http://localhost:$port(mailer).
   simpled-mailer:
     type: internal

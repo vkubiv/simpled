@@ -7,6 +7,8 @@ export const OrgPermissions = z.object({
   canManageMembers: z.boolean(),
   canCreateTeam: z.boolean(),
   canCreateProject: z.boolean(),
+  /** Add, rotate and remove the organization's GitHub tokens. */
+  canManageGitHubConnections: z.boolean(),
   /** Roles the caller may invite with or assign. */
   assignableRoles: z.array(OrgRole),
 });

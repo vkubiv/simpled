@@ -16,6 +16,10 @@ environment:
     - SENTRY_DSN                    # empty disables Sentry
     - CORS_ORIGINS                  # comma-separated browser origins, only when the web app is served from another origin
     - AUTH_RATE_LIMIT_PER_MINUTE    # per client IP on the auth endpoints; empty means 20
+    - GITHUB_API_URL                # empty means https://api.github.com
+    - PROBE_PROXY_URL               # local only: monitor-svc reaches every deployment through simpled-fakes
+    - MONITOR_INTERVAL_SECONDS      # how often each deployment's version endpoint is checked; empty means 60
+    - REPOSITORY_SYNC_INTERVAL_SECONDS  # how often linked repositories' spec files are re-read; empty means 600
 
   relative:
     - WEB_APP_URL="/"               # links in emails (confirm-email, reset-password, invitations)
@@ -23,6 +27,7 @@ environment:
 secrets:
   db_password:
   sendgrid_apikey:
+  github_token_key:                 # encrypts the GitHub tokens organizations save; changing it voids them
 
 app_services:
   main-svc:
@@ -39,6 +44,7 @@ app_services:
     secrets:
       - db_password
       - sendgrid_apikey
+      - github_token_key
 
   # The React SPA (web-app/), static files on nginx. `/api` goes to main-svc, everything else here.
   web-app:
@@ -53,6 +59,24 @@ app_services:
       timeout: 3s
       retries: 12
 
+  # Re-syncs linked repositories and checks every deployment's version endpoint. Run exactly one.
+  monitor-svc:
+    type: internal
+    image: simpled-server/monitor-svc
+    # /health fails once the monitor loop has stalled.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    environment:
+      - $all
+    secrets:
+      - db_password
+      - sendgrid_apikey
+      - github_token_key
+
   db-setup:
     type: job
     image: simpled-server/db-setup
@@ -61,3 +85,4 @@ app_services:
     secrets:
       - db_password
       - sendgrid_apikey
+      - github_token_key

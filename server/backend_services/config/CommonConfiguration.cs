@@ -26,4 +26,22 @@ public record CommonConfiguration
 
     /// <summary>Requests per minute per client IP on the auth endpoints.</summary>
     public required int AuthRateLimitPerMinute { get; init; }
+
+    /// <summary>GitHub's REST API; the e2e stack points it at simpled-fakes.</summary>
+    public required string GitHubApiUrl { get; init; }
+
+    /// <summary>Encrypts the GitHub tokens organizations save (TokenCipher).</summary>
+    public required string GitHubTokenKey { get; init; }
+
+    /// <summary>
+    /// An HTTP proxy the monitor reaches deployments through. Local only: simpled-fakes plays every deployment's
+    /// gateway, whatever its host name.
+    /// </summary>
+    public required string? ProbeProxyUrl { get; init; }
+
+    /// <summary>How often monitor-svc checks each deployment's version endpoint.</summary>
+    public required TimeSpan MonitorInterval { get; init; }
+
+    /// <summary>How often monitor-svc re-reads each linked repository's spec files.</summary>
+    public required TimeSpan RepositorySyncInterval { get; init; }
 }

@@ -13,4 +13,5 @@ export const paths = {
   projects: (orgId: number) => `/orgs/${orgId}/projects`,
   project: (orgId: number, projectId: number) => `/orgs/${orgId}/projects/${projectId}`,
   settings: (orgId: number) => `/orgs/${orgId}/settings`,
+  github: (orgId: number) => `/orgs/${orgId}/github`,
 };

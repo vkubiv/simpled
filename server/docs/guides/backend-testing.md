@@ -17,7 +17,9 @@ utest/
   Core/Operations/      TestOrganizationOps, TestConfirmationTokenOps, TestAuthSessionOps
   Core/Validations/     TestAccountValidation
   Core/Rules/           TestOrgPermissions (theories over the role matrix)
+  Core/Primitive/       TestSpecFiles (envspec / appspec reading)
   MainTest/             one Test<Controller> per controller
+  MonitorTest/          TestMonitorRound (monitor-svc's round, without the worker)
   TestSupport/          InMemoryPrimaryDb, CallContextSupport, AccountSupport, OrgSupport,
                         ControllerAssert, VRAssert, ControllerHelper, TestDoubles/RecordingMailer
 ```
@@ -36,6 +38,10 @@ Naming: `Test<Subject>` classes, `Test<Action>_<Scenario>` methods (`TestSetRole
 | `OrgSupport.Claims(account)` | the `MainClaims` a signed-in request would carry |
 | `OrgSupport.RoleOf(db, org, account)` | the stored role |
 | `RecordingMailer` | records mails; `.UserMailer()` for controllers, `.LastToken(email, template)` reads the link's token |
+| `FakeGitHub` | tokens and repositories a test adds (`AddToken`, `AddRepository`); files change between syncs, `Unreadable` and `Down` make reads fail |
+| `FakeVersionProbe` | `Answer(url, application, deployment, version)`; any other URL fails like a dead gateway |
+| `MonitorSupport.GitHub()`, `AddShop(github)` | GitHub with `MonitorSupport.Token`, and acme/shop holding a prod envspec and an appspec |
+| `MonitorSupport.CreateConnection(db, org)`, `LinkRepository(db, project, connection, github)` | a connection and a linked, synced repository |
 | `ControllerAssert.HasValidationError(result, code, field)`, `IsOkResult(result)` | assertions on action results |
 
 Add a helper to `TestSupport` when a second test needs the same setup.

@@ -17,6 +17,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "main-svc", "main-svc\main-s
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "utest", "utest\utest.csproj", "{684D3009-C70B-4891-B3BD-E626EA450619}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "monitor-svc", "monitor-svc\monitor-svc.csproj", "{5A399285-B475-42F6-BEB7-57BC83FDE182}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -111,6 +113,18 @@ Global
 		{684D3009-C70B-4891-B3BD-E626EA450619}.Release|x64.Build.0 = Release|Any CPU
 		{684D3009-C70B-4891-B3BD-E626EA450619}.Release|x86.ActiveCfg = Release|Any CPU
 		{684D3009-C70B-4891-B3BD-E626EA450619}.Release|x86.Build.0 = Release|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Debug|x64.Build.0 = Debug|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Debug|x86.Build.0 = Debug|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Release|x64.ActiveCfg = Release|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Release|x64.Build.0 = Release|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Release|x86.ActiveCfg = Release|Any CPU
+		{5A399285-B475-42F6-BEB7-57BC83FDE182}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
