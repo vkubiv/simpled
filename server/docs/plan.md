@@ -32,7 +32,7 @@ server/
 
 Infra: Postgres 17 and the SendGrid mock mailer. No Redis: confirmation tokens live in a table, rate limiting is in-process.
 
-Local gateway `localhost:7080`: `/api` → main-svc (prefix stripped), `/` → web-app (nginx). The SPA and API share an origin, so the browser uses an HttpOnly session cookie. The future CLI uses a bearer token on the same `auth_sessions` table (handler already supports both).
+Local gateway `localhost:7080`: `/api` → main-svc (prefix stripped), `/` → web-app (nginx; the Vite dev server on :7000 under `just infra`). The SPA and API share an origin, so the browser uses an HttpOnly session cookie. The future CLI uses a bearer token on the same `auth_sessions` table (handler already supports both).
 
 ## Data model
 
@@ -102,5 +102,5 @@ Role checks are validations (`OrgValidation.TryGetMembership(orgId, claims.Accou
 1. ✅ Backend scaffold: solution, config, auth and sessions, accounts (register/confirm/login/reset), mailer, db-setup, bundle specs; `just infra` + `just run` work.
 2. ✅ Organizations, members, invitations, teams, projects, roles + `utest`.
 3. ✅ `backend-client` + `e2e` (mock mailer for tokens; `simpled test e2e` on a fresh stack).
-4. `web-app`, its controller tests, and e2e cases driving its controllers.
+4. ✅ `web-app`, its controller tests, and e2e cases driving its controllers (`e2e/test/web-app/`).
 5. CLAUDE.md and guides adapted to this repo.
