@@ -43,6 +43,23 @@ add-migration NAME:
 apply-migrations:
     cd backend_services && just apply-migrations
 
+# Install the npm workspace (backend-client, e2e). Once, and after package.json changes.
+npm-install:
+    npm install
+
+# Typecheck and lint the TypeScript packages.
+check-ts:
+    npm run check
+
+# The e2e suite on a fresh stack of its own (testspec.yaml), on the first free instance so it runs next to
+# `just run`; needs `just build` for current images.
+test-e2e:
+    simpled test e2e --instance auto
+
+# The e2e suite against what is already running on the gateway port (`just run`, or `just infra` + main-svc from the IDE).
+test-e2e-attached:
+    simpled test e2e --no-up
+
 # Validate the bundle the way CI will (checks appspec and that images exist locally).
 verify:
     simpled app-bundle verify

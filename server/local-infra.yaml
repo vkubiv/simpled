@@ -3,7 +3,7 @@ extra_services:
     type: internal
     image: postgres:17-alpine
     ports:
-      - "5440:5432"
+      - "$port(db):5432"
     environment:
       - POSTGRES_USER=main_user
       - POSTGRES_PASSWORD_FILE=/secrets/db_password
@@ -18,11 +18,11 @@ extra_services:
       timeout: 3s
       retries: 12
 
-  # Catches every email; the web UI and GET /api/mails are on http://localhost:3020.
+  # Catches every email; the web UI and GET /api/mails are on http://localhost:$port(mailer).
   simpled-mailer:
     type: internal
     image: ghashange/sendgrid-mock:1.9.0
     ports:
-      - "3020:3000"
+      - "$port(mailer):3000"
     environment:
       - API_KEY=sendgrid-mock-api-key

@@ -11,7 +11,7 @@ Architecture sources:
 ```
 server/
 ├── CLAUDE.md  justfile  package.json          npm workspace: backend-client, e2e, web-app (from step 3)
-├── appspec.yaml  localenv.yaml  local-infra.yaml  testspec.yaml  e2e-infra.yaml  secrets.example/
+├── appspec.yaml  localenv.yaml  local-infra.yaml  testspec.yaml  secrets.example/
 ├── docs/                                      plan.md, guides/ (backend, backend-testing, backend-client, e2e, frontend)
 ├── backend_services/                          .NET solution
 │   ├── backend.sln  global.json  Directory.Build.props  .editorconfig  BannedSymbols.txt  justfile
@@ -25,7 +25,7 @@ server/
 │   ├── emails/                                email_confirmation, reset_password, org_invitation templates
 │   ├── main-svc/                              the Web API host
 │   └── utest/                                 xUnit + EF InMemory
-├── backend-client/                            @simpled/backend-client: TS source, Zod models, Result errors
+├── backend-client/                            @simpled/backend-client: TS source, Zod models, typed Result errors, MainClient
 ├── e2e/                                       vitest through backend-client + mock mailer; also drives web-app controllers
 └── web-app/                                   React SPA (subtree.js: model + controller + page + route per page)
 ```
@@ -101,6 +101,6 @@ Role checks are validations (`OrgValidation.TryGetMembership(orgId, claims.Accou
 
 1. ✅ Backend scaffold: solution, config, auth and sessions, accounts (register/confirm/login/reset), mailer, db-setup, bundle specs; `just infra` + `just run` work.
 2. ✅ Organizations, members, invitations, teams, projects, roles + `utest`.
-3. `backend-client` + `e2e` (mock mailer for tokens).
+3. ✅ `backend-client` + `e2e` (mock mailer for tokens; `simpled test e2e` on a fresh stack).
 4. `web-app`, its controller tests, and e2e cases driving its controllers.
 5. CLAUDE.md and guides adapted to this repo.

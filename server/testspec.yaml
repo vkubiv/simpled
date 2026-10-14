@@ -1,0 +1,17 @@
+# Test suites `simpled test` runs (`simpled docs reference --section testspecyaml`).
+suites:
+  # The e2e suite in e2e/, driven through @simpled/backend-client. `simpled test e2e` brings the `local` deployment
+  # up in its own compose project (test_env/), waits for main-svc behind the gateway, runs the suite and tears it
+  # down. `--no-up` runs it against whatever already listens on the gateway port (`just run`, or `just infra` + main-svc).
+  # `just test-e2e` passes `--instance auto`, so a run takes the first free instance next to your own stack.
+  # Tokens come from the mock mailer, so nothing here is a secret.
+  e2e:
+    deployment: local
+    working_dir: ./e2e
+    environment:
+      - E2E_API_URL=http://localhost:$port(gateway)/api
+      - E2E_MAILER_URL=http://localhost:$port(mailer)
+    wait_for:
+      - http://localhost:$port(gateway)/api/health
+    timeout: 3m
+    run: npm test

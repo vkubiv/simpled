@@ -1,6 +1,7 @@
 # simpled: generated compose + per-service .env/secrets for undockerized runs
-/local_env/
-/test_env/
+/local_env*/
+/test_env*/
+/.simpled-instance
 /secrets/
 /volumes/
 **/.env
@@ -17,3 +18,4 @@
 # Node
 **/node_modules/
 **/dist/
+*.tsbuildinfo
