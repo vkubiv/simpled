@@ -5,6 +5,7 @@
 # `.simpled-instance` file shifts every one by N * 100 (instance 1: gateway 7180, db 7154, ...).
 ports:
   gateway: 7080
+  web: 7000
   app: 7001
   mailer: 7025
   db: 7054
@@ -37,7 +38,6 @@ deployments:
       - DB_CONNECTION_STRING="Host=simpled-db;Port=5432;Username=main_user;Password={password};Database=simpled"
       - SEND_GRID_API_HOST=http://simpled-mailer:3000
       - DEV_ENV=true
-      - CORS_ORIGINS=http://localhost:4000
       - AUTH_RATE_LIMIT_PER_MINUTE=1000
     undockerized_environment:
       - DB_CONNECTION_STRING="Host=localhost;Port=$port(db);Username=main_user;Password={password};Database=simpled"
@@ -51,11 +51,18 @@ deployments:
         ports:
           - "$port(app):80"
         working_dir: ./backend_services/main-svc
+      # Excluded in `infra`, where the gateway sends `/` to the Vite dev server on the same port (`just web-dev`).
+      web-app:
+        host: app
+        prefix: /
+        ports:
+          - "$port(web):80"
 
-  # Gateway + Postgres + mock mailer only; run main-svc from the IDE against them (it migrates on `just apply-migrations`).
-  # The IDE's launch profile listens on 7001, so this one is for instance 0.
+  # Gateway + Postgres + mock mailer only; run main-svc from the IDE and the web app with `just web-dev` against them
+  # (migrate with `just apply-migrations`). The IDE's launch profile and Vite listen on 7001 and 7000: instance 0.
   infra:
     extends: local
     exclude_services:
       - main-svc
+      - web-app
       - db-setup

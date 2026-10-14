@@ -40,6 +40,19 @@ app_services:
       - db_password
       - sendgrid_apikey
 
+  # The React SPA (web-app/), static files on nginx. `/api` goes to main-svc, everything else here.
+  web-app:
+    type: public
+    image: simpled-server/web-app
+    export:
+      host: app
+      prefix: /
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   db-setup:
     type: job
     image: simpled-server/db-setup

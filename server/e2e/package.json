@@ -16,6 +16,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
     "@types/node": "22.20.4",
+    "simpled-web-app": "*",
     "typescript": "5.9.3",
     "vitest": "3.2.7"
   }

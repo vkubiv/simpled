@@ -1,0 +1,35 @@
+{
+  "name": "simpled-web-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "tsc -b && biome check . && vitest run",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@simpled/backend-client": "*",
+    "operation-result.js": "1.0.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-router-dom": "6.30.6",
+    "subtree.js": "2.0.0-alpha.0",
+    "trunk.js": "1.0.0-alpha.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "4.7.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "vite": "6.4.3",
+    "vitest": "3.2.7"
+  }
+}

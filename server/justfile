@@ -28,8 +28,15 @@ infra:
     simpled local generate-config --deployment infra
     simpled local run --deployment infra
 
-build:
+build: build-web
     cd backend_services && just build
+
+build-web:
+    docker build -f web-app/Dockerfile -t simpled-server/web-app:latest .
+
+# The web app on Vite (http://localhost:7000, or through the gateway at http://localhost:7080 with `just infra`).
+web-dev:
+    npm run dev -w web-app
 
 check-code:
     cd backend_services && just check-code
@@ -47,7 +54,7 @@ apply-migrations:
 npm-install:
     npm install
 
-# Typecheck and lint the TypeScript packages.
+# Typecheck, lint and unit-test the TypeScript packages.
 check-ts:
     npm run check
 
