@@ -1,0 +1,48 @@
+# just runs recipes with `sh -c` by default on every platform, including Windows. A plain PowerShell
+# or cmd session has no `sh` on PATH, so recipes here are written to the intersection of sh and cmd:
+# `cd x && cmd` chains, forward slashes, no `%`, `^` or quoting tricks. This setting is ignored on
+# macOS/Linux, which keep using sh.
+set windows-shell := ["cmd.exe", "/c"]
+
+# Seed ./secrets from the committed examples (never overwrites). Run once per machine.
+[unix]
+secrets-init:
+    mkdir -p secrets && cp -n secrets.example/* secrets/
+
+[windows]
+secrets-init:
+    if not exist secrets mkdir secrets
+    xcopy /d /y secrets.example\* secrets\ >nul
+
+# Write local_env/ without starting anything (validates appspec + localenv).
+prepare:
+    simpled local generate-config --deployment local
+
+# Full dockerized stack behind the gateway at http://localhost:7080 (main-svc under /api).
+run:
+    simpled local generate-config --deployment local
+    simpled local run --deployment local
+
+# Gateway, Postgres and the mock mailer only; run main-svc from the IDE (`working_dir` gets .env + secrets).
+infra:
+    simpled local generate-config --deployment infra
+    simpled local run --deployment infra
+
+build:
+    cd backend_services && just build
+
+check-code:
+    cd backend_services && just check-code
+
+test:
+    cd backend_services && just test
+
+add-migration NAME:
+    cd backend_services && just add-migration {{NAME}}
+
+apply-migrations:
+    cd backend_services && just apply-migrations
+
+# Validate the bundle the way CI will (checks appspec and that images exist locally).
+verify:
+    simpled app-bundle verify

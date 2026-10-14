@@ -1,0 +1,24 @@
+# Recipes run with cmd.exe on Windows (see ../justfile for why); keep them inside the sh/cmd intersection.
+set windows-shell := ["cmd.exe", "/c"]
+
+# Base image (restore + build of the whole solution), then one image per host.
+build:
+    docker build -f ./image/Dockerfile --no-cache -t simpled-server/primary:latest .
+    docker build -f ./main-svc/Dockerfile -t simpled-server/main-svc:latest --build-arg BASE_IMAGE=simpled-server/primary:latest .
+    docker build -f ./db-setup/Dockerfile -t simpled-server/db-setup:latest --build-arg BASE_IMAGE=simpled-server/primary:latest .
+
+# Restore, build, unit tests.
+check-code:
+    dotnet restore
+    dotnet build
+    dotnet test utest
+
+test:
+    dotnet test utest
+
+# `dotnet ef` reads .env + secrets/ from primary-db, or falls back to main-svc's (written by `simpled local generate-config`).
+add-migration MIGRATION_NAME:
+    cd primary-db && dotnet ef migrations add {{MIGRATION_NAME}}
+
+apply-migrations *MIGRATION_NAME:
+    cd primary-db && dotnet ef database update {{MIGRATION_NAME}}

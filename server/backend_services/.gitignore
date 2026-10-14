@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+/.vs/
+/.idea/
+*.DotSettings.user
+
+# Written by `simpled` into each service's working_dir for undockerized runs.
+**/.env
+**/undockerized.env
+**/secrets/

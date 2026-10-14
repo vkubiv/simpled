@@ -1,0 +1,19 @@
+# simpled: generated compose + per-service .env/secrets for undockerized runs
+/local_env/
+/test_env/
+/secrets/
+/volumes/
+**/.env
+**/undockerized.env
+**/secrets/
+!/secrets.example/
+
+# .NET
+**/bin/
+**/obj/
+/backend_services/.vs/
+*.DotSettings.user
+
+# Node
+**/node_modules/
+**/dist/

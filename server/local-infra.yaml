@@ -1,0 +1,28 @@
+extra_services:
+  simpled-db:
+    type: internal
+    image: postgres:17-alpine
+    ports:
+      - "5440:5432"
+    environment:
+      - POSTGRES_USER=main_user
+      - POSTGRES_PASSWORD_FILE=/secrets/db_password
+      - POSTGRES_DB=simpled
+    secrets:
+      - db_password
+    volumes:
+      - ./volumes/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U main_user -d simpled"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Catches every email; the web UI and GET /api/mails are on http://localhost:3020.
+  simpled-mailer:
+    type: internal
+    image: ghashange/sendgrid-mock:1.9.0
+    ports:
+      - "3020:3000"
+    environment:
+      - API_KEY=sendgrid-mock-api-key

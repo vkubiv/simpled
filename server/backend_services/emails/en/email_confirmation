@@ -1,0 +1,11 @@
+Confirm your email for simpled
+
+Hello {{name}},<br />
+<br />
+Welcome to simpled. Please confirm your email address to finish creating your account:<br />
+<br />
+<a href='{{link}}' target='_blank' clicktracking=off>Confirm email</a><br />
+<br />
+The link is valid for 24 hours. If you did not sign up for simpled, ignore this email.<br />
+<br />
+The simpled team
