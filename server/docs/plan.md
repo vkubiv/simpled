@@ -103,4 +103,4 @@ Role checks are validations (`OrgValidation.TryGetMembership(orgId, claims.Accou
 2. ✅ Organizations, members, invitations, teams, projects, roles + `utest`.
 3. ✅ `backend-client` + `e2e` (mock mailer for tokens; `simpled test e2e` on a fresh stack).
 4. ✅ `web-app`, its controller tests, and e2e cases driving its controllers (`e2e/test/web-app/`).
-5. CLAUDE.md and guides adapted to this repo.
+5. ✅ CLAUDE.md and guides adapted to this repo (`docs/guides/`).
