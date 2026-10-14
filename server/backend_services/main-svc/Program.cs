@@ -34,6 +34,9 @@ builder.Services.AddSingleton(new UserMailer(
     SetupMailer.CreateMailer(config, config.IsDockerized ? "emails" : "../emails"),
     new UserMailConfig { PostMasterEmail = config.PostMasterEmail, WebAppUrl = config.WebAppUrl }));
 
+// GitHub: organizations' tokens, read when repositories are linked and synced.
+builder.Services.AddGitHub(config);
+
 // Claims and call context.
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddTransient<MainClaims>(x =>

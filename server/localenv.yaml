@@ -7,8 +7,10 @@ ports:
   gateway: 7080
   web: 7000
   app: 7001
+  monitor: 7002
   mailer: 7025
   db: 7054
+  fakes: 7010
 
 gateway:
   name: simpled-server-local
@@ -31,6 +33,7 @@ deployments:
     secrets:
       db_password:
       sendgrid_apikey:
+      github_token_key:
 
     # `{password}` is the .NET app's own placeholder (config/ConfigurationLoader.cs), not simpled's — keep it literal.
     # Every email goes to the mock mailer: http://localhost:$port(mailer) lists them.
@@ -39,9 +42,16 @@ deployments:
       - SEND_GRID_API_HOST=http://simpled-mailer:3000
       - DEV_ENV=true
       - AUTH_RATE_LIMIT_PER_MINUTE=1000
+      # GitHub and every monitored deployment are simpled-fakes here (local-infra.yaml); the e2e suite sets them up.
+      - GITHUB_API_URL=http://simpled-fakes:3000
+      - PROBE_PROXY_URL=http://simpled-fakes:3000
+      - MONITOR_INTERVAL_SECONDS=2
+      - REPOSITORY_SYNC_INTERVAL_SECONDS=30
     undockerized_environment:
       - DB_CONNECTION_STRING="Host=localhost;Port=$port(db);Username=main_user;Password={password};Database=simpled"
       - SEND_GRID_API_HOST=http://localhost:$port(mailer)
+      - GITHUB_API_URL=http://localhost:$port(fakes)
+      - PROBE_PROXY_URL=http://localhost:$port(fakes)
 
     services:
       main-svc:
@@ -51,6 +61,10 @@ deployments:
         ports:
           - "$port(app):80"
         working_dir: ./backend_services/main-svc
+      monitor-svc:
+        ports:
+          - "$port(monitor):80"
+        working_dir: ./backend_services/monitor-svc
       # Excluded in `infra`, where the gateway sends `/` to the Vite dev server on the same port (`just web-dev`).
       web-app:
         host: app
@@ -64,5 +78,6 @@ deployments:
     extends: local
     exclude_services:
       - main-svc
+      - monitor-svc
       - web-app
       - db-setup

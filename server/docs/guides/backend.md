@@ -13,13 +13,15 @@ A .NET 10 solution, `backend_services/backend.sln`:
 | `core` | Everything else: `Operations/`, `Validations/`, `Presentation/`, `Rules/`, `Primitive/`, `Auth/` (sessions, cookie, rate limiting), `Libs/` (`EntityAccess`, `MVCValidation`), `Services/` (`Clock`, `Mailer`). |
 | `db` | `Entities/*Entity.cs`: POCOs with snake_case `[Table]` / `[Column]` and indexes as attributes. |
 | `primary-db` | `PrimaryDbContext` (the `DbSet`s), `DesignTimeDbContextFactory`, `Migrations/`. |
+| `monitor-svc` | One instance: `MonitorWorker` re-syncs stale repositories and checks due deployments' version endpoints each tick (`MonitorRound`); `/health` says the loop runs. |
 | `db-setup` | The `job` that applies migrations before main-svc starts. |
 | `config` | `CommonConfiguration` + `ConfigurationLoader`: environment variables and secret files. Not `appsettings.json`. |
 | `utest` | xUnit + EF InMemory. |
 | `emails/en/` | Mail templates: first line the subject, the rest the HTML body, Stubble (`{{name}}`, `{{link}}`, ...). |
 
 Tables: `accounts`, `auth_sessions`, `confirmation_tokens`, `organizations`, `org_members`, `org_invitations`,
-`teams`, `team_members`, `projects`, `project_teams`. Deleting an organization, team or project cascades in the
+`teams`, `team_members`, `projects`, `project_teams`, and for monitoring `github_connections`, `repositories`,
+`environments`, `deployments`, `deployment_events`. Deleting an organization, team or project cascades in the
 database.
 
 ## 2. The request flow
@@ -161,7 +163,25 @@ A caller outside the organization gets `doesnt-exist` on the route parameter, th
 `OrgValidation.EnsureAllowed(OrgPermissions.Can…(...), vr)` answers `forbidden`. A manager "is in" a project when
 they are in one of its teams (`ProjectOps.IsMember`).
 
-## 5. Adding a feature
+## 5. Monitoring
+
+`docs/plan.md` ("Monitoring") has the behaviour. In code:
+
+- **Outside calls** go through two interfaces registered by `core/Services/MonitoringServices`: `IGitHub`
+  (`GitHubClient`, REST with the organization's token, answering `GitHubResult<T>` with `Unauthorized` /
+  `NotFound` / `Unavailable` instead of throwing) and `IVersionProbe` (`VersionProbe`, through `PROBE_PROXY_URL`
+  when set). Controllers take `IGitHub` with `[FromServices]` like any dependency; tests pass fakes.
+- **Tokens**: `TokenCipher` encrypts on the way in (`GitHubConnectionOps.Create` / `ReplaceToken`) and
+  `GitHubConnectionOps.Token` decrypts for a call. Presenters never include them.
+- **Specs**: `core/Primitive/SpecFiles` reads only what monitoring needs from envspec.yaml and appspec.yaml and
+  ignores the rest, so newer simpled fields never break a sync.
+- **Ops**: `RepositoryOps.Sync` (GitHub → rows), `MonitorOps.ApplyCheck` (an answer → status and events),
+  `MonitorOps.DueForCheck` / `RepositoryOps.DueForSync` (what a round picks up). They change tracked rows and do not
+  save; `MonitorRound` saves once per repository and once per check batch.
+- **Settings**: `GITHUB_API_URL`, `PROBE_PROXY_URL`, `MONITOR_INTERVAL_SECONDS`, `REPOSITORY_SYNC_INTERVAL_SECONDS`,
+  secret `github_token_key`. Locally all GitHub and probe traffic goes to `simpled-fakes` (`fakes/server.mjs`).
+
+## 6. Adding a feature
 
 1. **Entity** in `db/Entities` (snake_case `[Table]`/`[Column]`, indexes as attributes), its `DbSet` in
    `PrimaryDbContext`, then `just add-migration <Name>` from `server/` and read the generated migration.
@@ -177,7 +197,7 @@ they are in one of its teams (`ProjectOps.IsMember`).
    (`external` / `optional`) and given a local value in `localenv.yaml`. A new secret also goes in
    `secrets.example/`.
 
-## 6. Commands
+## 7. Commands
 
 From `server/` (`just --list` for all):
 
@@ -191,7 +211,7 @@ just build               # docker images, needed by `just run` and `just test-e2
 main-svc run from the IDE listens on `http://localhost:7001` and reads `backend_services/main-svc/.env`, which
 `simpled local generate-config` (part of `just infra`) writes.
 
-## 7. Standards
+## 8. Standards
 
 1. Async for all I/O; no `Async` suffix on our own methods.
 2. Named parameters when calling ops.

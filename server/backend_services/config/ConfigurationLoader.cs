@@ -44,8 +44,19 @@ public static class ConfigurationLoader
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
             AuthRateLimitPerMinute = int.Parse(LoadOptionalEnv("AUTH_RATE_LIMIT_PER_MINUTE") ?? "20",
                 System.Globalization.CultureInfo.InvariantCulture),
+
+            GitHubApiUrl = (LoadOptionalEnv("GITHUB_API_URL") ?? "https://api.github.com").TrimEnd('/'),
+            GitHubTokenKey = LoadSecret("github_token_key"),
+            ProbeProxyUrl = LoadOptionalEnv("PROBE_PROXY_URL"),
+            MonitorInterval = TimeSpan.FromSeconds(LoadOptionalSeconds("MONITOR_INTERVAL_SECONDS", 60)),
+            RepositorySyncInterval =
+                TimeSpan.FromSeconds(LoadOptionalSeconds("REPOSITORY_SYNC_INTERVAL_SECONDS", 600)),
         };
     }
+
+    private static int LoadOptionalSeconds(string name, int defaultSeconds) =>
+        int.Parse(LoadOptionalEnv(name) ?? defaultSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.CultureInfo.InvariantCulture);
 
     private static string LoadRequiredEnv(string name)
     {

@@ -11,6 +11,7 @@ suites:
     environment:
       - E2E_API_URL=http://localhost:$port(gateway)/api
       - E2E_MAILER_URL=http://localhost:$port(mailer)
+      - E2E_FAKES_URL=http://localhost:$port(fakes)
     wait_for:
       - http://localhost:$port(gateway)/api/health
     timeout: 3m

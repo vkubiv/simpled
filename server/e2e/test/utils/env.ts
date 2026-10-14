@@ -11,10 +11,12 @@ if (existsSync(dotenv)) {
   }
 }
 
-/** Defaults match instance 0 of `just infra` / `just run`: the gateway on :7080 and the mock mailer on :7025. */
+/** Defaults match instance 0 of `just infra` / `just run`: the gateway on :7080, the mock mailer on :7025, fakes on :7010. */
 export const env = {
   apiUrl: process.env.E2E_API_URL ?? "http://localhost:7080/api",
   /** sendgrid-mock: every email the backend sends, `GET /api/mails?to=`. */
   mailerUrl: process.env.E2E_MAILER_URL ?? "http://localhost:7025",
+  /** simpled-fakes: GitHub and the monitored deployments, scripted through `/_fakes`. */
+  fakesUrl: process.env.E2E_FAKES_URL ?? "http://localhost:7010",
   printLogs: process.env.PRINT_LOGS === "1",
 };

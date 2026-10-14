@@ -198,3 +198,40 @@ export class InvitationForAnotherEmail extends ApiError {
     super(reason, originalError);
   }
 }
+
+export class GitHubConnectionNotFound extends ApiError {
+  constructor(
+    readonly connectionId: number,
+    originalError?: unknown,
+  ) {
+    super(`GitHub connection ${connectionId} not found`, originalError);
+  }
+}
+
+/** Repositories are still linked through the connection. `message` says how many. */
+export class ConnectionInUse extends ApiError {
+  constructor(
+    readonly reason: string,
+    originalError?: unknown,
+  ) {
+    super(reason, originalError);
+  }
+}
+
+export class RepositoryNotFound extends ApiError {
+  constructor(
+    readonly repositoryId: number,
+    originalError?: unknown,
+  ) {
+    super(`Repository ${repositoryId} not found`, originalError);
+  }
+}
+
+export class DeploymentNotFound extends ApiError {
+  constructor(
+    readonly deploymentId: number,
+    originalError?: unknown,
+  ) {
+    super(`Deployment ${deploymentId} not found`, originalError);
+  }
+}

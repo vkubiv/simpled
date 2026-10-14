@@ -3,6 +3,8 @@ import { Subtree } from "subtree.js/react";
 import { pick } from "trunk.js";
 import type { AppDeps } from "../../app-deps";
 import { paths } from "../../core/primitives/routes";
+import { DeploymentsController } from "../project-deployments/deployments-controller";
+import { DeploymentsSection } from "../project-deployments/deployments-section";
 import { ProjectController } from "./project-controller";
 import { ProjectPage } from "./project-page";
 
@@ -22,7 +24,19 @@ export function ProjectRoute({ deps, orgId }: { deps: AppDeps; orgId: number }) 
         )
       }
     >
-      <ProjectPage />
+      <ProjectPage
+        deployments={
+          <Subtree
+            key="project-deployments"
+            deps={[orgId, projectId]}
+            controller={() =>
+              new DeploymentsController(pick(deps, "client", "authHandler", "orgRepository"), orgId, projectId)
+            }
+          >
+            <DeploymentsSection />
+          </Subtree>
+        }
+      />
     </Subtree>
   );
 }

@@ -47,4 +47,7 @@ public static class OrgPermissions
     /// <summary>Rename, delete and change linked teams of a project; a manager needs one of its teams.</summary>
     public static bool CanManageProject(OrgRole role, bool isProjectMember) =>
         role is OrgRole.Owner or OrgRole.Admin || (role == OrgRole.Manager && isProjectMember);
+
+    /// <summary>Add, rotate and remove the organization's GitHub tokens; linking repositories is project management.</summary>
+    public static bool CanManageGitHubConnections(OrgRole role) => role is OrgRole.Owner or OrgRole.Admin;
 }

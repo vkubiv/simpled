@@ -1,6 +1,7 @@
 # simpled server — plan
 
-The control plane for simpled: accounts, organizations, teams, projects and roles. Deployments come later.
+The control plane for simpled: accounts, organizations, teams, projects and roles, and monitoring of the
+deployments a project's GitHub repositories describe.
 
 Architecture sources:
 - Backend, bundle and tests: `D:\active_projects\doejoHQ\HobbyExchange\backend` (.NET 10, Controller → Validation → Ops → Presenter, `Read<T>`/`Mutate<T>`/`UnitOfWork`, opaque sessions in `auth_sessions`).
@@ -48,6 +49,11 @@ Local gateway `localhost:7080`: `/api` → main-svc (prefix stripped), `/` → w
 | `team_members` | team, account, added_at; unique (team, account); removed with the org membership |
 | `projects` | org, name, slug; unique (org, slug) |
 | `project_teams` | project, team; unique (project, team) |
+| `github_connections` | org, name (unique per org), github_login, token_ciphertext (AES-GCM, key from the `github_token_key` secret), created_at |
+| `repositories` | project, github_connection, owner, name (unique per project), default_branch, synced_at, synced_revision, sync_error |
+| `environments` | repository, name (the envspec's directory), path (unique per repository) |
+| `deployments` | environment, name (unique per environment), application_name, version_constraint, url (primary host), repo_version (the appspec's), status (`unknown` / `up` / `down` / `mismatch`), status_since, live_version, live_deployed_at, checked_at, check_error, failure_count |
+| `deployment_events` | deployment, at, kind (`version-changed` / `down` / `up` / `mismatch`), version, previous_version, details |
 
 ## Roles
 
@@ -64,6 +70,9 @@ One role per organization member: `owner`, `admin`, `manager`, `member`. A manag
 | Manage a team's members | ✓ | ✓ | only teams they belong to | |
 | Link or unlink a team and a project | ✓ | ✓ | only when they belong to the team and to the project | |
 | View the org, members, teams and projects | ✓ | ✓ | ✓ | ✓ |
+| Add, rotate or remove GitHub connections | ✓ | ✓ | | |
+| Link, sync or unlink a project's repositories | ✓ | ✓ | only their own projects | |
+| View connections (no tokens), repositories, deployments and their history | ✓ | ✓ | ✓ | ✓ |
 | Restart a deployment | — | — | — | later |
 
 An organization always keeps at least one owner. The rules are one pure module (`core/Rules/OrgPermissions`) used by validations, and presenters return the caller's role and allowed actions, so the UI hides what it can't do.
@@ -93,9 +102,34 @@ Teams and projects:
 
 Role checks are validations (`OrgValidation.TryGetMembership(orgId, claims.AccountId, vr, …)` then `EnsureAllowed(permission, …)`), because roles are per organization and can't be global policies. An organization a caller doesn't belong to answers `doesnt-exist`; a forbidden action answers `forbidden`.
 
+Monitoring:
+- `GET|POST Orgs/{orgId}/GitHubConnections` {name, token}: the token is checked with GitHub (`GET /user`) and its
+  login kept. `PUT GitHubConnections/{connectionId}` {name, token?}, `DELETE GitHubConnections/{connectionId}`
+  (refused with `incorrect-state` while repositories use it).
+- `GET|POST Projects/{projectId}/Repositories` {connectionId, fullName}: `fullName` is `owner/name` or a GitHub URL;
+  linking reads the default branch right away. `GET|DELETE Repositories/{repositoryId}`,
+  `POST Repositories/{repositoryId}/Sync`. `GET Deployments/{deploymentId}/Events` (newest 50).
+
+## Monitoring
+
+A sync (`RepositoryOps.Sync`) lists the default branch's tree, reads every `envspec.yaml` (an environment, named
+after its directory) and `appspec.yaml` (application name → version), and makes the rows match: a deployment's URL
+is the first domain of its `primary_host` (`http` when `gateway.tls.disable`), `extends` is followed, templated
+hosts (`$port(...)`) give none. An envspec that cannot be read leaves its environment as it was; problems go to
+`sync_error`. Linking and "Sync now" sync in main-svc; `monitor-svc` re-syncs every
+`REPOSITORY_SYNC_INTERVAL_SECONDS` (600).
+
+`monitor-svc` (one instance) asks each deployment's `/.well-known/simpled/version` every `MONITOR_INTERVAL_SECONDS`
+(60) and applies `MonitorOps.ApplyCheck`: an answer for the deployment is `up` and records a `version-changed`
+event when the version moves; an answer for another application or deployment is `mismatch`; two failures in a row
+are `down`. Status changes are events, except a new deployment's first `up`.
+
+Next: deploy CI runs from GitHub Actions (workflows that run `simpled prepare-deployment <deployment>`), and
+service health through a gateway endpoint simpled aggregates from the appspec healthchecks.
+
 ## web-app pages
 
-`sign-in`, `register`, `check-email`, `confirm-email`, `forgot-password`, `reset-password`, `invitation` (accept or register), then the signed-in shell with an organization switcher: `org-overview`, `members` (roles, invitations), `teams`, `team` (members, projects), `projects`, `project` (linked teams), `org-settings`, `new-org`.
+`sign-in`, `register`, `check-email`, `confirm-email`, `forgot-password`, `reset-password`, `invitation` (accept or register), then the signed-in shell with an organization switcher: `org-overview`, `members` (roles, invitations), `teams`, `team` (members, projects), `projects`, `project` (deployments by repository and environment, linked teams), `github` (connections), `org-settings`, `new-org`.
 
 ## Build order
 
@@ -104,3 +138,6 @@ Role checks are validations (`OrgValidation.TryGetMembership(orgId, claims.Accou
 3. ✅ `backend-client` + `e2e` (mock mailer for tokens; `simpled test e2e` on a fresh stack).
 4. ✅ `web-app`, its controller tests, and e2e cases driving its controllers (`e2e/test/web-app/`).
 5. ✅ CLAUDE.md and guides adapted to this repo (`docs/guides/`).
+6. ✅ Monitoring: GitHub connections, linked repositories synced into environments and deployments, monitor-svc
+   checking version endpoints, simpled-fakes for local runs and e2e, the `github` page and the project's
+   deployments.

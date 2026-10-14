@@ -1,11 +1,12 @@
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { Link } from "react-router-dom";
 import { useObserver, useSubtree } from "subtree.js/react";
 import { EmptyState, Field, invalid, LoadFailed, Notice, PageHeader, Section, Spinner } from "../../components/ui";
 import { paths } from "../../core/primitives/routes";
 import { ProjectActions, ProjectState } from "./project-model";
 
-export function ProjectPage() {
+/** `deployments` is its own subtree (pages/project-deployments), shown above the teams. */
+export function ProjectPage({ deployments }: { deployments?: ReactNode }) {
   const state = useSubtree(ProjectState);
   const actions = useSubtree(ProjectActions);
   const observer = useObserver();
@@ -62,6 +63,8 @@ export function ProjectPage() {
       )}
 
       <div className="space-y-6">
+        {deployments}
+
         <Section title="Teams" description="Members of these teams work on the project.">
           {project.canManage && linkable.length > 0 && (
             <form

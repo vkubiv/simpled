@@ -2,15 +2,17 @@
 
 Guidance for Claude Code in `server/`. Write few comments: they say why, not what.
 
-The simpled control plane: accounts, organizations, teams, projects and roles, as one simpled bundle
+The simpled control plane: accounts, organizations, teams, projects and roles, plus monitoring of what they
+deploy (GitHub repositories' envspecs, each deployment's version endpoint), as one simpled bundle
 (`appspec.yaml`). Plan, data model and role matrix: `docs/plan.md`.
 
 | Part | Where | Guide |
 |---|---|---|
-| main-svc and db-setup (.NET 10) | `backend_services/` | `docs/guides/backend.md`, `docs/guides/backend-testing.md` |
+| main-svc, monitor-svc and db-setup (.NET 10) | `backend_services/` | `docs/guides/backend.md`, `docs/guides/backend-testing.md` |
 | TypeScript client for main-svc | `backend-client/` | `docs/guides/backend-client.md` |
 | End-to-end suite | `e2e/` | `docs/guides/e2e.md` |
 | React web app | `web-app/` | `docs/guides/frontend.md` |
+| simpled-fakes: GitHub and monitored gateways, local only | `fakes/server.mjs` | `docs/guides/e2e.md` |
 
 Read the guide for the part you change before changing it. The architecture comes from
 `D:\active_projects\doejoHQ\HobbyExchange` (backend) and `D:\active_projects\hobbyshopify\hobby-pro` (client,
@@ -32,16 +34,18 @@ e2e, frontend); the guides are self-contained, look there only for an example th
   controllers), never the database; web-app controllers have no DOM and no business logic (ops do), and views
   never touch repositories or ops.
 - A change to an endpoint touches main-svc, `backend-client`, `utest` and `e2e` in the same change.
+- GitHub tokens are stored only encrypted (`TokenCipher`, secret `github_token_key`) and never presented. Nothing
+  in the server calls GitHub or a deployment except through `IGitHub` / `IVersionProbe`, which tests fake.
 
 ## Commands (from `server/`)
 
 ```sh
 just secrets-init        # once per machine: ./secrets from secrets.example
 just npm-install         # the npm workspace (backend-client, e2e, web-app)
-just infra               # Postgres, mock mailer, gateway; then main-svc from the IDE and `just web-dev`
+just infra               # Postgres, mock mailer, fakes, gateway; then main-svc (and monitor-svc) from the IDE, `just web-dev`
 just apply-migrations    # against `just infra`'s Postgres
 just web-dev             # Vite on :7000; open http://localhost:7080, where emailed links land
-just build               # docker images (main-svc, db-setup, web-app)
+just build               # docker images (main-svc, monitor-svc, db-setup, web-app)
 just run                 # everything in Docker behind http://localhost:7080 (`/` web app, `/api` main-svc)
 just check-code          # backend: build + unit tests
 just check-ts            # TypeScript: tsc + biome + web-app unit tests
@@ -50,8 +54,9 @@ just test-e2e-attached   # e2e against the running stack
 just add-migration Name
 ```
 
-Named host ports (`localenv.yaml`): gateway 7080, web-app 7000, main-svc 7001, mock mailer 7025 (its UI lists
-every email), Postgres 7054. Instance N (`--instance N`, `SIMPLED_INSTANCE`, or a `.simpled-instance` file) adds
-N × 100 and runs as its own compose project with its own data. The IDE launch profile and Vite use instance 0's
+Named host ports (`localenv.yaml`): gateway 7080, web-app 7000, main-svc 7001, monitor-svc 7002 (`/health`
+only), simpled-fakes 7010, mock mailer 7025 (its UI lists every email), Postgres 7054. Instance N (`--instance N`,
+`SIMPLED_INSTANCE`, or a `.simpled-instance` file) adds N × 100 and runs as its own compose project with its own
+data. The IDE launch profile and Vite use instance 0's
 ports. Infra services are `simpled-db` / `simpled-mailer` because simpled names instance-0 containers after
 their services and other local projects own `primary-db` / `mock-mailer`.

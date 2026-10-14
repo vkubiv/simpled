@@ -4,12 +4,15 @@
  */
 import {
   anonymous,
+  type Deployment,
+  type GitHubConnection,
   type Me,
   type Member,
   type MyOrganization,
   type Organization,
   type OrgRole,
   type Project,
+  type Repository,
   type Team,
   type TeamSummary,
 } from "@simpled/backend-client";
@@ -29,6 +32,8 @@ export function fakeClient(parts: FakeClientParts): BackendApi {
     invitations: parts.invitations ?? {},
     teams: parts.teams ?? {},
     projects: parts.projects ?? {},
+    gitHubConnections: parts.gitHubConnections ?? {},
+    repositories: parts.repositories ?? {},
   } as unknown as BackendApi;
 }
 
@@ -62,6 +67,7 @@ const PERMISSIONS: Record<OrgRole, Organization["permissions"]> = {
     canManageMembers: true,
     canCreateTeam: true,
     canCreateProject: true,
+    canManageGitHubConnections: true,
     assignableRoles: ["owner", "admin", "manager", "member"],
   },
   admin: {
@@ -69,6 +75,7 @@ const PERMISSIONS: Record<OrgRole, Organization["permissions"]> = {
     canManageMembers: true,
     canCreateTeam: true,
     canCreateProject: true,
+    canManageGitHubConnections: true,
     assignableRoles: ["admin", "manager", "member"],
   },
   manager: {
@@ -76,6 +83,7 @@ const PERMISSIONS: Record<OrgRole, Organization["permissions"]> = {
     canManageMembers: false,
     canCreateTeam: true,
     canCreateProject: true,
+    canManageGitHubConnections: false,
     assignableRoles: [],
   },
   member: {
@@ -83,6 +91,7 @@ const PERMISSIONS: Record<OrgRole, Organization["permissions"]> = {
     canManageMembers: false,
     canCreateTeam: false,
     canCreateProject: false,
+    canManageGitHubConnections: false,
     assignableRoles: [],
   },
 };
@@ -132,6 +141,45 @@ export function makeProject(o: Partial<Project> = {}): Project {
     createdAt: NOW,
     teams: [],
     isMember: false,
+    canManage: true,
+    ...o,
+  };
+}
+
+export function makeConnection(o: Partial<GitHubConnection> = {}): GitHubConnection {
+  return { id: 200, name: "Deploy bot", gitHubLogin: "octocat", createdAt: NOW, repositoryCount: 0, ...o };
+}
+
+export function makeDeployment(o: Partial<Deployment> = {}): Deployment {
+  return {
+    id: 400,
+    name: "prod",
+    applicationName: "shop",
+    versionConstraint: "^1.0.0",
+    url: "https://shop.example.com",
+    repoVersion: "1.1.0",
+    status: "up",
+    statusSince: NOW,
+    liveVersion: "1.0.0",
+    liveDeployedAt: NOW,
+    checkedAt: NOW,
+    checkError: null,
+    ...o,
+  };
+}
+
+export function makeRepository(o: Partial<Repository> = {}): Repository {
+  return {
+    id: 300,
+    projectId: 100,
+    connectionId: 200,
+    owner: "acme",
+    name: "shop",
+    defaultBranch: "main",
+    createdAt: NOW,
+    syncedAt: NOW,
+    syncError: null,
+    environments: [{ id: 350, name: "prod", path: "deployment/prod/envspec.yaml", deployments: [makeDeployment()] }],
     canManage: true,
     ...o,
   };

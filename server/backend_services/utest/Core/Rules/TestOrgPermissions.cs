@@ -59,4 +59,14 @@ public class TestOrgPermissions
         Assert.False(OrgPermissions.CanCreateTeam(OrgRole.Member));
         Assert.False(OrgPermissions.CanCreateProject(OrgRole.Member));
     }
+
+    [Theory]
+    [InlineData(OrgRole.Owner, true)]
+    [InlineData(OrgRole.Admin, true)]
+    [InlineData(OrgRole.Manager, false)]
+    [InlineData(OrgRole.Member, false)]
+    public void TestCanManageGitHubConnections(OrgRole role, bool allowed)
+    {
+        Assert.Equal(allowed, OrgPermissions.CanManageGitHubConnections(role));
+    }
 }

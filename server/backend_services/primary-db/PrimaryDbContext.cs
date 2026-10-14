@@ -19,6 +19,13 @@ public class PrimaryDbContext : DbContext
     public DbSet<ProjectEntity> Projects { get; set; }
     public DbSet<ProjectTeamEntity> ProjectTeams { get; set; }
 
+    // Monitoring
+    public DbSet<GitHubConnectionEntity> GitHubConnections { get; set; }
+    public DbSet<RepositoryEntity> Repositories { get; set; }
+    public DbSet<DeployEnvironmentEntity> Environments { get; set; }
+    public DbSet<DeploymentEntity> Deployments { get; set; }
+    public DbSet<DeploymentEventEntity> DeploymentEvents { get; set; }
+
     public PrimaryDbContext(DbContextOptions<PrimaryDbContext> options) : base(options)
     {
     }

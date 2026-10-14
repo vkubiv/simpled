@@ -77,6 +77,11 @@ export function ShellLayout({ children }: { children: ReactNode }) {
                 </NavLink>
               </li>
               <li>
+                <NavLink to={paths.github(orgId)} className={navCls}>
+                  GitHub
+                </NavLink>
+              </li>
+              <li>
                 <NavLink to={paths.settings(orgId)} className={navCls}>
                   Settings
                 </NavLink>

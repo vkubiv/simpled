@@ -22,5 +22,6 @@
   <ItemGroup>
     <ProjectReference Include="..\core\core.csproj" />
     <ProjectReference Include="..\main-svc\main-svc.csproj" />
+    <ProjectReference Include="..\monitor-svc\monitor-svc.csproj" />
   </ItemGroup>
 </Project>

@@ -14,6 +14,7 @@ public class OrgPermissionsPresentation
     public required bool CanManageMembers { get; set; }
     public required bool CanCreateTeam { get; set; }
     public required bool CanCreateProject { get; set; }
+    public required bool CanManageGitHubConnections { get; set; }
 
     /// <summary>Roles the caller may invite with or assign.</summary>
     public required List<string> AssignableRoles { get; set; }
@@ -62,6 +63,7 @@ public static class OrganizationPresenter
                 CanManageMembers = OrgPermissions.CanManageMembers(role),
                 CanCreateTeam = OrgPermissions.CanCreateTeam(role),
                 CanCreateProject = OrgPermissions.CanCreateProject(role),
+                CanManageGitHubConnections = OrgPermissions.CanManageGitHubConnections(role),
                 AssignableRoles = OrgPermissions.AssignableRoles(role).Select(OrgRoles.ToValue).ToList(),
             },
         };
