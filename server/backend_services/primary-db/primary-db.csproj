@@ -18,8 +18,9 @@
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.1" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.0" />
-    <!-- Pins the transitive System.Security.Cryptography.Xml above the advisory-flagged 9.0.0 (NU1903). -->
-    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.12" />
+    <!-- Pin the transitive System.Security.Cryptography.Xml and .Pkcs above advisory-flagged releases (NU1902/NU1903 fail Release builds). -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.13" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\config\config.csproj" />
