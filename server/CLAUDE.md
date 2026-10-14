@@ -21,19 +21,39 @@ Architecture is copied from `D:\active_projects\doejoHQ\HobbyExchange\backend` (
 - Adding an entity: `db/Entities/*Entity.cs` with snake_case `[Table]`/`[Column]`, `DbSet` in `PrimaryDbContext`, `just add-migration <Name>`.
 - Error codes are kebab-case (`incorrect-value`, `email-not-confirmed`). Async methods have no `Async` suffix.
 
+## TypeScript rules (`backend-client`, `e2e`)
+
+- npm workspace at `server/` (`backend-client`, `e2e`; `web-app` joins in step 4). `backend-client` exports its
+  `.ts` source, no build step. Copied from hobby-pro's `backend-client-guide.md`.
+- Every API method takes `ctx: ApiContext` first and returns `Promise<Result<T, E>>` with `E` a union of concrete
+  error classes; the failure mapper names what it maps and ends in `signedIn(e)` / `rateLimited(e)` or
+  `throw new UnexpectedApiError(e)`. Write one mapper per method rather than a shared option bag, which widens the union.
+- Models are Zod schemas in `src/model`, parsed with `parse()`; dates are `isoDate`.
+- Contexts: browser → `browser` (cookie store), Node → `{ cookieJar: new MemoryCookieJar() }`, CLI → `withToken(token)`.
+- `e2e` imports only from `@simpled/backend-client`, never mocks, gets emailed tokens from the mock mailer
+  (`test/utils/mailbox.ts`) and builds scenarios with `Sugar` (per-run unique emails, people by alias).
+
 ## Commands (from `server/`)
 
 ```sh
 just secrets-init        # once per machine: seeds ./secrets from secrets.example
-just infra               # Postgres (5440) + mock mailer (http://localhost:3020) + gateway; run main-svc from the IDE
+just infra               # Postgres (7054) + mock mailer (http://localhost:7025) + gateway; run main-svc from the IDE
 just apply-migrations    # after `just infra`, before running main-svc from the IDE
 just run                 # full dockerized stack (needs `just build`); gateway http://localhost:7080, main-svc under /api
 just build               # docker images
 just check-code          # restore, build, unit tests
 just add-migration Name
+just npm-install         # npm workspace
+just check-ts            # tsc + biome for backend-client and e2e
+just test-e2e            # e2e on a fresh stack, first free instance (testspec.yaml); `just build` first
+just test-e2e-attached   # e2e against what already runs on :7080
 ```
 
-main-svc run from the IDE listens on http://localhost:7001 (`launchSettings.json`); the gateway forwards `/api` to it.
+Host ports are named in `localenv.yaml` (`ports:`, written `$port(name)`): gateway 7080, main-svc 7001, mock mailer
+7025, Postgres 7054. Instance N (`--instance N`, `SIMPLED_INSTANCE` or a `.simpled-instance` file) adds N * 100 and
+runs as its own compose project with its own data, so stacks from several worktrees run side by side. Never write a
+literal host port in the specs. main-svc run from the IDE listens on http://localhost:7001 (`launchSettings.json`), so
+IDE runs are instance 0; the gateway forwards `/api` to it.
 Infra service names are `simpled-db` / `simpled-mailer`, because simpled names containers after services and
 other local projects already own `primary-db` / `mock-mailer`.
 

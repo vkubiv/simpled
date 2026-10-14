@@ -1,0 +1,9 @@
+{
+  "name": "simpled-server",
+  "private": true,
+  "workspaces": ["backend-client", "e2e"],
+  "scripts": {
+    "check": "npm run check --workspaces",
+    "test:e2e": "npm test -w e2e"
+  }
+}

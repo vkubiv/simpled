@@ -1,13 +1,21 @@
 # Local development environment for the `simpled-server` bundle (type: local is implied here).
 # `just run` from this directory. Secrets come from ./secrets (gitignored) — `just secrets-init` seeds them.
 
+# Host ports, named so several instances can run side by side: `--instance N`, SIMPLED_INSTANCE or a
+# `.simpled-instance` file shifts every one by N * 100 (instance 1: gateway 7180, db 7154, ...).
+ports:
+  gateway: 7080
+  app: 7001
+  mailer: 7025
+  db: 7054
+
 gateway:
   name: simpled-server-local
   tls:
     disable: true
   hosts:
     app:
-      - localhost:7080
+      - localhost:$port(gateway)
 
 deployments:
   local:
@@ -24,7 +32,7 @@ deployments:
       sendgrid_apikey:
 
     # `{password}` is the .NET app's own placeholder (config/ConfigurationLoader.cs), not simpled's — keep it literal.
-    # Every email goes to the mock mailer: http://localhost:3020 lists them.
+    # Every email goes to the mock mailer: http://localhost:$port(mailer) lists them.
     environment:
       - DB_CONNECTION_STRING="Host=simpled-db;Port=5432;Username=main_user;Password={password};Database=simpled"
       - SEND_GRID_API_HOST=http://simpled-mailer:3000
@@ -32,8 +40,8 @@ deployments:
       - CORS_ORIGINS=http://localhost:4000
       - AUTH_RATE_LIMIT_PER_MINUTE=1000
     undockerized_environment:
-      - DB_CONNECTION_STRING="Host=localhost;Port=5440;Username=main_user;Password={password};Database=simpled"
-      - SEND_GRID_API_HOST=http://localhost:3020
+      - DB_CONNECTION_STRING="Host=localhost;Port=$port(db);Username=main_user;Password={password};Database=simpled"
+      - SEND_GRID_API_HOST=http://localhost:$port(mailer)
 
     services:
       main-svc:
@@ -41,10 +49,11 @@ deployments:
         prefix: /api
         strip_prefix: true
         ports:
-          - "7001:80"
+          - "$port(app):80"
         working_dir: ./backend_services/main-svc
 
   # Gateway + Postgres + mock mailer only; run main-svc from the IDE against them (it migrates on `just apply-migrations`).
+  # The IDE's launch profile listens on 7001, so this one is for instance 0.
   infra:
     extends: local
     exclude_services:
