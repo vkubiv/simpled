@@ -1,0 +1,50 @@
+name: simpled-server
+version: 0.1.0
+
+# Topology only. Domains, registry, secret sources and env var VALUES live in localenv.yaml (local)
+# and deployment envspecs. See `simpled docs agent`.
+
+environment:
+  external:
+    - DB_CONNECTION_STRING          # contains a literal `{password}`; the .NET config loader substitutes the db_password secret itself
+    - DEV_ENV=false
+    - POSTMASTER_EMAIL="no-reply@example.com"
+    - SEND_GRID_API_HOST="not-set"
+    - SEND_GRID_MOCK_API_KEY="not-set"
+    - SEND_GRID_MOCK_API_HOST="not-set"
+  optional:
+    - SENTRY_DSN                    # empty disables Sentry
+    - CORS_ORIGINS                  # comma-separated browser origins, only when the web app is served from another origin
+    - AUTH_RATE_LIMIT_PER_MINUTE    # per client IP on the auth endpoints; empty means 20
+
+  relative:
+    - WEB_APP_URL="/"               # links in emails (confirm-email, reset-password, invitations)
+
+secrets:
+  db_password:
+  sendgrid_apikey:
+
+app_services:
+  main-svc:
+    type: public
+    image: simpled-server/main-svc
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    environment:
+      - $all
+    secrets:
+      - db_password
+      - sendgrid_apikey
+
+  db-setup:
+    type: job
+    image: simpled-server/db-setup
+    environment:
+      - $all
+    secrets:
+      - db_password
+      - sendgrid_apikey

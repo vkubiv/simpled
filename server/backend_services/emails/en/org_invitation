@@ -1,0 +1,11 @@
+{{inviter}} invited you to {{organization}} on simpled
+
+Hello,<br />
+<br />
+{{inviter}} invited you to join <b>{{organization}}</b> on simpled as {{role}}.<br />
+<br />
+<a href='{{link}}' target='_blank' clicktracking=off>Accept the invitation</a><br />
+<br />
+The link is valid for 7 days. If you did not expect this invitation, ignore this email.<br />
+<br />
+The simpled team

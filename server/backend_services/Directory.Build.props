@@ -1,0 +1,9 @@
+<Project>
+  <ItemGroup Condition="'$(MSBuildProjectName)' != 'utest' And '$(MSBuildProjectName)' != 'itest'">
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="5.6.0" PrivateAssets="all" />
+    <AdditionalFiles Include="$(MSBuildThisFileDirectory)BannedSymbols.txt" />
+  </ItemGroup>
+  <PropertyGroup>
+    <WarningsAsErrors>$(WarningsAsErrors);RS0030</WarningsAsErrors>
+  </PropertyGroup>
+</Project>

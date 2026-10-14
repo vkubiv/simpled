@@ -1,0 +1,52 @@
+# Local development environment for the `simpled-server` bundle (type: local is implied here).
+# `just run` from this directory. Secrets come from ./secrets (gitignored) — `just secrets-init` seeds them.
+
+gateway:
+  name: simpled-server-local
+  tls:
+    disable: true
+  hosts:
+    app:
+      - localhost:7080
+
+deployments:
+  local:
+    primary_host: app
+
+    application:
+      name: simpled-server
+      extra:
+        - ./local-infra.yaml
+
+    secrets_folder: ./secrets
+    secrets:
+      db_password:
+      sendgrid_apikey:
+
+    # `{password}` is the .NET app's own placeholder (config/ConfigurationLoader.cs), not simpled's — keep it literal.
+    # Every email goes to the mock mailer: http://localhost:3020 lists them.
+    environment:
+      - DB_CONNECTION_STRING="Host=simpled-db;Port=5432;Username=main_user;Password={password};Database=simpled"
+      - SEND_GRID_API_HOST=http://simpled-mailer:3000
+      - DEV_ENV=true
+      - CORS_ORIGINS=http://localhost:4000
+      - AUTH_RATE_LIMIT_PER_MINUTE=1000
+    undockerized_environment:
+      - DB_CONNECTION_STRING="Host=localhost;Port=5440;Username=main_user;Password={password};Database=simpled"
+      - SEND_GRID_API_HOST=http://localhost:3020
+
+    services:
+      main-svc:
+        host: app
+        prefix: /api
+        strip_prefix: true
+        ports:
+          - "7001:80"
+        working_dir: ./backend_services/main-svc
+
+  # Gateway + Postgres + mock mailer only; run main-svc from the IDE against them (it migrates on `just apply-migrations`).
+  infra:
+    extends: local
+    exclude_services:
+      - main-svc
+      - db-setup
