@@ -269,9 +269,22 @@ pub fn run(
 
             let proxy = ReverseProxy::new(&svc.prefix, &target);
 
+            // The proxy mounts itself with `nest`, which in axum 0.8 matches
+            // "/prefix" and "/prefix/rest" but not "/prefix/" itself. Without an
+            // explicit route that path falls through to the root fallback, so
+            // e.g. an SPA's index at "/admin-panel/" would be served by whatever
+            // owns "/". The proxy maps "/prefix/" to the target's "/" (or
+            // "/prefix/" when the prefix is kept), same as nginx/k8s ingress.
+            let slash_route = (!is_root_prefix(&svc.prefix) && !svc.prefix.ends_with('/'))
+                .then(|| format!("{}/", svc.prefix))
+                .map(|path| Router::new().route_service(&path, proxy.clone()));
+
             // `merge` consumes and returns the router, so swap the stored one out
             // to fold the new proxy into it.
             *app = std::mem::take(app).merge(proxy);
+            if let Some(slash_route) = slash_route {
+                *app = std::mem::take(app).merge(slash_route);
+            }
         }
     }
 
@@ -428,6 +441,86 @@ mod tests {
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["content-type"], "application/json");
         assert_eq!(response.text().unwrap(), r#"{"version":"1.2.3"}"#);
+        handle.stop();
+    }
+
+    /// A minimal upstream that answers every request with "<name> <path>".
+    fn upstream(name: &'static str) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                // Drain the headers so the client is not reset mid-request.
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 2 {
+                    line.clear();
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = format!("{} {}", name, path);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_prefix_with_a_trailing_slash_reaches_its_service_not_the_root_fallback() {
+        let gateway_port = StdTcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let service =
+            |name: &str, port: u16, prefix: &str, strip_prefix: bool| crate::resolved_spec::IngressToServiceRule {
+                service_name: name.to_string(),
+                deployment_name: "dev".to_string(),
+                port,
+                prefix: prefix.to_string(),
+                strip_prefix,
+                body_limit: None,
+            };
+        let spec = IngressResolvedSpec {
+            name: "gateway".to_string(),
+            tls: None,
+            domains: vec![],
+            rules: vec![crate::resolved_spec::IngressRule {
+                domain_name: format!("localhost:{}", gateway_port),
+                services: vec![
+                    service("web", upstream("web"), "/", false),
+                    service("admin", upstream("admin"), "/admin-panel", false),
+                    service("api", upstream("api"), "/api", true),
+                ],
+            }],
+            redirects: vec![],
+            version_routes: vec![],
+            version_document: None,
+        };
+        let handle = run(spec, "dev", "127.0.0.1", Path::new("local_env")).unwrap();
+
+        let get = |path: &str| {
+            reqwest::blocking::get(format!("http://localhost:{}{}", gateway_port, path))
+                .unwrap()
+                .text()
+                .unwrap()
+        };
+        assert_eq!(get("/admin-panel"), "admin /admin-panel");
+        assert_eq!(get("/admin-panel/"), "admin /admin-panel/");
+        assert_eq!(get("/admin-panel/?a=1"), "admin /admin-panel/?a=1");
+        assert_eq!(get("/admin-panel/doctors"), "admin /admin-panel/doctors");
+        assert_eq!(get("/api/"), "api /");
+        assert_eq!(get("/api/users"), "api /users");
+        assert_eq!(get("/"), "web /");
+        assert_eq!(get("/login"), "web /login");
         handle.stop();
     }
 
