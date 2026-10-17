@@ -151,16 +151,15 @@ pub fn convert_env_spec(
                 svc_names.sort();
                 for svc_name in svc_names {
                     let svc_spec = &services[svc_name];
-                    // A listed service needs a host port when something reaches it
-                    // there: the gateway routes to `localhost:<port>`, and a host-run
-                    // service listens on one. An entry that only adds `depends_on`,
-                    // mounts or a command (a migration job, say) needs none.
+                    // A listed service needs a host port when the gateway routes to
+                    // it: the route targets `localhost:<port>`. An entry that only
+                    // adds `depends_on`, mounts, a command or a `working_dir` (a
+                    // migration job or a worker run from the IDE, say) needs none.
                     let routed = svc_spec
                         .routes
                         .iter()
                         .any(|r| r.host.is_some() || !r.prefixes.is_empty());
-                    let reachable = routed || svc_spec.working_dir.is_some();
-                    if svc_spec.ports.is_empty() && reachable {
+                    if svc_spec.ports.is_empty() && routed {
                         return Err(anyhow!(
                             "In Local environment, service {} must have at least one port",
                             svc_name
@@ -1785,7 +1784,17 @@ deployments:
         let spec = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
         assert_eq!(service(&spec, "migrate").depends_on, Some(vec!["postgres".to_string()]));
 
-        // Something the gateway routes to, or that runs on the host, still needs one.
+        // Nor does a host-run service the gateway does not route to: it only gets
+        // its working_dir .env.
+        let host_run = raw.replace(
+            "        depends_on: [postgres]\n",
+            "        working_dir: ./migrate\n",
+        );
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&host_run).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
+        assert_eq!(service(&spec, "migrate").working_dir.as_deref(), Some("./migrate"));
+
+        // Something the gateway routes to still needs one.
         let routed = raw.replace(
             "        depends_on: [postgres]\n",
             "        host: web\n        prefix: /m\n",

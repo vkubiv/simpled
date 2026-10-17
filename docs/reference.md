@@ -980,6 +980,13 @@ deployments:
         working_dir: ../api   # run the api here; .env + secrets written into it
 ```
 
+A service the gateway does not route to needs no `host`, `prefix` or `ports` — `working_dir` alone is enough, e.g. a migration job or a worker you run from the IDE:
+
+```yaml
+      migrate:
+        working_dir: ../migrate
+```
+
 `working_dir` is not valid for `k8s` or `docker` environments.
 
 Two services in the same deployment cannot share a `working_dir`: each one writes its own `.env` and secrets there, so they would overwrite each other. `simpled` rejects the spec with an error naming both services. Paths are compared after normalization, so `./api`, `api` and `api/` all count as the same directory. Different deployments may reuse a directory, since only one runs at a time.
