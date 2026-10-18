@@ -201,6 +201,7 @@ one inline with `extends:`.
 | Secret already in the CI environment | `env: VAR` |
 | Many secrets already in the CI environment | `secrets_env_prefix: CI_SECRET_` on the deployment, and no source per secret |
 | Many secrets in one JSON document | `secrets_json: ./secrets.json` locally, `secrets_aws: prod/app/bundle` for real environments; each secret takes the field named after it |
+| A few secrets that belong together, in one JSON file | `json_file: ./vendor.json` on each secret; the field named after it, or `jq: .path`; missing file or field is an error |
 | Secret that must not pass through CI | `aws: path/to/secret` (resolved on the deploy target) |
 
 ## Error → fix

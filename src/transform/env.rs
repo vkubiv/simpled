@@ -520,7 +520,7 @@ fn read_secret_file(name: &str, path: &Path) -> Result<String> {
 fn json_field(doc: &serde_json::Value, filter: &str) -> Result<Option<String>> {
     let path = parse_field_path(filter).ok_or_else(|| {
         anyhow!(
-            "'{}' is not a field path. A secret read from secrets_json is selected by a path like .api_key or \
+            "'{}' is not a field path. A secret read from secrets_json or a json_file is selected by a path like .api_key or \
              .db.password; a filter that does more than that works only with an aws source, where jq runs.",
             filter
         )
@@ -575,9 +575,49 @@ fn parse_field_path(filter: &str) -> Option<Vec<String>> {
 }
 
 fn load_secrets_json(path: &Path) -> Result<serde_json::Value> {
+    load_json_document("secrets_json", path)
+}
+
+fn load_json_document(kind: &str, path: &Path) -> Result<serde_json::Value> {
     let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read secrets_json {}", path_for_message(path)))?;
-    serde_json::from_str(&content).with_context(|| format!("secrets_json {} is not valid JSON", path_for_message(path)))
+        fs::read_to_string(path).with_context(|| format!("Failed to read {} {}", kind, path_for_message(path)))?;
+    serde_json::from_str(&content).with_context(|| format!("{} {} is not valid JSON", kind, path_for_message(path)))
+}
+
+/// A `json_file:` source: the field of a JSON document, read now. Unlike
+/// `secrets_json` it is the secret's only source, so a file or field that is not
+/// there is an error rather than a fall-through. `documents` keeps each file
+/// parsed once when several secrets share it.
+fn read_json_file_secret(
+    name: &str,
+    path: &Path,
+    jq: Option<&str>,
+    documents: &mut HashMap<PathBuf, serde_json::Value>,
+) -> Result<String> {
+    if !documents.contains_key(path) {
+        if !path.exists() {
+            return Err(anyhow!(
+                "Secret '{}' reads json_file {}, which does not exist",
+                name,
+                path_for_message(path)
+            ));
+        }
+        documents.insert(path.to_path_buf(), load_json_document("json_file", path)?);
+    }
+    let filter = jq.map(str::to_string).unwrap_or_else(|| default_secret_filter(name));
+    let value = json_field(&documents[path], &filter)?.ok_or_else(|| {
+        anyhow!(
+            "Secret '{}' has no value: {} has no {}",
+            name,
+            path_for_message(path),
+            filter
+        )
+    })?;
+    let value = trim_secret_value(&value);
+    if value.is_empty() {
+        return Err(anyhow!("Secret '{}' is empty in {}", name, path_for_message(path)));
+    }
+    Ok(value.to_string())
 }
 
 /// Resolves a secret the deployment gives no source for, against the fallbacks in
@@ -859,16 +899,22 @@ fn convert_deployment(
 
     let secrets = if let Some(sec) = &yaml.secrets {
         let mut list = Vec::new();
+        let mut json_files = HashMap::new();
         for (k, v) in sec {
             match v {
                 DeploymentSecretSpecExYaml::Detailed(v) => {
-                    let sources = [v.env.is_some(), v.file.is_some(), v.aws.is_some()]
-                        .iter()
-                        .filter(|present| **present)
-                        .count();
+                    let sources = [
+                        v.env.is_some(),
+                        v.file.is_some(),
+                        v.aws.is_some(),
+                        v.json_file.is_some(),
+                    ]
+                    .iter()
+                    .filter(|present| **present)
+                    .count();
                     if sources > 1 {
                         return Err(anyhow!(
-                            "Secret {} can only have one of the env, file and aws sources",
+                            "Secret {} can only have one of the env, file, aws and json_file sources",
                             k
                         ));
                     }
@@ -882,6 +928,13 @@ fn convert_deployment(
                         DeploymentSecretSource::EnvVariable(env.clone())
                     } else if let Some(file) = &v.file {
                         DeploymentSecretSource::FilePath(root.join(file).to_string_lossy().into_owned())
+                    } else if let Some(json_file) = &v.json_file {
+                        DeploymentSecretSource::Embedded(read_json_file_secret(
+                            k,
+                            &root.join(json_file),
+                            v.jq.as_deref(),
+                            &mut json_files,
+                        )?)
                     } else if let Some(aws) = &v.aws {
                         // An `aws` source with no filter is the whole secret, which is
                         // how a secret that holds one value is read. Only the
@@ -1786,10 +1839,7 @@ deployments:
 
         // Nor does a host-run service the gateway does not route to: it only gets
         // its working_dir .env.
-        let host_run = raw.replace(
-            "        depends_on: [postgres]\n",
-            "        working_dir: ./migrate\n",
-        );
+        let host_run = raw.replace("        depends_on: [postgres]\n", "        working_dir: ./migrate\n");
         let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&host_run).unwrap();
         let spec = convert_env_spec(yaml, root.path(), Some("dev")).unwrap();
         assert_eq!(service(&spec, "migrate").working_dir.as_deref(), Some("./migrate"));
@@ -2076,6 +2126,87 @@ deployments:
         let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
         let err = convert_env_spec(yaml, root.path(), None).unwrap_err().to_string();
         assert!(err.contains("is not a field path"), "{err}");
+    }
+
+    fn json_file_spec(secrets: &str) -> String {
+        format!(
+            r#"
+type: docker
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    disable: true
+deployments:
+  app_prod:
+    primary_host: web
+    application:
+      name: app
+    secrets:
+{secrets}"#
+        )
+    }
+
+    /// Several secrets share one document, each taking the field named after it
+    /// or the one its `jq` selects, in a real (non-local) environment.
+    #[test]
+    fn json_file_gives_a_secret_the_field_named_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("vendor.json"),
+            r#"{"vendor_auth": "Bearer abc\n", "nested": {"signing": "s-1"}}"#,
+        )
+        .unwrap();
+        let raw = json_file_spec(
+            "      vendor_auth:\n        json_file: ./vendor.json\n      vendor_signing:\n        json_file: ./vendor.json\n        jq: .nested.signing\n",
+        );
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&raw).unwrap();
+        let spec = convert_env_spec(yaml, root.path(), None).unwrap();
+        let embedded = |name: &str| match &spec.deployments[0]
+            .secrets
+            .iter()
+            .find(|s| s.secret_name == name)
+            .unwrap()
+            .source
+        {
+            DeploymentSecretSource::Embedded(value) => value.clone(),
+            other => panic!("unexpected source for {name}: {other:?}"),
+        };
+        assert_eq!(embedded("vendor_auth"), "Bearer abc");
+        assert_eq!(embedded("vendor_signing"), "s-1");
+    }
+
+    /// The json_file is the secret's only source: nothing to fall through to.
+    #[test]
+    fn a_json_file_secret_fails_when_the_file_or_field_is_missing_or_empty() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("vendor.json"), r#"{"empty": "", "other": "1"}"#).unwrap();
+        let err = |secrets: &str| {
+            let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(&json_file_spec(secrets)).unwrap();
+            convert_env_spec(yaml, root.path(), None)
+                .unwrap_err()
+                .to_string()
+                .replace('\\', "/")
+        };
+
+        let missing_file = err("      api_key:\n        json_file: ./nope.json\n");
+        assert!(
+            missing_file.contains("Secret 'api_key' reads json_file"),
+            "{missing_file}"
+        );
+        assert!(
+            missing_file.contains("nope.json, which does not exist"),
+            "{missing_file}"
+        );
+
+        let missing_field = err("      api_key:\n        json_file: ./vendor.json\n");
+        assert!(missing_field.contains("vendor.json has no .api_key"), "{missing_field}");
+
+        let empty = err("      empty:\n        json_file: ./vendor.json\n");
+        assert!(empty.contains("Secret 'empty' is empty in"), "{empty}");
+
+        let two_sources = err("      api_key:\n        json_file: ./vendor.json\n        env: API_KEY\n");
+        assert!(two_sources.contains("aws and json_file sources"), "{two_sources}");
     }
 
     /// Everything that was consulted is named, so a secret that is nowhere does

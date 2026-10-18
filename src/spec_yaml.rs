@@ -255,10 +255,14 @@ pub struct DeploymentSecretSpecYaml {
     // AWS Secrets Manager secret name or ARN. Resolved on the deploy target, not
     // here, so the value never enters the generated deployment directory.
     pub aws: Option<String>,
+    // A JSON document read where the deployment is prepared; the secret takes the
+    // field named after it, or the one its `jq` selects. Several secrets can share
+    // one file.
+    pub json_file: Option<String>,
     // Filter for a secret that holds a JSON document: required by an `aws` source
-    // that is more than one value, and on its own it selects a field of the
-    // deployment's `secrets_json` or `secrets_aws` document. Defaults to the field
-    // named after the secret.
+    // that is more than one value, selects the field of a `json_file`, and on its
+    // own it selects a field of the deployment's `secrets_json` or `secrets_aws`
+    // document. Defaults to the field named after the secret.
     pub jq: Option<String>,
 }
 

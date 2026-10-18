@@ -527,7 +527,7 @@ jq's own error output is discarded rather than printed: a parse error quotes the
 
 Notes:
 
-- `aws` cannot be combined with `env` or `file`, and `jq` goes with `aws`, [`secrets_json`](#secrets_json) or [`secrets_aws`](#secrets_aws) — never with `env` or `file`, which carry one raw value.
+- `aws` cannot be combined with `env`, `file` or `json_file`, and `jq` goes with `aws`, [`json_file`](#json_file), [`secrets_json`](#secrets_json) or [`secrets_aws`](#secrets_aws) — never with `env` or `file`, which carry one raw value.
 - An `aws` source written on the secret itself is read whole unless it sets `jq`. The deployment-wide [`secrets_aws`](#secrets_aws) is the one that defaults to a field named after the secret.
 - `$secret(name)` cannot reference an `aws` secret: env files are written when the deployment is prepared, and the value does not exist yet. Mount the secret on the service with `variable:` instead.
 - For `local` deployments there is no deploy target to defer to, so the lookup runs on your machine while the environment is resolved.
@@ -673,6 +673,8 @@ deployments:
         env: ENV_VAR_NAME         # read from shell environment
       from_file:
         file: ./path/to/file      # read from file
+      from_json_file:
+        json_file: ./secrets.json # the field named after the secret
       from_aws:
         aws: prod/myapp/db        # read from AWS Secrets Manager on the deploy target
         jq: .password             # optional; for secrets holding a JSON document
@@ -799,6 +801,7 @@ Each secret must match a name declared in `appspec.yaml`. Exactly one source mus
 | `secret_name:` + `jq: .path` | A field of the deployment's `secrets_json` or `secrets_aws` document. |
 | `secret_name:` + `env: VAR_NAME` | Read from the named shell environment variable at deploy time. |
 | `secret_name:` + `file: ./path` | Read from a file at deploy time. |
+| `secret_name:` + `json_file: ./path.json` | The field named after the secret in a JSON document, or the one `jq: .path` selects. See [json_file](#json_file). |
 
 ```yaml
 secrets:
@@ -808,7 +811,30 @@ secrets:
     env: REDIS_PASSWORD          # read from env var
   admin_cert:
     file: ./secrets/admin.pem    # read from file
+  vendor_token:
+    json_file: ./vendor.json     # field .vendor_token of the document
 ```
+
+##### json_file
+
+Several secrets that belong together can share one JSON document instead of a
+file or variable each:
+
+```yaml
+secrets:
+  vendor_ios_token:
+    json_file: ./vendor.json     # .vendor_ios_token
+  vendor_android_token:
+    json_file: ./vendor.json
+    jq: .android.token           # a field not named after the secret
+```
+
+The document is read where the deployment is prepared, like `file:`, and each
+file is parsed once however many secrets name it. The filter is a field path, as
+for [`secrets_json`](#secrets_json). Unlike `secrets_json` this is the secret's
+own source, so there is no fall-through: a file that does not exist, a field it
+does not have, a `null` or an empty value each stop the deployment naming the
+secret and the file. It is valid in every environment type.
 
 ##### Whitespace and empty values
 
