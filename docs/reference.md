@@ -527,7 +527,7 @@ jq's own error output is discarded rather than printed: a parse error quotes the
 
 Notes:
 
-- `aws` cannot be combined with `env`, `file` or `json_file`, and `jq` goes with `aws`, [`json_file`](#json_file), [`secrets_json`](#secrets_json) or [`secrets_aws`](#secrets_aws) — never with `env` or `file`, which carry one raw value.
+- A secret has one source: `env`, `file`, `aws`, `json_file` or `json_env`. `jq` goes with `aws`, [`json_file` or `json_env`](#json_file-and-json_env), [`secrets_json`](#secrets_json) or [`secrets_aws`](#secrets_aws) — never with `env` or `file`, which carry one raw value.
 - An `aws` source written on the secret itself is read whole unless it sets `jq`. The deployment-wide [`secrets_aws`](#secrets_aws) is the one that defaults to a field named after the secret.
 - `$secret(name)` cannot reference an `aws` secret: env files are written when the deployment is prepared, and the value does not exist yet. Mount the secret on the service with `variable:` instead.
 - For `local` deployments there is no deploy target to defer to, so the lookup runs on your machine while the environment is resolved.
@@ -675,6 +675,8 @@ deployments:
         file: ./path/to/file      # read from file
       from_json_file:
         json_file: ./secrets.json # the field named after the secret
+      from_json_env:
+        json_env: APP_SECRETS     # the same, from a variable holding the JSON
       from_aws:
         aws: prod/myapp/db        # read from AWS Secrets Manager on the deploy target
         jq: .password             # optional; for secrets holding a JSON document
@@ -801,7 +803,8 @@ Each secret must match a name declared in `appspec.yaml`. Exactly one source mus
 | `secret_name:` + `jq: .path` | A field of the deployment's `secrets_json` or `secrets_aws` document. |
 | `secret_name:` + `env: VAR_NAME` | Read from the named shell environment variable at deploy time. |
 | `secret_name:` + `file: ./path` | Read from a file at deploy time. |
-| `secret_name:` + `json_file: ./path.json` | The field named after the secret in a JSON document, or the one `jq: .path` selects. See [json_file](#json_file). |
+| `secret_name:` + `json_file: ./path.json` | The field named after the secret in a JSON file, or the one `jq: .path` selects. See [json_file and json_env](#json_file-and-json_env). |
+| `secret_name:` + `json_env: VAR_NAME` | The same, from an environment variable holding the JSON document. |
 
 ```yaml
 secrets:
@@ -815,26 +818,38 @@ secrets:
     json_file: ./vendor.json     # field .vendor_token of the document
 ```
 
-##### json_file
+##### json_file and json_env
 
 Several secrets that belong together can share one JSON document instead of a
-file or variable each:
+file or variable each. `json_file` reads it from a file, `json_env` from an
+environment variable — in CI, one GitHub secret holding the whole document:
 
 ```yaml
 secrets:
   vendor_ios_token:
-    json_file: ./vendor.json     # .vendor_ios_token
+    json_env: VENDOR_SECRETS     # field .vendor_ios_token of $VENDOR_SECRETS
   vendor_android_token:
-    json_file: ./vendor.json
+    json_env: VENDOR_SECRETS
     jq: .android.token           # a field not named after the secret
+  local_token:
+    json_file: ./vendor.json     # the same, from a file
 ```
 
-The document is read where the deployment is prepared, like `file:`, and each
-file is parsed once however many secrets name it. The filter is a field path, as
-for [`secrets_json`](#secrets_json). Unlike `secrets_json` this is the secret's
-own source, so there is no fall-through: a file that does not exist, a field it
-does not have, a `null` or an empty value each stop the deployment naming the
-secret and the file. It is valid in every environment type.
+```yaml
+# GitHub Actions
+env:
+  VENDOR_SECRETS: ${{ secrets.VENDOR_SECRETS }}   # {"vendor_ios_token": "...", "android": {"token": "..."}}
+```
+
+The document is read when the deployment is prepared, exactly like `env:` and
+`file:` — only for the deployment being prepared, so a sibling deployment in the
+same env spec never needs it — and parsed once however many secrets name it.
+The filter is a field path, as for [`secrets_json`](#secrets_json). Unlike
+`secrets_json` this is the secret's own source, so there is no fall-through: an
+unset variable, a file that does not exist, invalid JSON, a field the document
+does not have, a `null` or an empty value each stop the deployment, naming the
+secret and the document. A parse error gives the line and column, never the
+content. Both are valid in every environment type.
 
 ##### Whitespace and empty values
 

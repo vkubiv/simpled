@@ -329,6 +329,25 @@ secrets:
     env: REDIS_PASSWORD
 ```
 
+Secrets that belong together can live in one GitHub secret holding a JSON
+document; each takes the field named after it:
+
+```yaml
+env:
+  VENDOR_SECRETS: ${{ secrets.VENDOR_SECRETS }}   # {"vendor_token": "...", "vendor_signing": "..."}
+```
+
+```yaml
+secrets:
+  vendor_token:
+    json_env: VENDOR_SECRETS
+  vendor_signing:
+    json_env: VENDOR_SECRETS
+```
+
+No step writes the document to a file: simpled reads and validates it while
+preparing, and a missing field stops the run naming it.
+
 ### External secret managers
 
 For AWS Secrets Manager, HashiCorp Vault, or Azure Key Vault, retrieve secrets before running `simpled`:

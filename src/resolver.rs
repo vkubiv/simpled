@@ -244,6 +244,8 @@ fn resolve_secrets(
         values: HashMap::new(),
         deferred: HashSet::new(),
     };
+    // A document several secrets share is read and parsed once.
+    let mut documents: HashMap<JsonDocument, serde_json::Value> = HashMap::new();
     for secret_spec in &deployment.secrets {
         let value = match &secret_spec.source {
             DeploymentSecretSource::EnvVariable(var_name) => {
@@ -295,6 +297,26 @@ fn resolve_secrets(
             }
             DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
             DeploymentSecretSource::Aws(reference) => resolve_aws_secret(env_spec, reference)?,
+            DeploymentSecretSource::JsonField(json) => {
+                let name = &secret_spec.secret_name;
+                if !documents.contains_key(&json.document) {
+                    let parsed = read_json_document(name, &json.document)?;
+                    documents.insert(json.document.clone(), parsed);
+                }
+                let value = select_json_field(&documents[&json.document], &json.field).ok_or_else(|| {
+                    anyhow!(
+                        "Secret '{}' has no value: {} has no {}",
+                        name,
+                        json.document.describe(),
+                        json.filter
+                    )
+                })?;
+                let value = trim_secret_value(&value);
+                if value.is_empty() {
+                    return Err(anyhow!("Secret '{}' is empty in {}", name, json.document.describe()));
+                }
+                SecretResolvedValue::Literal(value.to_string())
+            }
         };
         match &value {
             SecretResolvedValue::Literal(literal) => {
@@ -310,6 +332,43 @@ fn resolve_secrets(
         });
     }
     Ok(secrets)
+}
+
+/// The JSON document of a `json_file` or `json_env` secret. The error never
+/// quotes the content: it is the secret.
+fn read_json_document(name: &str, document: &JsonDocument) -> Result<serde_json::Value> {
+    let content = match document {
+        JsonDocument::File { path, display } => {
+            if !Path::new(path).exists() {
+                return Err(anyhow!(
+                    "Secret '{}' reads json_file {}, which does not exist",
+                    name,
+                    display
+                ));
+            }
+            fs::read_to_string(path).with_context(|| format!("Failed to read json_file {}", display))?
+        }
+        JsonDocument::Env(variable) => match env::var(variable) {
+            Ok(value) if !value.trim().is_empty() => value,
+            Ok(_) => return Err(anyhow!("Secret '{}' reads json_env {}, which is empty", name, variable)),
+            Err(_) => {
+                return Err(anyhow!(
+                    "Secret '{}' reads json_env {}, which is not set",
+                    name,
+                    variable
+                ))
+            }
+        },
+    };
+    serde_json::from_str(&content).map_err(|error| {
+        anyhow!(
+            "Secret '{}': {} is not valid JSON (line {}, column {})",
+            name,
+            document.describe(),
+            error.line(),
+            error.column()
+        )
+    })
 }
 
 /// Everything `resolve_service` needs from its surroundings, plus the state

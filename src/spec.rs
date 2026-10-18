@@ -456,6 +456,50 @@ pub enum DeploymentSecretSource {
     /// the value is fetched on the machine that runs the deploy. That keeps the
     /// value out of the directory that is shipped to the target.
     Aws(AwsSecretRef),
+    /// `json_file:` or `json_env:`: one field of a JSON document. Read when the
+    /// deployment is prepared, like `env:` and `file:`, so preparing a sibling
+    /// deployment of the same env spec never needs the document.
+    JsonField(JsonFieldSecret),
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonFieldSecret {
+    pub document: JsonDocument,
+    /// The path the filter addresses, already checked to be a plain field path.
+    pub field: Vec<String>,
+    /// The filter as written, or the default one, for messages.
+    pub filter: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum JsonDocument {
+    /// The full path, and the path as a message prints it.
+    File { path: String, display: String },
+    /// An environment variable holding the whole document.
+    Env(String),
+}
+
+impl JsonDocument {
+    pub fn describe(&self) -> String {
+        match self {
+            JsonDocument::File { display, .. } => display.clone(),
+            JsonDocument::Env(variable) => format!("${}", variable),
+        }
+    }
+}
+
+/// The value at `field` in `doc` the way jq would print it — a string raw,
+/// anything else as its JSON — or `None` when it is absent or `null`.
+pub fn select_json_field(doc: &serde_json::Value, field: &[String]) -> Option<String> {
+    let mut value = doc;
+    for segment in field {
+        value = value.get(segment)?;
+    }
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// A secret value as it comes out of its source, without the newline whatever
