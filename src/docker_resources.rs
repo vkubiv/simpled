@@ -191,6 +191,8 @@ mod tests {
             replicas: 1,
             requests,
             limits,
+            update: None,
+            placement: None,
         }
     }
 

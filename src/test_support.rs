@@ -37,6 +37,8 @@ pub fn resources() -> ResourcesSpec {
         replicas: 1,
         requests: ResourceLimits::default(),
         limits: ResourceLimits::default(),
+        update: None,
+        placement: None,
     }
 }
 
@@ -83,6 +85,8 @@ pub fn resolved_env(env_type: DeploymentEnvType, deployment: DeploymentResolvedS
             version_routes: vec![],
             version_document: None,
             trusted_proxies: vec![],
+            global: false,
+            placement: None,
             name: "gateway".to_string(),
             tls: None,
             domains: vec![],

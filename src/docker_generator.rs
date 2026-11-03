@@ -18,6 +18,7 @@ const DOCKER_NETWORK: &str = "common_network";
 // changes the configuration format.
 const NGINX_IMAGE: &str = "nginx:1.31.6-alpine";
 const TRAEFIK_IMAGE: &str = "traefik:v2.10";
+const TRAEFIK_PING_ROUTER: &str = "simpled-ping";
 const CERTBOT_IMAGE: &str = "certbot/certbot:v5.8.0";
 const TRAEFIK_RESOLVER: &str = "myresolver";
 /// Placeholder backend for redirect-only routers, which still have to name one.
@@ -779,6 +780,19 @@ fn write_job_invocation(
         }
     }
 
+    if let Some(placement) = service.deploy.as_ref().and_then(|d| d.placement.as_ref()) {
+        for constraint in &placement.constraints {
+            writeln!(deploy_sh, "  --constraint {} \\", sh_quote(constraint))?;
+        }
+        for preference in &placement.preferences {
+            writeln!(
+                deploy_sh,
+                "  --placement-pref {} \\",
+                sh_quote(&format!("spread={}", preference.spread))
+            )?;
+        }
+    }
+
     for volume in &service.volumes {
         // Compose volume entries are `<source>:<target>`; the source is relative
         // to the stack file, i.e. to the deployment directory.
@@ -926,6 +940,7 @@ fn generate_nginx_swarm(
     writeln!(stack, "services:")?;
     writeln!(stack, "  nginx:")?;
     writeln!(stack, "    image: {}", NGINX_IMAGE)?;
+    write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress)?;
     write_swarm_host_ports(&mut stack, resolved_spec.ingress.tls.is_some())?;
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf")?;
@@ -1177,7 +1192,7 @@ fn generate_traefik_standalone(
     let traefik_dir = output_dir.join("traefik");
     fs::create_dir_all(&traefik_dir)?;
 
-    let has_tls = resolved_spec.ingress.tls.is_some();
+    let has_tls = resolved_spec.ingress.terminates_tls();
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
@@ -1186,6 +1201,7 @@ fn generate_traefik_standalone(
         has_tls,
         letsencrypt,
         &resolved_spec.ingress.trusted_proxies,
+        resolved_spec.ingress.tls_upstream(),
     )?;
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
@@ -1230,12 +1246,14 @@ fn generate_traefik_swarm(
     fs::create_dir_all(&traefik_dir)?;
 
     // Reuse generate logic for config, but write to new dir
-    let has_tls = resolved_spec.ingress.tls.is_some();
+    let has_tls = resolved_spec.ingress.terminates_tls();
+    let upstream = resolved_spec.ingress.tls_upstream();
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
-    if letsencrypt.is_none() {
+    if letsencrypt.is_none() && !upstream {
         return Err(anyhow!(
-            "Currently swarm ingress only supports Let's Encrypt, specify a letsencrypt block in ingress.tls"
+            "Currently swarm traefik ingress only supports Let's Encrypt or TLS terminated in front of it: \
+             specify a letsencrypt block in gateway.tls, or set gateway.tls.upstream: true"
         ));
     }
 
@@ -1245,6 +1263,7 @@ fn generate_traefik_swarm(
         has_tls,
         letsencrypt,
         &resolved_spec.ingress.trusted_proxies,
+        upstream,
     )?;
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
@@ -1254,6 +1273,7 @@ fn generate_traefik_swarm(
     writeln!(stack, "services:")?;
     writeln!(stack, "  traefik:")?;
     writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
+    write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress)?;
     write_swarm_host_ports(&mut stack, has_tls)?;
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./traefik/traefik.yml:/etc/traefik/traefik.yml")?;
@@ -1279,6 +1299,7 @@ fn write_traefik_static_config(
     has_tls: bool,
     letsencrypt: Option<&LetsEncryptResolvedSpec>,
     trusted_proxies: &[String],
+    ping: bool,
 ) -> Result<()> {
     writeln!(file, "entryPoints:")?;
     writeln!(file, "  web:")?;
@@ -1298,6 +1319,15 @@ fn write_traefik_static_config(
     writeln!(file, "  file:")?;
     writeln!(file, "    filename: \"/etc/traefik/dynamic_conf.yml\"")?;
     writeln!(file, "    watch: true")?;
+    // Traefik's own health answer on the entrypoint the load balancer reaches.
+    // Its built-in router is `PathPrefix(`/ping`)`, which would also swallow
+    // `/pingback` on every domain, so it is routed by hand instead: an exact
+    // `Path(`/ping`)` router in the dynamic config (TRAEFIK_PING_ROUTER).
+    if ping {
+        writeln!(file, "ping:")?;
+        writeln!(file, "  entryPoint: web")?;
+        writeln!(file, "  manualRouting: true")?;
+    }
     if let Some(le) = letsencrypt {
         writeln!(file, "certificatesResolvers:")?;
         writeln!(file, "  {}:", TRAEFIK_RESOLVER)?;
@@ -1321,6 +1351,34 @@ fn write_traefik_trusted_ips(file: &mut File, trusted_proxies: &[String]) -> Res
     writeln!(file, "      trustedIPs:")?;
     for entry in trusted_proxies {
         writeln!(file, "        - \"{}\"", entry)?;
+    }
+    Ok(())
+}
+
+/// `deploy:` of the gateway service, written only when the env spec asks for
+/// global mode or a placement, so the stack is otherwise what it always was.
+fn write_swarm_ingress_deploy(stack: &mut File, ingress: &IngressResolvedSpec) -> Result<()> {
+    if !ingress.global && ingress.placement.is_none() {
+        return Ok(());
+    }
+    writeln!(stack, "    deploy:")?;
+    if ingress.global {
+        writeln!(stack, "      mode: global")?;
+    }
+    if let Some(placement) = &ingress.placement {
+        writeln!(stack, "      placement:")?;
+        if !placement.constraints.is_empty() {
+            writeln!(stack, "        constraints:")?;
+            for constraint in &placement.constraints {
+                writeln!(stack, "          - {}", serde_json::to_string(constraint)?)?;
+            }
+        }
+        if !placement.spread.is_empty() {
+            writeln!(stack, "        preferences:")?;
+            for spread in &placement.spread {
+                writeln!(stack, "          - spread: {}", serde_json::to_string(spread)?)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1355,7 +1413,10 @@ fn write_swarm_compose_network(stack: &mut File, network_name: &str) -> Result<(
 
 fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<()> {
     let mut file = File::create(path)?;
-    let has_tls = ingress.tls.is_some();
+    // Clients use https whenever TLS is on, upstream or here; only the latter
+    // puts the routers on `websecure`.
+    let public_https = ingress.tls.is_some();
+    let has_tls = ingress.terminates_tls();
     let use_le = ingress.tls.as_ref().map(|t| t.letsencrypt.is_some()).unwrap_or(false);
 
     writeln!(file, "http:")?;
@@ -1409,11 +1470,24 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         writeln!(file, "    {}:", traefik_redirect_name(&redirect.from_domain))?;
         writeln!(file, "      redirectRegex:")?;
         writeln!(file, "        regex: \"^https?://[^/]+/(.*)\"")?;
-        writeln!(file, "        replacement: \"{}/${{1}}\"", redirect.target_url(has_tls))?;
+        writeln!(
+            file,
+            "        replacement: \"{}/${{1}}\"",
+            redirect.target_url(public_https)
+        )?;
         writeln!(file, "        permanent: {}", redirect.permanent)?;
     }
 
     writeln!(file, "  routers:")?;
+    if ingress.tls_upstream() {
+        // No Host matcher, so it answers whatever Host the health check sends.
+        writeln!(file, "    {}:", TRAEFIK_PING_ROUTER)?;
+        writeln!(file, "      rule: \"Path(`/ping`)\"")?;
+        writeln!(file, "      entryPoints:")?;
+        writeln!(file, "        - web")?;
+        writeln!(file, "      service: ping@internal")?;
+        writeln!(file, "      priority: 2147483647")?;
+    }
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
 
@@ -1580,6 +1654,8 @@ mod tests {
                 replicas: 1,
                 requests: ResourceLimits::default(),
                 limits: ResourceLimits::default(),
+                update: None,
+                placement: None,
             },
             working_dir: None,
             excluded: false,
@@ -1655,6 +1731,8 @@ mod tests {
                 version_routes: vec![],
                 version_document: None,
                 trusted_proxies: Vec::new(),
+                global: false,
+                placement: None,
                 name: "gateway".to_string(),
                 tls: None,
                 domains: vec![],
@@ -1678,6 +1756,8 @@ mod tests {
             version_routes: vec![],
             version_document: None,
             trusted_proxies: Vec::new(),
+            global: false,
+            placement: None,
             name: "gateway".to_string(),
             tls,
             domains: vec!["www.somesite.com".to_string(), "somesite.com".to_string()],
@@ -1705,6 +1785,8 @@ mod tests {
             version_routes: vec![],
             version_document: None,
             trusted_proxies: Vec::new(),
+            global: false,
+            placement: None,
             name: "gateway".to_string(),
             tls: None,
             domains: vec!["somesite.com".to_string()],
@@ -1771,6 +1853,7 @@ mod tests {
                 server: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
                 email: "ops@somesite.com".to_string(),
             }),
+            upstream: false,
         }
     }
 
@@ -2292,7 +2375,7 @@ mkdir -p \"/var/"
         let letsencrypt = if has_tls { tls.letsencrypt.as_ref() } else { None };
         let proxies: Vec<String> = trusted_proxies.iter().map(|p| p.to_string()).collect();
         let mut file = File::create(&path).unwrap();
-        write_traefik_static_config(&mut file, has_tls, letsencrypt, &proxies).unwrap();
+        write_traefik_static_config(&mut file, has_tls, letsencrypt, &proxies, false).unwrap();
         drop(file);
         fs::read_to_string(path).unwrap()
     }
@@ -2306,6 +2389,56 @@ mkdir -p \"/var/"
         assert_eq!(
             static_config(false, &[]),
             "entryPoints:\n  web:\n    address: \":80\"\nproviders:\n  file:\n    filename: \"/etc/traefik/dynamic_conf.yml\"\n    watch: true\n"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_traefik_listens_on_web_only_and_answers_ping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("traefik.yml");
+        let mut file = File::create(&path).unwrap();
+        write_traefik_static_config(&mut file, false, None, &["10.0.0.0/16".to_string()], true).unwrap();
+        drop(file);
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "entryPoints:\n  web:\n    address: \":80\"\n    forwardedHeaders:\n      trustedIPs:\n        - \"10.0.0.0/16\"\nproviders:\n  file:\n    filename: \"/etc/traefik/dynamic_conf.yml\"\n    watch: true\nping:\n  entryPoint: web\n  manualRouting: true\n"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_routers_stay_on_web_and_redirect_to_https() {
+        let mut ingress = ingress_with_redirect(Some(IngressTlsResolvedSpec {
+            secret: None,
+            letsencrypt: None,
+            upstream: true,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_conf.yml");
+        generate_traefik_dynamic_config(&ingress, &path).unwrap();
+        let conf = fs::read_to_string(&path).unwrap();
+        assert!(!conf.contains("websecure") && !conf.contains("tls:"), "{}", conf);
+        assert!(
+            conf.contains("replacement: \"https://www.somesite.com/${1}\""),
+            "{}",
+            conf
+        );
+        assert!(
+            conf.contains(
+                "  routers:\n    simpled-ping:\n      rule: \"Path(`/ping`)\"\n      entryPoints:\n        - web\n      service: ping@internal\n      priority: 2147483647\n"
+            ),
+            "{}",
+            conf
+        );
+
+        // Without TLS at all the redirect stays on http, and there is no ping.
+        ingress.tls = None;
+        generate_traefik_dynamic_config(&ingress, &path).unwrap();
+        let conf = fs::read_to_string(&path).unwrap();
+        assert!(!conf.contains("simpled-ping"), "{}", conf);
+        assert!(
+            conf.contains("replacement: \"http://www.somesite.com/${1}\""),
+            "{}",
+            conf
         );
     }
 

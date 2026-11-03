@@ -86,6 +86,8 @@ pub fn service(deployment: &str, document: &str, env_type: &DeploymentEnvType) -
             replicas: 1,
             requests: k8s_limits(on_k8s, "16Mi", "10m"),
             limits: k8s_limits(on_k8s, "32Mi", "50m"),
+            update: None,
+            placement: None,
         },
         working_dir: None,
         excluded: false,

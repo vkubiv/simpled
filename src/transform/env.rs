@@ -27,6 +27,7 @@ pub fn convert_env_spec(
     let ingress_type_str = gateway_yaml.ingress_type.clone();
     let has_trusted_proxies = gateway_yaml.trusted_proxies.as_ref().is_some_and(|p| !p.is_empty());
     let ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
+    let tls_upstream = ingress.tls.as_ref().is_some_and(|t| t.upstream);
     let registry = yaml.registry.unwrap_or_default();
 
     // Resolve `extends` inheritance before anything inspects the deployments, so
@@ -76,6 +77,15 @@ pub fn convert_env_spec(
         }
         deployments.push(deployment);
     }
+    let swarm_only = swarm_only_setting(&ingress, &deployments);
+    let reject_swarm_only = |env: &str| match &swarm_only {
+        Some(what) => Err(anyhow!(
+            "{} cannot be set for {} environment: it only applies to Docker Swarm (type: docker, swarm_mode: true)",
+            what,
+            env
+        )),
+        None => Ok(()),
+    };
 
     let env_type = match env_type_yaml {
         DeploymentEnvTypeYaml::K8S => {
@@ -90,6 +100,12 @@ pub fn convert_env_spec(
                     "gateway trusted_proxies cannot be set for K8S environment: configure the ingress controller instead"
                 ));
             }
+            if tls_upstream {
+                return Err(anyhow!(
+                    "gateway tls.upstream cannot be set for K8S environment: configure the ingress controller instead"
+                ));
+            }
+            reject_swarm_only("K8S")?;
             if concrete.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for K8S environment"));
             }
@@ -117,6 +133,14 @@ pub fn convert_env_spec(
             if concrete.values().any(|d| d.exclude_services.is_some()) {
                 return Err(anyhow!("exclude_services cannot be set for Docker environment"));
             }
+            if tls_upstream && ingress_type == DockerIngressType::Nginx {
+                return Err(anyhow!(
+                    "gateway tls.upstream is only supported with the traefik gateway (type: traefik)"
+                ));
+            }
+            if !swarm_mode {
+                reject_swarm_only("standalone Docker")?;
+            }
             DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode,
                 ingress_type,
@@ -132,6 +156,7 @@ pub fn convert_env_spec(
             if has_trusted_proxies {
                 return Err(anyhow!("gateway trusted_proxies cannot be set for Local environment"));
             }
+            reject_swarm_only("Local")?;
             if deployments.is_empty() {
                 return Err(anyhow!(
                     "For Local environment at least one deployment must be specified"
@@ -434,6 +459,8 @@ fn merge_service(base: &DeploymentServiceSpecYaml, child: &DeploymentServiceSpec
         hosts: merge_opt_map(base.hosts.as_ref(), child.hosts.as_ref(), |_, c| c.clone()),
         replicas: child.replicas.or(base.replicas),
         resources: child.resources.clone().or_else(|| base.resources.clone()),
+        update: child.update.clone().or_else(|| base.update.clone()),
+        placement: child.placement.clone().or_else(|| base.placement.clone()),
         ports: child.ports.clone().or_else(|| base.ports.clone()),
         expose: child.expose.clone().or_else(|| base.expose.clone()),
         // Volumes concatenate rather than replace: an `extends` child adding a
@@ -687,6 +714,20 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         (None, DeploymentEnvTypeYaml::Local) => None,
         (None, _) => return Err(anyhow!("Ingress TLS configuration is required for non-local environments. If you want to disable TLS explicitly set 'disable: true' in tls section")),
         (Some(t), _) => {
+            let upstream = t.upstream == Some(true);
+            if upstream && matches!(env_type, DeploymentEnvTypeYaml::Local) {
+                return Err(anyhow!("gateway tls.upstream cannot be set for Local environment"));
+            }
+            if upstream && t.disable == Some(true) {
+                return Err(anyhow!(
+                    "gateway tls.upstream and tls.disable are mutually exclusive: upstream means TLS is on, terminated in front of the gateway"
+                ));
+            }
+            if upstream && (t.letsencrypt.is_some() || t.secret.is_some()) {
+                return Err(anyhow!(
+                    "gateway tls.upstream cannot be combined with tls.letsencrypt or tls.secret: with upstream the gateway holds no certificate"
+                ));
+            }
             if t.disable == Some(true) {
                 None
             } else if matches!(env_type, DeploymentEnvTypeYaml::Local) {
@@ -705,6 +746,7 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
                 Some(IngressTlsSpec {
                     secret: t.secret,
                     letsencrypt,
+                    upstream,
                 })
             }
         }
@@ -741,6 +783,24 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         }
     }
 
+    let global = yaml.global == Some(true);
+    let placement = yaml
+        .placement
+        .as_ref()
+        .map(|p| convert_placement(p, "gateway"))
+        .transpose()?;
+    if global && tls.as_ref().is_some_and(|t| t.letsencrypt.is_some()) {
+        return Err(anyhow!(
+            "gateway global cannot be combined with tls.letsencrypt: every gateway task would run its own ACME client \
+             and the HTTP-01 challenge would reach a random node. Terminate TLS upstream (tls.upstream) or bring a certificate (tls.secret)"
+        ));
+    }
+    if global && placement.as_ref().is_some_and(|p| !p.spread.is_empty()) {
+        return Err(anyhow!(
+            "gateway placement.preferences cannot be combined with global: a global service runs one task on every eligible node"
+        ));
+    }
+
     Ok(IngressSpec {
         name: yaml.name,
         hosts,
@@ -748,7 +808,119 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         redirects,
         body_limit,
         trusted_proxies,
+        global,
+        placement,
     })
+}
+
+/// The first Swarm-only setting the env spec uses, described for an error
+/// message, or `None`. Only concrete deployments are looked at: an abstract
+/// base is a template and is never deployed.
+fn swarm_only_setting(ingress: &IngressSpec, deployments: &[DeploymentSpec]) -> Option<String> {
+    if ingress.global {
+        return Some("gateway global".to_string());
+    }
+    if ingress.placement.is_some() {
+        return Some("gateway placement".to_string());
+    }
+    let field = |r: &ResourcesSpec| {
+        if r.update.is_some() {
+            Some("update")
+        } else if r.placement.is_some() {
+            Some("placement")
+        } else {
+            None
+        }
+    };
+    let mut deployments: Vec<&DeploymentSpec> = deployments.iter().collect();
+    deployments.sort_by(|a, b| a.name.cmp(&b.name));
+    for deployment in deployments {
+        if let Some(f) = field(&deployment.defaults) {
+            return Some(format!("{} in deployment '{}' defaults", f, deployment.name));
+        }
+        let mut names: Vec<&String> = deployment.services.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(f) = field(&deployment.services[name].resources) {
+                return Some(format!(
+                    "{} on service '{}' in deployment '{}'",
+                    f, name, deployment.name
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn convert_update(yaml: &UpdateSpecYaml, owner: &str) -> Result<UpdatePolicy> {
+    let order = match yaml.order.as_deref() {
+        None => None,
+        Some("start-first") => Some(UpdateOrder::StartFirst),
+        Some("stop-first") => Some(UpdateOrder::StopFirst),
+        Some(other) => bail!(
+            "{}: invalid update.order '{}', expected start-first or stop-first",
+            owner,
+            other
+        ),
+    };
+    let failure_action = match yaml.failure_action.as_deref() {
+        None => None,
+        Some("rollback") => Some(UpdateFailureAction::Rollback),
+        Some("pause") => Some(UpdateFailureAction::Pause),
+        Some("continue") => Some(UpdateFailureAction::Continue),
+        Some(other) => bail!(
+            "{}: invalid update.failure_action '{}', expected rollback, pause or continue",
+            owner,
+            other
+        ),
+    };
+    let duration = |field: &str, value: &Option<String>| -> Result<Option<String>> {
+        match value {
+            None => Ok(None),
+            Some(v) if spec::parse_duration_secs(v).is_some() => Ok(Some(v.trim().to_string())),
+            Some(v) => bail!(
+                "{}: invalid update.{} '{}', expected a duration such as 10s, 1m30s or 500ms",
+                owner,
+                field,
+                v
+            ),
+        }
+    };
+    Ok(UpdatePolicy {
+        order,
+        failure_action,
+        parallelism: yaml.parallelism,
+        delay: duration("delay", &yaml.delay)?,
+        monitor: duration("monitor", &yaml.monitor)?,
+    })
+}
+
+fn convert_placement(yaml: &PlacementSpecYaml, owner: &str) -> Result<Placement> {
+    let constraints = yaml.constraints.clone().unwrap_or_default();
+    for constraint in &constraints {
+        let well_formed = ["==", "!="].iter().any(|op| {
+            constraint
+                .split_once(op)
+                .is_some_and(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        });
+        if !well_formed {
+            bail!(
+                "{}: invalid placement constraint '{}', expected '<attribute> == <value>' or '<attribute> != <value>', e.g. \"node.role == worker\"",
+                owner,
+                constraint
+            );
+        }
+    }
+    let spread: Vec<String> = yaml
+        .preferences
+        .iter()
+        .flatten()
+        .map(|p| p.spread.trim().to_string())
+        .collect();
+    if spread.iter().any(|s| s.is_empty()) {
+        bail!("{}: placement preference has an empty spread", owner);
+    }
+    Ok(Placement { constraints, spread })
 }
 
 fn is_ip_or_cidr(value: &str) -> bool {
@@ -970,12 +1142,14 @@ fn convert_deployment(
     };
 
     let defaults = if let Some(def) = &yaml.defaults {
-        convert_defaults(def)?
+        convert_defaults(def, &name)?
     } else {
         ResourcesSpec {
             replicas: 1,
             requests: ResourceLimits::default(),
             limits: ResourceLimits::default(),
+            update: None,
+            placement: None,
         }
     };
 
@@ -1033,12 +1207,19 @@ fn convert_deployment_app(yaml: &DeploymentAppSpecYaml, root: &Path) -> Result<D
     })
 }
 
-fn convert_defaults(yaml: &DefaultsSpecYaml) -> Result<ResourcesSpec> {
+fn convert_defaults(yaml: &DefaultsSpecYaml, deployment: &str) -> Result<ResourcesSpec> {
     let res = yaml.resources.as_ref();
+    let owner = format!("Deployment '{}' defaults", deployment);
     Ok(ResourcesSpec {
         replicas: yaml.replicas.unwrap_or(1),
         requests: convert_limits(res.and_then(|r| r.requests.as_ref())),
         limits: convert_limits(res.and_then(|r| r.limits.as_ref())),
+        update: yaml.update.as_ref().map(|u| convert_update(u, &owner)).transpose()?,
+        placement: yaml
+            .placement
+            .as_ref()
+            .map(|p| convert_placement(p, &owner))
+            .transpose()?,
     })
 }
 
@@ -1136,17 +1317,32 @@ fn convert_deployment_service(
 ) -> Result<DeploymentServiceSpec> {
     let routes = convert_service_routes(yaml, name)?;
 
+    // `update` and `placement` replace the defaults' value as a whole, the way
+    // `resources` does; nothing is merged field by field.
+    let owner = format!("Service '{}'", name);
+    let update = match &yaml.update {
+        Some(u) => Some(convert_update(u, &owner)?),
+        None => defaults.update.clone(),
+    };
+    let placement = match &yaml.placement {
+        Some(p) => Some(convert_placement(p, &owner)?),
+        None => defaults.placement.clone(),
+    };
     let resources = if let Some(res) = &yaml.resources {
         ResourcesSpec {
             replicas: yaml.replicas.unwrap_or(defaults.replicas),
             requests: convert_limits(res.requests.as_ref()),
             limits: convert_limits(res.limits.as_ref()),
+            update,
+            placement,
         }
     } else {
         ResourcesSpec {
             replicas: yaml.replicas.unwrap_or(defaults.replicas),
             requests: defaults.requests.clone(),
             limits: defaults.limits.clone(),
+            update,
+            placement,
         }
     };
 
@@ -2366,5 +2562,165 @@ deployments:
         assert!(err.contains("trusted_proxies cannot be set for K8S"), "{err}");
         // An empty list says nothing, so it is not an error anywhere.
         assert!(convert_trusted("k8s", "").is_ok());
+    }
+
+    fn convert_raw(raw: &str) -> Result<DeploymentEnvironmentSpec> {
+        let yaml: DeploymentEnvironmentSpecYaml = serde_yaml::from_str(raw).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        convert_env_spec(yaml, root.path(), None)
+    }
+
+    const SWARM_ROLLOUT: &str = r#"
+type: docker
+swarm_mode: true
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    upstream: true
+deployments:
+  base:
+    abstract: true
+    application:
+      name: app
+    defaults:
+      update:
+        order: start-first
+        failure_action: rollback
+      placement:
+        constraints: ["node.role == worker"]
+    services:
+      api:
+        update:
+          parallelism: 2
+        placement:
+          preferences:
+            - spread: node.labels.az
+  prod:
+    extends: base
+    primary_host: web
+    services:
+      api:
+        placement:
+          constraints: ["node.labels.tier == app"]
+      worker:
+        replicas: 2
+"#;
+
+    #[test]
+    fn update_and_placement_replace_the_defaults_whole_and_follow_extends() {
+        let spec = convert_raw(SWARM_ROLLOUT).unwrap();
+        let prod = &spec.deployments[0];
+        assert!(spec.ingress.tls.as_ref().is_some_and(|t| t.upstream));
+
+        let defaults_update = prod.defaults.update.clone().unwrap();
+        assert_eq!(defaults_update.order, Some(UpdateOrder::StartFirst));
+        assert_eq!(defaults_update.failure_action, Some(UpdateFailureAction::Rollback));
+
+        // api's own update replaces the defaults' as a whole: no order inherited.
+        let api = &prod.services["api"].resources;
+        assert_eq!(
+            api.update,
+            Some(UpdatePolicy {
+                parallelism: Some(2),
+                ..UpdatePolicy::default()
+            })
+        );
+        // The child's placement replaces the base's api placement whole too.
+        assert_eq!(
+            api.placement,
+            Some(Placement {
+                constraints: vec!["node.labels.tier == app".to_string()],
+                spread: vec![],
+            })
+        );
+
+        // A service listed without either takes the deployment defaults.
+        let worker = &prod.services["worker"].resources;
+        assert_eq!(worker.update, Some(defaults_update));
+        assert_eq!(worker.placement, prod.defaults.placement);
+    }
+
+    #[test]
+    fn update_and_placement_are_rejected_off_swarm() {
+        let err = convert_raw(&SWARM_ROLLOUT.replace("swarm_mode: true\n", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("update in deployment 'prod' defaults cannot be set for standalone Docker environment"),
+            "{err}"
+        );
+
+        let local = SWARM_ROLLOUT
+            .replace("type: docker\nswarm_mode: true\n", "type: local\n")
+            .replace("  tls:\n    upstream: true\n", "");
+        let err = convert_raw(&local).unwrap_err().to_string();
+        assert!(err.contains("cannot be set for Local environment"), "{err}");
+
+        // Only on a service, after the defaults are gone.
+        let k8s = SWARM_ROLLOUT
+            .replace("type: docker\nswarm_mode: true\n", "type: k8s\n")
+            .replace("    upstream: true", "    disable: true")
+            .replace(
+                "    defaults:\n      update:\n        order: start-first\n        failure_action: rollback\n      placement:\n        constraints: [\"node.role == worker\"]\n",
+                "",
+            );
+        let err = convert_raw(&k8s).unwrap_err().to_string();
+        assert!(
+            err.contains("update on service 'api' in deployment 'prod' cannot be set for K8S environment"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_is_exclusive_with_disable_and_rejected_locally() {
+        let disabled = SWARM_ROLLOUT.replace("    upstream: true", "    upstream: true\n    disable: true");
+        let err = convert_raw(&disabled).unwrap_err().to_string();
+        assert!(
+            err.contains("tls.upstream and tls.disable are mutually exclusive"),
+            "{err}"
+        );
+
+        let secret = SWARM_ROLLOUT.replace("    upstream: true", "    upstream: true\n    secret: tls");
+        let err = convert_raw(&secret).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be combined with tls.letsencrypt or tls.secret"),
+            "{err}"
+        );
+
+        let local = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+  tls:
+    upstream: true
+deployments:
+  dev:
+    primary_host: web
+    application:
+      name: app
+"#;
+        let err = convert_raw(local).unwrap_err().to_string();
+        assert!(
+            err.contains("tls.upstream cannot be set for Local environment"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_global_gateway_takes_no_spread_preference() {
+        let raw = SWARM_ROLLOUT.replace(
+            "    upstream: true\n",
+            "    upstream: true\n  global: true\n  placement:\n    preferences:\n      - spread: node.labels.az\n",
+        );
+        let err = convert_raw(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("placement.preferences cannot be combined with global"),
+            "{err}"
+        );
+
+        let ok = SWARM_ROLLOUT.replace("    upstream: true\n", "    upstream: true\n  global: true\n");
+        assert!(convert_raw(&ok).unwrap().ingress.global);
     }
 }

@@ -653,6 +653,8 @@ mod tests {
             version_routes: vec![],
             version_document: None,
             trusted_proxies: Vec::new(),
+            global: false,
+            placement: None,
             name: "gateway".to_string(),
             tls,
             domains: vec!["www.somesite.com".to_string()],
@@ -697,10 +699,13 @@ mod tests {
                 version_routes: vec![],
                 version_document: None,
                 trusted_proxies: Vec::new(),
+                global: false,
+                placement: None,
                 name: "gateway".to_string(),
                 tls: Some(IngressTlsResolvedSpec {
                     secret: Some("tls".to_string()),
                     letsencrypt: None,
+                    upstream: false,
                 }),
                 domains: vec!["somesite.com".to_string()],
                 rules: vec![IngressRule {
@@ -814,6 +819,7 @@ mod tests {
                 server: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
                 email: "ops@somesite.com".to_string(),
             }),
+            upstream: false,
         };
         let yaml = render(&ingress(
             vec![redirect("somesite.com", "www.somesite.com", true)],
@@ -908,6 +914,8 @@ mod tests {
                     memory: Some("256Mi".to_string()),
                     cpu: Some("200m".to_string()),
                 },
+                update: None,
+                placement: None,
             },
             working_dir: None,
             excluded: false,

@@ -268,6 +268,12 @@ one inline with `extends:`.
   (IPs/CIDRs) or the apps see the proxy instead of the client. Rejected on `k8s` (the
   ingress controller owns it) and `local`. The swarm gateway publishes in host mode and
   answers only on the node running it.
+- TLS ended at a load balancer (AWS ALB, CloudFront) in front of a swarm: `gateway.tls.upstream: true`
+  (traefik only; no `letsencrypt`/`secret`) makes Traefik plain HTTP on :80 with `GET /ping`
+  for the health check, `gateway.global: true` runs one gateway per node, and
+  `trusted_proxies` should hold the VPC CIDR. Per service (or in `defaults`), `update`
+  (`order`, `failure_action`, `parallelism`, `delay`, `monitor`) and `placement`
+  (`constraints`, `preferences: [{spread}]`) are Swarm-only and replace the defaults whole.
 - Only one deployment can run locally at a time; the ones you do not pick are dropped
   before validation, so they may freely share domains and ports.
 

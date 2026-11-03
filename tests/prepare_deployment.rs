@@ -346,3 +346,296 @@ fn an_invalid_trusted_proxy_fails_validation() {
         stderr
     );
 }
+
+/// Runs `prepare-deployment prod` on `env`, expecting it to fail, and returns stderr.
+fn prepare_fails(env: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    common::write_project(dir.path(), env);
+    let output = common::simpled(
+        dir.path(),
+        &["prepare-deployment", "prod", "--bundle", "bundle"],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    assert!(
+        !output.status.success(),
+        "expected a failure:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The fixture env spec with TLS ended in front of the gateway.
+fn upstream_envspec(env_type: &str, extra_top_level: &str, gateway: &str) -> String {
+    envspec(env_type, extra_top_level, gateway).replace("    disable: true", "    upstream: true")
+}
+
+#[test]
+fn an_upstream_tls_swarm_gateway_serves_plain_http_on_every_node() {
+    let env = upstream_envspec(
+        "docker",
+        "swarm_mode: true",
+        "type: traefik\n  global: true\n  placement:\n    constraints: [\"node.role == worker\"]\n  trusted_proxies: [\"10.0.0.0/16\"]\n  redirects:\n    - from: example.com\n      to: shop.example.com",
+    );
+    let dir = prepare(&env);
+    let ingress = dir.path().join("docker-deploy").join("ingress");
+
+    let traefik = read(&ingress.join("traefik").join("traefik.yml"));
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
+    let web = &parsed["entryPoints"]["web"];
+    assert_eq!(web["address"].as_str(), Some(":80"), "{}", traefik);
+    // No redirect to https: behind an HTTP listener it would loop.
+    assert!(web["http"].is_null(), "{}", traefik);
+    assert_eq!(
+        web["forwardedHeaders"]["trustedIPs"][0].as_str(),
+        Some("10.0.0.0/16"),
+        "{}",
+        traefik
+    );
+    assert!(parsed["entryPoints"]["websecure"].is_null(), "{}", traefik);
+    assert!(parsed["certificatesResolvers"].is_null(), "{}", traefik);
+    assert_eq!(parsed["ping"]["entryPoint"].as_str(), Some("web"), "{}", traefik);
+
+    let dynamic = read(&ingress.join("traefik").join("dynamic_conf.yml"));
+    serde_yaml::from_str::<serde_yaml::Value>(&dynamic).unwrap();
+    assert!(!dynamic.contains("websecure"), "{}", dynamic);
+    assert!(!dynamic.contains("tls:"), "{}", dynamic);
+    assert!(!dynamic.contains("certResolver"), "{}", dynamic);
+    // Clients still arrive over https, so a redirect keeps that scheme.
+    assert!(
+        dynamic.contains("replacement: \"https://shop.example.com/${1}\""),
+        "{}",
+        dynamic
+    );
+
+    let stack = read(&ingress.join("docker-compose.yaml"));
+    assert_eq!(host_mode_ports(&stack, "traefik"), vec![80]);
+    let stack: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
+    let deploy = &stack["services"]["traefik"]["deploy"];
+    assert_eq!(deploy["mode"].as_str(), Some("global"));
+    assert_eq!(
+        deploy["placement"]["constraints"][0].as_str(),
+        Some("node.role == worker")
+    );
+    assert!(!ingress.parent().unwrap().join("letsencrypt").exists());
+}
+
+#[test]
+fn an_upstream_tls_standalone_traefik_publishes_only_port_80() {
+    let dir = prepare(&upstream_envspec(
+        "docker",
+        "",
+        "type: traefik\n  trusted_proxies: [\"10.0.0.0/16\"]",
+    ));
+    let out = dir.path().join("docker-deploy");
+    let script = read(&out.join("deploy.sh"));
+    let traefik_run = script
+        .lines()
+        .find(|l| l.starts_with("docker run -d --name traefik-ingress"))
+        .unwrap();
+    assert!(traefik_run.contains(" -p 80:80"), "{}", traefik_run);
+    assert!(!traefik_run.contains("443"), "{}", traefik_run);
+    let traefik = read(&out.join("traefik").join("traefik.yml"));
+    assert!(
+        traefik.contains("ping:\n  entryPoint: web\n  manualRouting: true\n"),
+        "{}",
+        traefik
+    );
+    assert!(!traefik.contains("websecure"), "{}", traefik);
+}
+
+#[test]
+fn upstream_tls_without_trusted_proxies_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    common::write_project(
+        dir.path(),
+        &upstream_envspec("docker", "swarm_mode: true", "type: traefik"),
+    );
+    let output = common::simpled(
+        dir.path(),
+        &["prepare-deployment", "prod", "--bundle", "bundle"],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}", stderr);
+    assert!(
+        stderr.contains("Warning: gateway tls.upstream is set but gateway.trusted_proxies is empty"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn gateway_tls_and_mode_combinations_that_cannot_work_fail_validation() {
+    let letsencrypt = "    letsencrypt:\n      email: ops@example.com";
+    let cases = [
+        (
+            upstream_envspec("docker", "swarm_mode: true", "type: traefik")
+                .replace("    upstream: true", &format!("    upstream: true\n{}", letsencrypt)),
+            "tls.upstream cannot be combined with tls.letsencrypt or tls.secret",
+        ),
+        (
+            envspec("docker", "swarm_mode: true", "type: traefik\n  global: true")
+                .replace("    disable: true", letsencrypt),
+            "gateway global cannot be combined with tls.letsencrypt",
+        ),
+        (
+            upstream_envspec("docker", "swarm_mode: true", "type: nginx"),
+            "tls.upstream is only supported with the traefik gateway",
+        ),
+        (
+            upstream_envspec("k8s", "", ""),
+            "gateway tls.upstream cannot be set for K8S environment",
+        ),
+        (
+            envspec("docker", "", "type: traefik\n  global: true"),
+            "gateway global cannot be set for standalone Docker environment",
+        ),
+        (
+            envspec("k8s", "", "placement:\n    constraints: [\"node.role == worker\"]"),
+            "gateway placement cannot be set for K8S environment",
+        ),
+    ];
+    for (env, expected) in cases {
+        let stderr = prepare_fails(&env);
+        assert!(stderr.contains(expected), "expected '{}' in: {}", expected, stderr);
+    }
+}
+
+/// The fixture env spec with a deployment-wide update policy and placement, and
+/// an `api` override of the update policy only.
+fn envspec_with_rollout(env_type: &str, extra_top_level: &str, gateway_type: &str) -> String {
+    envspec(env_type, extra_top_level, gateway_type).replace(
+        "    services:\n      api:\n",
+        r#"    defaults:
+      update:
+        order: stop-first
+        parallelism: 2
+      placement:
+        constraints:
+          - node.role == worker
+        preferences:
+          - spread: node.labels.az
+    services:
+      api:
+        update:
+          order: start-first
+          failure_action: rollback
+          parallelism: 1
+          delay: 10s
+          monitor: 1m30s
+"#,
+    )
+}
+
+#[test]
+fn swarm_services_take_their_update_policy_and_placement() {
+    let dir = prepare(&envspec_with_rollout("docker", "swarm_mode: true", "type: nginx"));
+    let out = dir.path().join("docker-deploy");
+    let stack = read(&out.join("prod").join("docker-compose.yaml"));
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
+
+    let api = &parsed["services"]["api"]["deploy"];
+    let update = &api["update_config"];
+    assert_eq!(update["order"].as_str(), Some("start-first"), "{}", stack);
+    assert_eq!(update["failure_action"].as_str(), Some("rollback"), "{}", stack);
+    assert_eq!(update["parallelism"].as_u64(), Some(1), "{}", stack);
+    assert_eq!(update["delay"].as_str(), Some("10s"), "{}", stack);
+    assert_eq!(update["monitor"].as_str(), Some("1m30s"), "{}", stack);
+    let rollback = &api["rollback_config"];
+    assert_eq!(rollback["order"].as_str(), Some("start-first"), "{}", stack);
+    assert_eq!(rollback["parallelism"].as_u64(), Some(1), "{}", stack);
+    assert!(rollback["delay"].is_null(), "{}", stack);
+    // api sets no placement of its own, so it keeps the deployment's.
+    assert_eq!(
+        api["placement"]["constraints"][0].as_str(),
+        Some("node.role == worker"),
+        "{}",
+        stack
+    );
+    assert_eq!(
+        api["placement"]["preferences"][0]["spread"].as_str(),
+        Some("node.labels.az"),
+        "{}",
+        stack
+    );
+
+    // A service without an override takes the defaults whole; no rollback
+    // config without failure_action: rollback.
+    let db = &parsed["services"]["primary-db"]["deploy"];
+    assert_eq!(db["update_config"]["order"].as_str(), Some("stop-first"), "{}", stack);
+    assert_eq!(db["update_config"]["parallelism"].as_u64(), Some(2), "{}", stack);
+    assert!(db["update_config"]["failure_action"].is_null(), "{}", stack);
+    assert!(db["rollback_config"].is_null(), "{}", stack);
+    assert_eq!(
+        db["placement"]["constraints"][0].as_str(),
+        Some("node.role == worker"),
+        "{}",
+        stack
+    );
+
+    // A job is placed like the services, and never updated.
+    let script = read(&out.join("deploy.sh"));
+    assert!(
+        script.contains("  --constraint 'node.role == worker' \\\n  --placement-pref 'spread=node.labels.az' \\\n"),
+        "{}",
+        script
+    );
+    assert!(!script.contains("--update-"), "{}", script);
+}
+
+#[test]
+fn without_update_or_placement_the_swarm_stack_has_neither() {
+    let dir = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let out = dir.path().join("docker-deploy");
+    let stack = read(&out.join("prod").join("docker-compose.yaml"));
+    for key in ["update_config", "rollback_config", "placement"] {
+        assert!(!stack.contains(key), "{}", stack);
+    }
+    let script = read(&out.join("deploy.sh"));
+    assert!(
+        !script.contains("--constraint") && !script.contains("--placement-pref"),
+        "{}",
+        script
+    );
+    let ingress = read(&out.join("ingress").join("docker-compose.yaml"));
+    assert!(!ingress.contains("deploy:"), "{}", ingress);
+}
+
+#[test]
+fn update_and_placement_mistakes_fail_validation() {
+    let swarm = envspec_with_rollout("docker", "swarm_mode: true", "type: nginx");
+    let cases = [
+        (
+            swarm.replace("order: start-first", "order: blue-green"),
+            "Service 'api': invalid update.order 'blue-green'",
+        ),
+        (
+            swarm.replace("failure_action: rollback", "failure_action: retry"),
+            "Service 'api': invalid update.failure_action 'retry'",
+        ),
+        (
+            swarm.replace("delay: 10s", "delay: \"10\""),
+            "Service 'api': invalid update.delay '10'",
+        ),
+        (
+            swarm.replace("monitor: 1m30s", "monitor: soon"),
+            "Service 'api': invalid update.monitor 'soon'",
+        ),
+        (
+            swarm.replace("- node.role == worker", "- node.role"),
+            "Deployment 'prod' defaults: invalid placement constraint 'node.role'",
+        ),
+        (
+            envspec_with_rollout("docker", "", "type: nginx"),
+            "update in deployment 'prod' defaults cannot be set for standalone Docker environment",
+        ),
+        (
+            envspec_with_rollout("k8s", "", ""),
+            "update in deployment 'prod' defaults cannot be set for K8S environment",
+        ),
+    ];
+    for (env, expected) in cases {
+        let stderr = prepare_fails(&env);
+        assert!(stderr.contains(expected), "expected '{}' in: {}", expected, stderr);
+    }
+}

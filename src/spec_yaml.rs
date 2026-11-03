@@ -158,6 +158,9 @@ pub struct IngressTlsSpecYaml {
     pub disable: Option<bool>,
     pub secret: Option<String>,
     pub letsencrypt: Option<LetsEncryptSpecYaml>,
+    // TLS ends in front of the gateway (a load balancer holding the certificate):
+    // the gateway serves plain HTTP on :80 only, while URLs stay `https://`.
+    pub upstream: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -172,6 +175,10 @@ pub struct IngressSpecYaml {
     // Docker only: IPs/CIDRs of proxies in front of the gateway (a CDN, a load
     // balancer) whose X-Forwarded-For the gateway believes.
     pub trusted_proxies: Option<Vec<String>>,
+    // Swarm only: one gateway task on every node (`deploy.mode: global`).
+    pub global: Option<bool>,
+    // Swarm only: where the gateway task(s) may run.
+    pub placement: Option<PlacementSpecYaml>,
     // Domains the gateway answers only to send the client somewhere else, e.g.
     // the bare apex redirecting to the `www` host that actually serves the app.
     // They are never routed to a service, but they are still part of the
@@ -312,6 +319,33 @@ pub struct DeploymentAppSpecYaml {
 pub struct DefaultsSpecYaml {
     pub replicas: Option<u32>,
     pub resources: Option<ResourcesSpecYaml>,
+    pub update: Option<UpdateSpecYaml>,
+    pub placement: Option<PlacementSpecYaml>,
+}
+
+// Swarm only: how a rolling update replaces the tasks, `deploy.update_config`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSpecYaml {
+    pub order: Option<String>,
+    pub failure_action: Option<String>,
+    pub parallelism: Option<u32>,
+    pub delay: Option<String>,
+    pub monitor: Option<String>,
+}
+
+// Swarm only: `deploy.placement`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementSpecYaml {
+    pub constraints: Option<Vec<String>>,
+    pub preferences: Option<Vec<PlacementPreferenceYaml>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementPreferenceYaml {
+    pub spread: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -345,6 +379,9 @@ pub struct DeploymentServiceSpecYaml {
     pub prefixes: Option<HashMap<String, PrefixOptionsYaml>>,
     pub replicas: Option<u32>,
     pub resources: Option<ResourcesSpecYaml>,
+    // Swarm only. Each replaces the deployment `defaults` value as a whole.
+    pub update: Option<UpdateSpecYaml>,
+    pub placement: Option<PlacementSpecYaml>,
     // ports are a vector of strings in the form "external:internal"
     pub ports: Option<Vec<String>>,
     // Container ports the gateway routes to but which are NOT published on the

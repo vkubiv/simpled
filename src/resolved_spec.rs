@@ -1,6 +1,6 @@
 use crate::spec::{
-    AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, ResourcesSpec, ServiceCommand, ServiceConfigOption,
-    ServicePort, ServiceSecret, ServiceType, ServiceVolume,
+    AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, Placement, ResourcesSpec, ServiceCommand,
+    ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume,
 };
 
 #[derive(Debug)]
@@ -27,6 +27,23 @@ pub struct IngressResolvedSpec {
     pub version_document: Option<String>,
     /// Docker only: proxies whose X-Forwarded-For the gateway believes.
     pub trusted_proxies: Vec<String>,
+    /// Swarm only: one gateway task per node.
+    pub global: bool,
+    /// Swarm only: where the gateway task(s) may run.
+    pub placement: Option<Placement>,
+}
+
+impl IngressResolvedSpec {
+    /// Whether the gateway itself holds the certificate and listens on 443.
+    /// False without TLS and with `tls.upstream`, where TLS ends in front of it
+    /// even though clients still use `https://`.
+    pub fn terminates_tls(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| !t.upstream)
+    }
+
+    pub fn tls_upstream(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.upstream)
+    }
 }
 
 /// One domain's version endpoint, served by the version service of the
@@ -76,6 +93,7 @@ impl RedirectRule {
 pub struct IngressTlsResolvedSpec {
     pub secret: Option<String>,
     pub letsencrypt: Option<LetsEncryptResolvedSpec>,
+    pub upstream: bool,
 }
 
 #[derive(Debug, Clone)]

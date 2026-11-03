@@ -28,6 +28,15 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         }
     }
 
+    let upstream = env_spec.ingress.tls.as_ref().is_some_and(|t| t.upstream);
+    if upstream && env_spec.ingress.trusted_proxies.is_empty() {
+        eprintln!(
+            "Warning: gateway tls.upstream is set but gateway.trusted_proxies is empty: the gateway discards the \
+             X-Forwarded-For and X-Forwarded-Proto the load balancer sends, so the apps see the balancer's address \
+             and plain http. List the balancer's addresses (e.g. the VPC CIDR) under gateway.trusted_proxies."
+        );
+    }
+
     // Docker targets convert the quantities themselves, so a value they cannot
     // read is reported here rather than when the files are generated.
     if env_spec.env_type != DeploymentEnvType::K8S {

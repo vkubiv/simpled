@@ -627,6 +627,7 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
                 .unwrap_or("https://acme-v02.api.letsencrypt.org/directory".to_string()),
             email: le.email.clone(),
         }),
+        upstream: tls_spec.upstream,
     });
 
     let redirects = resolve_redirects(&env_spec.ingress)?;
@@ -651,6 +652,8 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         version_routes: crate::version_endpoint::routes(env_spec),
         version_document: None,
         trusted_proxies: env_spec.ingress.trusted_proxies.clone(),
+        global: env_spec.ingress.global,
+        placement: env_spec.ingress.placement.clone(),
     })
 }
 
@@ -1081,6 +1084,8 @@ mod tests {
             redirects,
             body_limit: None,
             trusted_proxies: Vec::new(),
+            global: false,
+            placement: None,
         }
     }
 

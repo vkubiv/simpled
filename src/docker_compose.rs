@@ -115,6 +115,81 @@ pub struct DeployConfig {
     pub restart_policy: Option<RestartPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<DockerResources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_config: Option<UpdateConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_config: Option<UpdateConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<DockerPlacement>,
+}
+
+/// `deploy.update_config` / `deploy.rollback_config`: only what is set.
+#[derive(Serialize, Clone, Default, Debug, PartialEq)]
+pub struct UpdateConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
+}
+
+impl UpdateConfig {
+    fn from_policy(policy: &spec::UpdatePolicy) -> Self {
+        UpdateConfig {
+            parallelism: policy.parallelism,
+            delay: policy.delay.clone(),
+            failure_action: policy.failure_action.map(|a| a.as_str().to_string()),
+            monitor: policy.monitor.clone(),
+            order: policy.order.map(|o| o.as_str().to_string()),
+        }
+    }
+
+    /// The rollback a `failure_action: rollback` triggers goes at the same pace
+    /// and in the same order as the update. Swarm's rollback defaults are
+    /// stop-first one task at a time, which under a start-first update would
+    /// take the service down while it rolls back.
+    fn rollback_for(policy: &spec::UpdatePolicy) -> Option<Self> {
+        if policy.failure_action != Some(spec::UpdateFailureAction::Rollback) {
+            return None;
+        }
+        let rollback = UpdateConfig {
+            parallelism: policy.parallelism,
+            order: policy.order.map(|o| o.as_str().to_string()),
+            ..UpdateConfig::default()
+        };
+        (rollback != UpdateConfig::default()).then_some(rollback)
+    }
+}
+
+#[derive(Serialize, Clone, Default, Debug)]
+pub struct DockerPlacement {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub preferences: Vec<PlacementPreference>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct PlacementPreference {
+    pub spread: String,
+}
+
+impl DockerPlacement {
+    fn from_spec(placement: &spec::Placement) -> Self {
+        DockerPlacement {
+            constraints: placement.constraints.clone(),
+            preferences: placement
+                .spread
+                .iter()
+                .map(|spread| PlacementPreference { spread: spread.clone() })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -323,19 +398,35 @@ pub fn prepare_service_with(
     //
     // Resources are written wherever they are set: Swarm and `docker compose up`
     // both read `deploy.resources`.
+    //
+    // Update policy and placement are Swarm's alone (validation rejects them
+    // anywhere else). A job carries its placement for the deploy script, which
+    // turns it into `docker service create` flags; it is never updated.
     let is_local = spec.env_type == spec::DeploymentEnvType::Local;
+    let is_swarm = matches!(&spec.env_type, spec::DeploymentEnvType::Docker(d) if d.swarm_mode);
     let resources = DockerResources::from_spec(&service.resources, &format!("Service '{}'", service.full_name))?;
+    let placement = service
+        .resources
+        .placement
+        .as_ref()
+        .filter(|_| is_swarm)
+        .map(DockerPlacement::from_spec);
+    let update = service.resources.update.as_ref().filter(|_| is_swarm);
     let deploy = match service.service_type {
         ServiceType::Job => Some(DeployConfig {
             restart_policy: Some(RestartPolicy {
                 condition: "none".to_string(),
             }),
             resources,
+            placement,
             ..DeployConfig::default()
         }),
         _ if !is_local => Some(DeployConfig {
             replicas: Some(service.resources.replicas),
             resources,
+            update_config: update.map(UpdateConfig::from_policy),
+            rollback_config: update.and_then(UpdateConfig::rollback_for),
+            placement,
             ..DeployConfig::default()
         }),
         _ => resources.map(|resources| DeployConfig {

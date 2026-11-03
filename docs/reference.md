@@ -548,6 +548,10 @@ gateway:
   body_limit: 10m         # optional; max request body for every route
   trusted_proxies:          # docker only, optional; proxies whose X-Forwarded-For is believed
     - 10.0.0.0/8
+  global: true              # swarm only, optional; one gateway task on every node
+  placement:                # swarm only, optional; where the gateway task(s) run
+    constraints:
+      - node.role == worker
   redirects:
     - from: domain.com      # a domain, or a list of them
       to: www.domain.com    # bare domain or full URL
@@ -558,6 +562,7 @@ gateway:
     letsencrypt:
       email: ops@co.com
       server: https://...   # optional; defaults to Let's Encrypt production
+    upstream: true          # docker + traefik; TLS ends at a load balancer in front
 ```
 
 `hosts` maps abstract names (used in `services[].host`) to real domain names. For local environments, use `localhost:port`.
@@ -672,6 +677,65 @@ Under Docker Swarm the gateway publishes its ports in host mode, so it sees the 
 | `disable: true` | No TLS. HTTP only. |
 | `secret: name` | Use an existing Kubernetes TLS secret. |
 | `letsencrypt` | Provision via Let's Encrypt (cert-manager). Kubernetes only. |
+| `upstream: true` | TLS is terminated in front of the gateway, by a load balancer or CDN holding the certificate. `docker` with the traefik gateway only. See [tls.upstream](#tlsupstream). |
+
+#### tls.upstream
+
+The gateway serves plain HTTP and the load balancer in front of it holds the certificate. Clients still use `https://`, so `relative` environment variables and redirect targets keep that scheme; only the gateway itself changes:
+
+- Traefik has the `web` entrypoint on `:80` only: no `websecure`, no `certificatesResolvers`/ACME, and no HTTP→HTTPS redirect (behind an HTTP listener it would loop). Routers carry no `tls`.
+- The gateway publishes only port 80 (host mode on Swarm, `-p 80:80` standalone).
+- Traefik's ping is enabled on `web`: `GET /ping` on port 80 answers `200 OK`, for use as the load balancer's health check. The path is fixed.
+
+| Combination | Result |
+|-------------|--------|
+| `upstream` with `letsencrypt` or `secret` | Validation error: the gateway holds no certificate. |
+| `upstream` with `disable: true` | Validation error. |
+| `upstream` with the nginx gateway | Validation error. |
+| `upstream` on `k8s` or `local` | Validation error. |
+| `upstream` with empty `trusted_proxies` | Allowed, with a warning: Traefik then discards the `X-Forwarded-For` and `X-Forwarded-Proto` the balancer sends, so the apps see its address and `http`. |
+
+About `/ping`: Traefik's built-in ping router is ``PathPrefix(`/ping`)``, which would also take `/pingback` and `/ping/x` on every domain, so simpled turns on `manualRouting` and adds its own router, `simpled-ping`, with the rule ``Path(`/ping`)``, no `Host` matcher and the highest priority, on the `web` entrypoint. It answers whatever `Host` header arrives, which matters because an ALB health check sends the target's IP as `Host`, and it takes only the exact path `/ping` from the app routes, on any domain; `/pingback`, `/ping/x` and every other path are routed as before. While Traefik shuts down gracefully, `/ping` answers `503`, so the balancer stops sending to that node before it goes away.
+
+#### global and placement (Swarm)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Rejected together with `tls.letsencrypt`: each task would run its own ACME client, and the HTTP-01 challenge would land on a random node. Allowed with `tls.upstream`, or with `tls.secret` on the nginx gateway (the swarm traefik gateway takes only `letsencrypt` or `upstream`). |
+| `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`. |
+
+Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the ingress stack is unchanged: a single replica placed anywhere.
+
+#### Behind a load balancer (AWS ALB)
+
+CloudFront → an internal ALB that terminates TLS with an ACM certificate → plain HTTP to Traefik on port 80 of every swarm node:
+
+```yaml
+type: docker
+swarm_mode: true
+gateway:
+  type: traefik
+  hosts:
+    web: shop.example.com
+  tls:
+    upstream: true
+  trusted_proxies:
+    - 10.0.0.0/16           # the VPC CIDR the ALB's addresses come from
+  global: true
+deployments:
+  prod:
+    # ...
+    defaults:
+      update:
+        order: start-first
+        failure_action: rollback
+        monitor: 30s
+      placement:
+        constraints:
+          - node.role == worker
+```
+
+On the AWS side: an ALB target group over every swarm node on HTTP port 80, health check path `/ping` (success code 200), and a listener on 443 with the ACM certificate forwarding to it. Keep the ALB in front of the nodes: the security group on port 80 should admit only the ALB, as the gateway itself trusts `X-Forwarded-*` from the whole `trusted_proxies` range. If CloudFront talks to the ALB over HTTP rather than HTTPS, the `X-Forwarded-Proto` the apps see is that hop's, not the client's.
 
 ---
 
@@ -761,7 +825,7 @@ deployments:
 | `secrets_env_prefix` | string | no | Reads every valueless secret from `<prefix><secret name>` in the environment, ignoring case. See [secrets_env_prefix](#secrets_env_prefix). |
 | `secrets_json` | string | no | Path to a JSON document holding a field per secret. See [secrets_json](#secrets_json). |
 | `secrets_aws` | string | no | AWS Secrets Manager secret holding that same document, for secrets with no source of their own. See [secrets_aws](#secrets_aws). |
-| `defaults` | object | no | Default replica count and resource limits applied to every service without a `resources` of its own. |
+| `defaults` | object | no | Default `replicas`, `resources`, and on Swarm `update` and `placement`, applied to every service that does not set its own. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
 | `exclude_services` | list | no | Services this deployment does not start. Only valid for `local`. See [exclude_services](#exclude_services). |
 
@@ -954,6 +1018,8 @@ Some things outside the stack do not follow an instance: a tunnel or OAuth redir
 | `variant` | string | Image variant to use (must be declared in `appspec.yaml`). |
 | `replicas` | int | Number of pod/container replicas. Overrides `defaults.replicas`. Applied on Kubernetes and Swarm; standalone Docker and local runs always start one container. |
 | `resources` | object | CPU/memory requests and limits, in Kubernetes notation. Overrides `defaults.resources` as a whole. Applied on every target; see [resources](#resources) for how Docker maps them. |
+| `update` | object | Swarm only. Rolling update policy. Overrides `defaults.update` as a whole. See [update and placement](#update-and-placement-swarm). |
+| `placement` | object | Swarm only. Placement constraints and preferences. Overrides `defaults.placement` as a whole. See [update and placement](#update-and-placement-swarm). |
 | `ports` | list | Published host ports, `"external:internal"`. The gateway routes to `external`, so it must equal the container's port; use `expose` when no host port is wanted. |
 | `expose` | list | Container ports the gateway may route to **without** publishing them on the host. The first entry wins as the upstream port, ahead of `ports`. |
 | `working_dir` | string | Local only. Directory of a host-run (non-dockerized) service. See [working_dir](#working_dir). |
@@ -999,6 +1065,39 @@ units (`512Mi` becomes `512m`, `1Gi` becomes `1g`), or to an exact byte count
 when the quantity is not a whole binary unit (`1G` becomes `1000000000`), and
 CPU to a decimal core count (`500m` becomes `0.5`). A value that is not a
 quantity, or a memory request above the memory limit, fails validation.
+
+#### update and placement (Swarm)
+
+```yaml
+deployments:
+  prod:
+    defaults:
+      update:
+        order: start-first        # start-first | stop-first
+        failure_action: rollback  # rollback | pause | continue
+        parallelism: 1            # tasks updated at once; 0 means all
+        delay: 10s                # between batches
+        monitor: 30s              # how long a new task is watched for failure
+      placement:
+        constraints:
+          - node.role == worker
+        preferences:
+          - spread: node.labels.az
+    services:
+      api:
+        update:
+          order: start-first
+          parallelism: 2
+```
+
+| Field | Written as |
+|-------|------------|
+| `update` | `deploy.update_config` of the stack service, only the fields that are set. With `failure_action: rollback` also `deploy.rollback_config` with the same `order` and `parallelism`, since Swarm's rollback defaults (stop-first, one task at a time) would otherwise apply to the rollback of a start-first update. |
+| `placement` | `deploy.placement` of the stack service (`constraints`, `preferences: [{spread}]`). On a job: `docker service create --constraint` / `--placement-pref spread=...`. |
+
+A service's own `update` or `placement` replaces the one in `defaults` whole, with no merging of fields (the same rule as `resources`); under `extends` a child's service entry or `defaults` likewise replaces the base's. `update` never applies to jobs, which are created and removed by the deploy script. `order` and `failure_action` must be one of the listed values, `delay` and `monitor` durations such as `10s`, `1m30s` or `500ms`, a constraint `<attribute> == <value>` or `!=`; anything else fails validation. Unset, nothing is written and Swarm's defaults apply. The generated version service of a deployment takes neither.
+
+Both fields are rejected on `k8s`, `local` and standalone Docker rather than ignored: an env spec has one `type`, so a shared `extends` base never has to serve another target, and a silently dropped constraint is how a service ends up on the wrong node.
 
 #### expose
 
@@ -1502,7 +1601,7 @@ Output directory: `docker-deploy/`
 | `<deployment>/<service>/` | Per-service `.env`, config and secret files |
 | `ingress/` | Traefik or nginx ingress stack |
 
-The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts.
+The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
 
 ### Local (`type: local`)
 

@@ -384,6 +384,10 @@ pub struct IngressSpec {
     /// IPs/CIDRs of the proxies in front of the gateway whose X-Forwarded-For
     /// is believed. Empty trusts no one, the gateway's own default.
     pub trusted_proxies: Vec<String>,
+    /// Swarm only: one gateway task per node instead of a single replica.
+    pub global: bool,
+    /// Swarm only: where the gateway task(s) may run.
+    pub placement: Option<Placement>,
 }
 
 /// A domain the gateway serves only to bounce the client to another one, such as
@@ -401,6 +405,9 @@ pub struct RedirectSpec {
 pub struct IngressTlsSpec {
     pub secret: Option<String>,
     pub letsencrypt: Option<LetsEncryptSpec>,
+    /// TLS ends in front of the gateway. Clients still use `https://`, so URLs
+    /// and redirects keep that scheme, but the gateway itself serves plain HTTP.
+    pub upstream: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +563,61 @@ pub struct ResourcesSpec {
     pub replicas: u32,
     pub requests: ResourceLimits,
     pub limits: ResourceLimits,
+    /// Swarm only: rolling update policy. `None` keeps Swarm's defaults.
+    pub update: Option<UpdatePolicy>,
+    /// Swarm only: placement constraints and preferences.
+    pub placement: Option<Placement>,
+}
+
+/// `deploy.update_config` of a Swarm service. Only the fields the env spec sets
+/// are written; durations are kept as written, already checked to parse.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UpdatePolicy {
+    pub order: Option<UpdateOrder>,
+    pub failure_action: Option<UpdateFailureAction>,
+    pub parallelism: Option<u32>,
+    pub delay: Option<String>,
+    pub monitor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UpdateOrder {
+    StartFirst,
+    StopFirst,
+}
+
+impl UpdateOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateOrder::StartFirst => "start-first",
+            UpdateOrder::StopFirst => "stop-first",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UpdateFailureAction {
+    Rollback,
+    Pause,
+    Continue,
+}
+
+impl UpdateFailureAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateFailureAction::Rollback => "rollback",
+            UpdateFailureAction::Pause => "pause",
+            UpdateFailureAction::Continue => "continue",
+        }
+    }
+}
+
+/// `deploy.placement` of a Swarm service: constraints such as
+/// `node.role == worker` and the label each `spread` preference spreads over.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Placement {
+    pub constraints: Vec<String>,
+    pub spread: Vec<String>,
 }
 
 /// A field is `None` when the env spec does not set it. Kubernetes writes the

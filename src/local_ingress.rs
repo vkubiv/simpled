@@ -434,6 +434,8 @@ mod tests {
             version_routes: vec![],
             version_document: Some(r#"{"version":"1.2.3"}"#.to_string()),
             trusted_proxies: Vec::new(),
+            global: false,
+            placement: None,
         };
         let handle = run(spec, "dev", "127.0.0.1", Path::new("local_env")).unwrap();
 
@@ -506,6 +508,8 @@ mod tests {
             version_routes: vec![],
             version_document: None,
             trusted_proxies: Vec::new(),
+            global: false,
+            placement: None,
         };
         let handle = run(spec, "dev", "127.0.0.1", Path::new("local_env")).unwrap();
 
