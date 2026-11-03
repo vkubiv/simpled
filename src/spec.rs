@@ -381,6 +381,9 @@ pub struct IngressSpec {
     /// Default maximum request body, in bytes, for every route the gateway
     /// serves. `None` leaves the gateway's own default in place.
     pub body_limit: Option<u64>,
+    /// IPs/CIDRs of the proxies in front of the gateway whose X-Forwarded-For
+    /// is believed. Empty trusts no one, the gateway's own default.
+    pub trusted_proxies: Vec<String>,
 }
 
 /// A domain the gateway serves only to bounce the client to another one, such as

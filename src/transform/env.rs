@@ -25,6 +25,7 @@ pub fn convert_env_spec(
         (None, None) => return Err(anyhow!("'gateway' field is required in env spec")),
     };
     let ingress_type_str = gateway_yaml.ingress_type.clone();
+    let has_trusted_proxies = gateway_yaml.trusted_proxies.as_ref().is_some_and(|p| !p.is_empty());
     let ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
     let registry = yaml.registry.unwrap_or_default();
 
@@ -84,6 +85,11 @@ pub fn convert_env_spec(
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for K8S environment"));
             }
+            if has_trusted_proxies {
+                return Err(anyhow!(
+                    "gateway trusted_proxies cannot be set for K8S environment: configure the ingress controller instead"
+                ));
+            }
             if concrete.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for K8S environment"));
             }
@@ -122,6 +128,9 @@ pub fn convert_env_spec(
             }
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for Local environment"));
+            }
+            if has_trusted_proxies {
+                return Err(anyhow!("gateway trusted_proxies cannot be set for Local environment"));
             }
             if deployments.is_empty() {
                 return Err(anyhow!(
@@ -722,13 +731,39 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
 
     let body_limit = convert_body_limit(yaml.body_limit.as_deref(), "gateway")?;
 
+    let trusted_proxies = yaml.trusted_proxies.unwrap_or_default();
+    for entry in &trusted_proxies {
+        if !is_ip_or_cidr(entry) {
+            return Err(anyhow!(
+                "Invalid gateway trusted_proxies entry '{}': expected an IP address or CIDR, e.g. \"10.0.0.0/8\" or \"2600:9000::/28\"",
+                entry
+            ));
+        }
+    }
+
     Ok(IngressSpec {
         name: yaml.name,
         hosts,
         tls,
         redirects,
         body_limit,
+        trusted_proxies,
     })
+}
+
+fn is_ip_or_cidr(value: &str) -> bool {
+    let (addr, prefix) = match value.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (value, None),
+    };
+    let Ok(addr) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    match prefix {
+        None => true,
+        Some(p) => p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u8>().is_ok_and(|p| p <= max),
+    }
 }
 
 /// Parses a `body_limit` value, naming what carries it so a typo points at the
@@ -2268,5 +2303,68 @@ deployments:
             .unwrap_err()
             .to_string();
         assert_eq!(err, "Deployment 'infra' lists service 'api' twice in exclude_services");
+    }
+
+    fn trusted_proxies_spec(env_type: &str, entries: &str) -> String {
+        format!(
+            r#"
+type: {env_type}
+gateway:
+  hosts:
+    web: example.com
+  tls:
+    disable: true
+  trusted_proxies: [{entries}]
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: app
+"#
+        )
+    }
+
+    fn convert_trusted(env_type: &str, entries: &str) -> Result<DeploymentEnvironmentSpec> {
+        let yaml: DeploymentEnvironmentSpecYaml =
+            serde_yaml::from_str(&trusted_proxies_spec(env_type, entries)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        convert_env_spec(yaml, root.path(), None)
+    }
+
+    #[test]
+    fn trusted_proxies_accept_ipv4_and_ipv6_addresses_and_cidrs() {
+        let spec = convert_trusted("docker", r#""10.0.0.0/8", "203.0.113.7", "2600:9000::/28", "::1""#).unwrap();
+        assert_eq!(
+            spec.ingress.trusted_proxies,
+            vec!["10.0.0.0/8", "203.0.113.7", "2600:9000::/28", "::1"]
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_reject_an_entry_that_is_not_an_ip_or_cidr() {
+        for bad in [
+            "10.0.0.0/33",
+            "2600:9000::/129",
+            "10.0.0/8",
+            "example.com",
+            "10.0.0.0/",
+            "10.0.0.0/+8",
+        ] {
+            let err = convert_trusted("docker", &format!("\"{bad}\""))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("trusted_proxies") && err.contains(&format!("'{bad}'")),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_are_docker_only() {
+        let err = convert_trusted("k8s", r#""10.0.0.0/8""#).unwrap_err().to_string();
+        assert!(err.contains("trusted_proxies cannot be set for K8S"), "{err}");
+        // An empty list says nothing, so it is not an error anywhere.
+        assert!(convert_trusted("k8s", "").is_ok());
     }
 }

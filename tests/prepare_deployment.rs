@@ -244,3 +244,105 @@ fn kubernetes_keeps_writing_the_builtin_defaults() {
         db
     );
 }
+
+fn host_mode_ports(stack: &str, service: &str) -> Vec<u64> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(stack).unwrap();
+    let ports = parsed["services"][service]["ports"].as_sequence().expect("ports list");
+    ports
+        .iter()
+        .map(|p| {
+            assert_eq!(p["mode"].as_str(), Some("host"), "{}", stack);
+            assert_eq!(p["protocol"].as_str(), Some("tcp"), "{}", stack);
+            assert_eq!(p["target"].as_u64(), p["published"].as_u64(), "{}", stack);
+            p["published"].as_u64().unwrap()
+        })
+        .collect()
+}
+
+/// The swarm gateway publishes in host mode, so the routing mesh does not
+/// replace the client address with its own.
+#[test]
+fn swarm_gateway_publishes_its_ports_in_host_mode() {
+    let dir = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let stack = read(
+        &dir.path()
+            .join("docker-deploy")
+            .join("ingress")
+            .join("docker-compose.yaml"),
+    );
+    assert_eq!(host_mode_ports(&stack, "nginx"), vec![80]);
+    assert!(!stack.contains("start-first"), "{}", stack);
+
+    let env = envspec(
+        "docker",
+        "swarm_mode: true",
+        "type: traefik\n  trusted_proxies:\n    - 10.0.0.0/8\n    - 2600:9000::/28",
+    )
+    .replace("    disable: true", "    letsencrypt:\n      email: ops@example.com");
+    let dir = prepare(&env);
+    let ingress = dir.path().join("docker-deploy").join("ingress");
+    let stack = read(&ingress.join("docker-compose.yaml"));
+    assert_eq!(host_mode_ports(&stack, "traefik"), vec![80, 443]);
+
+    let traefik = read(&ingress.join("traefik").join("traefik.yml"));
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
+    for entrypoint in ["web", "websecure"] {
+        assert_eq!(
+            parsed["entryPoints"][entrypoint]["forwardedHeaders"]["trustedIPs"][1].as_str(),
+            Some("2600:9000::/28"),
+            "{}",
+            traefik
+        );
+    }
+}
+
+#[test]
+fn trusted_proxies_reach_the_standalone_gateways() {
+    let dir = prepare(&envspec(
+        "docker",
+        "",
+        "type: traefik\n  trusted_proxies: [\"10.0.0.0/8\"]",
+    ));
+    let out = dir.path().join("docker-deploy");
+    let traefik = read(&out.join("traefik").join("traefik.yml"));
+    assert!(
+        traefik.contains(
+            "  web:\n    address: \":80\"\n    forwardedHeaders:\n      trustedIPs:\n        - \"10.0.0.0/8\"\n"
+        ),
+        "{}",
+        traefik
+    );
+    // Standalone publishing is untouched: no mesh in front of `docker run -p`.
+    assert!(read(&out.join("deploy.sh")).contains(" -p 80:80"));
+
+    let dir = prepare(&envspec(
+        "docker",
+        "",
+        "type: nginx\n  trusted_proxies: [\"10.0.0.0/8\"]",
+    ));
+    let nginx = read(&dir.path().join("docker-deploy").join("nginx").join("default.conf"));
+    assert!(
+        nginx.starts_with("set_real_ip_from 10.0.0.0/8;\nreal_ip_header X-Forwarded-For;\nreal_ip_recursive on;\n"),
+        "{}",
+        nginx
+    );
+}
+
+#[test]
+fn an_invalid_trusted_proxy_fails_validation() {
+    let env = envspec("docker", "", "type: traefik\n  trusted_proxies: [\"10.0.0.0/40\"]");
+    let dir = tempfile::tempdir().unwrap();
+    common::write_project(dir.path(), &env);
+    let output = common::simpled(
+        dir.path(),
+        &["prepare-deployment", "prod", "--bundle", "bundle"],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid gateway trusted_proxies entry '10.0.0.0/40'"),
+        "{}",
+        stderr
+    );
+}

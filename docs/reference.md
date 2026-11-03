@@ -546,6 +546,8 @@ gateway:
       - www.domain.com
       - domain.com
   body_limit: 10m         # optional; max request body for every route
+  trusted_proxies:          # docker only, optional; proxies whose X-Forwarded-For is believed
+    - 10.0.0.0/8
   redirects:
     - from: domain.com      # a domain, or a list of them
       to: www.domain.com    # bare domain or full URL
@@ -638,6 +640,30 @@ How it is applied per target:
 | `docker` + nginx | `client_max_body_size` inside each `location` block. |
 | `docker` + traefik | A `buffering` middleware with `maxRequestBodyBytes`. Traefik has no non-buffering size cap, so a limited route spools the request body before forwarding it. |
 | `local` | The gateway rejects a request whose `Content-Length` exceeds the limit with `413`. A chunked request that declares no length is passed through. |
+
+#### trusted_proxies
+
+IPs or CIDRs (IPv4 or IPv6) of the proxies in front of the gateway, such as a CDN or a load balancer. A request arriving from one of them keeps its `X-Forwarded-For`, so the apps behind the gateway see the original client rather than the proxy:
+
+```yaml
+gateway:
+  trusted_proxies:
+    - 130.176.0.0/16
+    - 2600:9000::/28
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `trusted_proxies` | list of strings | no | Each entry an IP address or a CIDR. Anything else fails validation. Unset or empty trusts no one, and the gateway config is what it was without the field. |
+
+| Target | Mechanism |
+|--------|-----------|
+| `docker` + traefik | `forwardedHeaders.trustedIPs` on the `web` entrypoint and, with TLS, on `websecure`. Without it Traefik replaces an incoming `X-Forwarded-For` with the address it was connected from. |
+| `docker` + nginx | `set_real_ip_from` per entry, `real_ip_header X-Forwarded-For` and `real_ip_recursive on` in the http scope, so `$remote_addr` (and the `X-Real-IP` sent upstream) is the client. Upstream requests already carry `X-Forwarded-For $proxy_add_x_forwarded_for`. |
+| `k8s` | Rejected. The ingress controller owns this (ingress-nginx: `proxy-real-ip-cidr` and `use-forwarded-headers` in its ConfigMap). |
+| `local` | Rejected. |
+
+Under Docker Swarm the gateway publishes its ports in host mode, so it sees the real peer address to begin with; see [Docker Swarm](#docker-swarm-type-docker-swarm_mode-true).
 
 #### TLS options (mutually exclusive)
 
@@ -1475,6 +1501,8 @@ Output directory: `docker-deploy/`
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
 | `<deployment>/<service>/` | Per-service `.env`, config and secret files |
 | `ingress/` | Traefik or nginx ingress stack |
+
+The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts.
 
 ### Local (`type: local`)
 

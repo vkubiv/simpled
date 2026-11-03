@@ -926,11 +926,7 @@ fn generate_nginx_swarm(
     writeln!(stack, "services:")?;
     writeln!(stack, "  nginx:")?;
     writeln!(stack, "    image: {}", NGINX_IMAGE)?;
-    writeln!(stack, "    ports:")?;
-    writeln!(stack, "      - \"80:80\"")?;
-    if resolved_spec.ingress.tls.is_some() {
-        writeln!(stack, "      - \"443:443\"")?;
-    }
+    write_swarm_host_ports(&mut stack, resolved_spec.ingress.tls.is_some())?;
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf")?;
 
@@ -985,6 +981,17 @@ fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<(
     let mut file = File::create(path)?;
 
     let has_tls = ingress.tls.is_some();
+
+    // conf.d files are included in the http block, so this applies to every
+    // server below and $remote_addr becomes the client behind the trusted proxies.
+    if !ingress.trusted_proxies.is_empty() {
+        for entry in &ingress.trusted_proxies {
+            writeln!(file, "set_real_ip_from {};", entry)?;
+        }
+        writeln!(file, "real_ip_header X-Forwarded-For;")?;
+        writeln!(file, "real_ip_recursive on;")?;
+        writeln!(file)?;
+    }
 
     // The same domain can be declared under multiple host groups, producing
     // several rules with the same domain_name. nginx treats repeated server
@@ -1174,7 +1181,12 @@ fn generate_traefik_standalone(
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
-    write_traefik_static_config(&mut static_conf, has_tls, letsencrypt)?;
+    write_traefik_static_config(
+        &mut static_conf,
+        has_tls,
+        letsencrypt,
+        &resolved_spec.ingress.trusted_proxies,
+    )?;
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
 
@@ -1228,7 +1240,12 @@ fn generate_traefik_swarm(
     }
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
-    write_traefik_static_config(&mut static_conf, has_tls, letsencrypt)?;
+    write_traefik_static_config(
+        &mut static_conf,
+        has_tls,
+        letsencrypt,
+        &resolved_spec.ingress.trusted_proxies,
+    )?;
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
 
@@ -1237,11 +1254,7 @@ fn generate_traefik_swarm(
     writeln!(stack, "services:")?;
     writeln!(stack, "  traefik:")?;
     writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
-    writeln!(stack, "    ports:")?;
-    writeln!(stack, "      - \"80:80\"")?;
-    if has_tls {
-        writeln!(stack, "      - \"443:443\"")?;
-    }
+    write_swarm_host_ports(&mut stack, has_tls)?;
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./traefik/traefik.yml:/etc/traefik/traefik.yml")?;
     writeln!(
@@ -1265,10 +1278,12 @@ fn write_traefik_static_config(
     file: &mut File,
     has_tls: bool,
     letsencrypt: Option<&LetsEncryptResolvedSpec>,
+    trusted_proxies: &[String],
 ) -> Result<()> {
     writeln!(file, "entryPoints:")?;
     writeln!(file, "  web:")?;
     writeln!(file, "    address: \":80\"")?;
+    write_traefik_trusted_ips(file, trusted_proxies)?;
     if has_tls {
         writeln!(file, "    http:")?;
         writeln!(file, "      redirections:")?;
@@ -1277,6 +1292,7 @@ fn write_traefik_static_config(
         writeln!(file, "          scheme: https")?;
         writeln!(file, "  websecure:")?;
         writeln!(file, "    address: \":443\"")?;
+        write_traefik_trusted_ips(file, trusted_proxies)?;
     }
     writeln!(file, "providers:")?;
     writeln!(file, "  file:")?;
@@ -1290,6 +1306,33 @@ fn write_traefik_static_config(
         writeln!(file, "      storage: \"/letsencrypt/acme.json\"")?;
         writeln!(file, "      httpChallenge:")?;
         writeln!(file, "        entryPoint: web")?;
+    }
+    Ok(())
+}
+
+/// Host-mode publishing: the routing mesh would SNAT every client to a mesh
+/// address. The ports bind only on the node running the gateway task, and the
+/// default stop-first update order keeps two tasks from fighting over them.
+fn write_traefik_trusted_ips(file: &mut File, trusted_proxies: &[String]) -> Result<()> {
+    if trusted_proxies.is_empty() {
+        return Ok(());
+    }
+    writeln!(file, "    forwardedHeaders:")?;
+    writeln!(file, "      trustedIPs:")?;
+    for entry in trusted_proxies {
+        writeln!(file, "        - \"{}\"", entry)?;
+    }
+    Ok(())
+}
+
+fn write_swarm_host_ports(stack: &mut File, has_tls: bool) -> Result<()> {
+    writeln!(stack, "    ports:")?;
+    let ports: &[u16] = if has_tls { &[80, 443] } else { &[80] };
+    for port in ports {
+        writeln!(stack, "      - target: {}", port)?;
+        writeln!(stack, "        published: {}", port)?;
+        writeln!(stack, "        protocol: tcp")?;
+        writeln!(stack, "        mode: host")?;
     }
     Ok(())
 }
@@ -1611,6 +1654,7 @@ mod tests {
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
                 version_document: None,
+                trusted_proxies: Vec::new(),
                 name: "gateway".to_string(),
                 tls: None,
                 domains: vec![],
@@ -1633,6 +1677,7 @@ mod tests {
         IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
+            trusted_proxies: Vec::new(),
             name: "gateway".to_string(),
             tls,
             domains: vec!["www.somesite.com".to_string(), "somesite.com".to_string()],
@@ -1659,6 +1704,7 @@ mod tests {
         IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
+            trusted_proxies: Vec::new(),
             name: "gateway".to_string(),
             tls: None,
             domains: vec!["somesite.com".to_string()],
@@ -2236,6 +2282,77 @@ mkdir -p \"/var/"
             script.contains("docker run -d --name api --network common_network --network-alias prod_api"),
             "{}",
             script
+        );
+    }
+
+    fn static_config(has_tls: bool, trusted_proxies: &[&str]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("traefik.yml");
+        let tls = letsencrypt_tls();
+        let letsencrypt = if has_tls { tls.letsencrypt.as_ref() } else { None };
+        let proxies: Vec<String> = trusted_proxies.iter().map(|p| p.to_string()).collect();
+        let mut file = File::create(&path).unwrap();
+        write_traefik_static_config(&mut file, has_tls, letsencrypt, &proxies).unwrap();
+        drop(file);
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn traefik_static_config_is_unchanged_without_trusted_proxies() {
+        assert_eq!(
+            static_config(true, &[]),
+            "entryPoints:\n  web:\n    address: \":80\"\n    http:\n      redirections:\n        entryPoint:\n          to: websecure\n          scheme: https\n  websecure:\n    address: \":443\"\nproviders:\n  file:\n    filename: \"/etc/traefik/dynamic_conf.yml\"\n    watch: true\ncertificatesResolvers:\n  myresolver:\n    acme:\n      email: \"ops@somesite.com\"\n      storage: \"/letsencrypt/acme.json\"\n      httpChallenge:\n        entryPoint: web\n"
+        );
+        assert_eq!(
+            static_config(false, &[]),
+            "entryPoints:\n  web:\n    address: \":80\"\nproviders:\n  file:\n    filename: \"/etc/traefik/dynamic_conf.yml\"\n    watch: true\n"
+        );
+    }
+
+    #[test]
+    fn traefik_trusts_forwarded_headers_from_the_proxies_on_both_entrypoints() {
+        let conf = static_config(true, &["10.0.0.0/8", "2600:9000::/28"]);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&conf).unwrap();
+        for entrypoint in ["web", "websecure"] {
+            let trusted = &parsed["entryPoints"][entrypoint]["forwardedHeaders"]["trustedIPs"];
+            assert_eq!(
+                trusted
+                    .as_sequence()
+                    .map(|s| s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+                Some(vec!["10.0.0.0/8", "2600:9000::/28"]),
+                "{}",
+                conf
+            );
+        }
+        assert_eq!(
+            parsed["entryPoints"]["web"]["http"]["redirections"]["entryPoint"]["to"].as_str(),
+            Some("websecure"),
+            "{}",
+            conf
+        );
+    }
+
+    #[test]
+    fn nginx_takes_the_client_address_from_trusted_proxies() {
+        let mut ingress = ingress_with_limits(&[("api", "/api", None)]);
+        let without = write_config(&ingress, false);
+        assert!(!without.contains("real_ip"), "{}", without);
+
+        ingress.trusted_proxies = vec!["10.0.0.0/8".to_string(), "2600:9000::/28".to_string()];
+        let conf = write_config(&ingress, false);
+        let real_ip = "set_real_ip_from 10.0.0.0/8;
+set_real_ip_from 2600:9000::/28;
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+";
+        // The server blocks are what they were, X-Forwarded-For still set once.
+        assert_eq!(conf.strip_prefix(real_ip), Some(without.as_str()), "{}", conf);
+        assert_eq!(
+            conf.matches("X-Forwarded-For $proxy_add_x_forwarded_for;").count(),
+            1,
+            "{}",
+            conf
         );
     }
 }

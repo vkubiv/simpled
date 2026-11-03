@@ -25,6 +25,8 @@ pub struct IngressResolvedSpec {
     /// Local only: the current deployment's version document, which the local
     /// gateway answers with itself.
     pub version_document: Option<String>,
+    /// Docker only: proxies whose X-Forwarded-For the gateway believes.
+    pub trusted_proxies: Vec<String>,
 }
 
 /// One domain's version endpoint, served by the version service of the

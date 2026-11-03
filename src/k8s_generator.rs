@@ -652,6 +652,7 @@ mod tests {
         IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
+            trusted_proxies: Vec::new(),
             name: "gateway".to_string(),
             tls,
             domains: vec!["www.somesite.com".to_string()],
@@ -695,6 +696,7 @@ mod tests {
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
                 version_document: None,
+                trusted_proxies: Vec::new(),
                 name: "gateway".to_string(),
                 tls: Some(IngressTlsResolvedSpec {
                     secret: Some("tls".to_string()),

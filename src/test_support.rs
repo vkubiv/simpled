@@ -82,6 +82,7 @@ pub fn resolved_env(env_type: DeploymentEnvType, deployment: DeploymentResolvedS
         ingress: IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
+            trusted_proxies: vec![],
             name: "gateway".to_string(),
             tls: None,
             domains: vec![],

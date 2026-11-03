@@ -650,6 +650,7 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         tls,
         version_routes: crate::version_endpoint::routes(env_spec),
         version_document: None,
+        trusted_proxies: env_spec.ingress.trusted_proxies.clone(),
     })
 }
 
@@ -1079,6 +1080,7 @@ mod tests {
             tls: None,
             redirects,
             body_limit: None,
+            trusted_proxies: Vec::new(),
         }
     }
 

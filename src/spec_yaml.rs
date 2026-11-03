@@ -169,6 +169,9 @@ pub struct IngressSpecYaml {
     // Default maximum request body size for every route, in nginx notation
     // ("10m", "512k", "1g", or a plain byte count). "0" means no limit.
     pub body_limit: Option<String>,
+    // Docker only: IPs/CIDRs of proxies in front of the gateway (a CDN, a load
+    // balancer) whose X-Forwarded-For the gateway believes.
+    pub trusted_proxies: Option<Vec<String>>,
     // Domains the gateway answers only to send the client somewhere else, e.g.
     // the bare apex redirecting to the `www` host that actually serves the app.
     // They are never routed to a service, but they are still part of the
