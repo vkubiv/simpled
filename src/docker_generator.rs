@@ -66,14 +66,21 @@ const RUN_JOB_FUNCTION: &str = r#"run_job() {
   # jobs in the stack file) would make `docker service create` fail on the name.
   docker service rm "${job_name}" >/dev/null 2>&1 || true
 
+  # Detached: with --detach=false the CLI waits on a job whose task failed, printing
+  # "non-zero exit" forever, so the timeout below never got a chance to run.
   create_status=0
   docker service create \
     --name "${job_name}" \
     --mode replicated-job \
     --restart-condition none \
-    --detach=false \
+    --detach \
+    --quiet \
     --with-registry-auth \
-    "$@" || create_status=$?
+    "$@" >/dev/null || create_status=$?
+  if [ "${create_status}" -ne 0 ]; then
+    echo "Job ${job_name} could not be created (exit code ${create_status})." >&2
+    exit 1
+  fi
 
   # The task is polled for a terminal state rather than trusting the exit code of
   # `docker service create` alone, which reports on the rollout, not on the
