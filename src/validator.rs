@@ -28,6 +28,23 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         }
     }
 
+    // Docker targets convert the quantities themselves, so a value they cannot
+    // read is reported here rather than when the files are generated.
+    if env_spec.env_type != DeploymentEnvType::K8S {
+        crate::docker_resources::DockerResources::from_spec(
+            &deployment.defaults,
+            &format!("Deployment {} defaults", env_name),
+        )?;
+        let mut names: Vec<&String> = deployment.services.keys().collect();
+        names.sort();
+        for name in names {
+            crate::docker_resources::DockerResources::from_spec(
+                &deployment.services[name].resources,
+                &format!("Service '{}'", name),
+            )?;
+        }
+    }
+
     // Check environment variables
     let provided_env_vars: HashSet<&String> = deployment.environment.iter().map(|e| &e.name).collect();
     let mut missing_env_vars = Vec::new();

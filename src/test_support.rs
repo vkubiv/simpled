@@ -35,14 +35,8 @@ pub fn env_spec(raw: &str, root: &Path) -> DeploymentEnvironmentSpec {
 pub fn resources() -> ResourcesSpec {
     ResourcesSpec {
         replicas: 1,
-        requests: ResourceLimits {
-            memory: "128Mi".to_string(),
-            cpu: "100m".to_string(),
-        },
-        limits: ResourceLimits {
-            memory: "256Mi".to_string(),
-            cpu: "200m".to_string(),
-        },
+        requests: ResourceLimits::default(),
+        limits: ResourceLimits::default(),
     }
 }
 

@@ -226,3 +226,42 @@ fn a_released_bundle_runs_the_images_published_for_its_version() {
     // Extra services are the env's own and stay as written.
     assert_eq!(parsed["services"]["primary-db"]["image"].as_str(), Some("postgres:16"));
 }
+
+#[test]
+fn local_compose_carries_resources_only_where_they_are_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let localenv = LOCALENV.replace(
+        "      api:\n        host: web\n",
+        "      api:\n        resources:\n          limits:\n            memory: 1Gi\n            cpu: 500m\n        host: web\n",
+    );
+    fs::write(root.join("localenv.yaml"), localenv).unwrap();
+    fs::write(root.join("appspec.yaml"), APPSPEC).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_simpled"))
+        .current_dir(root)
+        .args(["local", "generate-config"])
+        .output()
+        .expect("simpled runs");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let compose = read(&root.join("local_env").join("docker-compose.yaml"));
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&compose).unwrap();
+    let api = &parsed["services"]["api"];
+    assert_eq!(
+        api["deploy"]["resources"]["limits"]["memory"].as_str(),
+        Some("1g"),
+        "{}",
+        compose
+    );
+    assert_eq!(
+        api["deploy"]["resources"]["limits"]["cpus"].as_str(),
+        Some("0.5"),
+        "{}",
+        compose
+    );
+    // compose refuses `replicas` next to `container_name`, so none is written.
+    assert!(api["deploy"]["replicas"].is_null(), "{}", compose);
+    assert_eq!(api["container_name"].as_str(), Some("api"), "{}", compose);
+    assert!(parsed["services"]["primary-db"]["deploy"].is_null(), "{}", compose);
+}

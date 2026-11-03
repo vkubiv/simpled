@@ -1,3 +1,4 @@
+use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
 use crate::spec;
 use crate::spec::{EnvVariable, Healthcheck, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType};
@@ -112,6 +113,8 @@ pub struct DeployConfig {
     pub replicas: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<RestartPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<DockerResources>,
 }
 
 #[derive(Serialize, Clone)]
@@ -317,19 +320,28 @@ pub fn prepare_service_with(
     // Replicas are only written for Swarm. A local compose file names every
     // container, and compose refuses `container_name` next to `replicas`; a job
     // is created by the deploy script rather than the stack file.
+    //
+    // Resources are written wherever they are set: Swarm and `docker compose up`
+    // both read `deploy.resources`.
     let is_local = spec.env_type == spec::DeploymentEnvType::Local;
+    let resources = DockerResources::from_spec(&service.resources, &format!("Service '{}'", service.full_name))?;
     let deploy = match service.service_type {
         ServiceType::Job => Some(DeployConfig {
             restart_policy: Some(RestartPolicy {
                 condition: "none".to_string(),
             }),
+            resources,
             ..DeployConfig::default()
         }),
         _ if !is_local => Some(DeployConfig {
             replicas: Some(service.resources.replicas),
+            resources,
             ..DeployConfig::default()
         }),
-        _ => None,
+        _ => resources.map(|resources| DeployConfig {
+            resources: Some(resources),
+            ..DeployConfig::default()
+        }),
     };
 
     Ok(DockerService {

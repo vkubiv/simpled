@@ -95,3 +95,152 @@ fn swarm_stack_carries_replicas_and_keeps_jobs_out() {
     let script = read(&out.join("deploy.sh"));
     assert!(script.contains("run_job 'prod_migrate'"), "{}", script);
 }
+
+/// The fixture env spec with deployment-wide `defaults.resources` and an `api`
+/// override of its own.
+fn envspec_with_resources(env_type: &str, extra_top_level: &str, gateway_type: &str) -> String {
+    envspec(env_type, extra_top_level, gateway_type).replace(
+        "    services:\n      api:\n",
+        r#"    defaults:
+      resources:
+        limits:
+          memory: 512Mi
+    services:
+      api:
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 1Gi
+            cpu: "2"
+"#,
+    )
+}
+
+#[test]
+fn swarm_stack_and_jobs_are_limited_by_their_resources() {
+    let dir = prepare(&envspec_with_resources("docker", "swarm_mode: true", "type: nginx"));
+    let out = dir.path().join("docker-deploy");
+
+    let stack = read(&out.join("prod").join("docker-compose.yaml"));
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
+    let api = &parsed["services"]["api"]["deploy"];
+    assert_eq!(api["replicas"].as_u64(), Some(2), "{}", stack);
+    assert_eq!(api["resources"]["limits"]["memory"].as_str(), Some("1g"), "{}", stack);
+    assert_eq!(api["resources"]["limits"]["cpus"].as_str(), Some("2"), "{}", stack);
+    assert_eq!(
+        api["resources"]["reservations"]["memory"].as_str(),
+        Some("256m"),
+        "{}",
+        stack
+    );
+    assert_eq!(
+        api["resources"]["reservations"]["cpus"].as_str(),
+        Some("0.25"),
+        "{}",
+        stack
+    );
+
+    // A service without an override takes the deployment defaults, and only
+    // what they set.
+    let db = &parsed["services"]["primary-db"]["deploy"]["resources"];
+    assert_eq!(db["limits"]["memory"].as_str(), Some("512m"), "{}", stack);
+    assert!(db["limits"]["cpus"].is_null(), "{}", stack);
+    assert!(db["reservations"].is_null(), "{}", stack);
+
+    let script = read(&out.join("deploy.sh"));
+    assert!(script.contains("  --limit-memory '512m' \\\n"), "{}", script);
+    assert!(!script.contains("--limit-cpu"), "{}", script);
+    assert!(!script.contains("--reserve-"), "{}", script);
+}
+
+#[test]
+fn standalone_docker_limits_containers_by_their_resources() {
+    let dir = prepare(&envspec_with_resources("docker", "", "type: traefik"));
+    let script = read(&dir.path().join("docker-deploy").join("deploy.sh"));
+
+    let api = script
+        .lines()
+        .find(|l| l.starts_with("docker run -d --name api "))
+        .unwrap();
+    assert!(
+        api.contains(" --memory 1g --cpus 2 --memory-reservation 256m "),
+        "{}",
+        api
+    );
+    let job = script
+        .lines()
+        .find(|l| l.starts_with("docker run --name migrate "))
+        .unwrap();
+    assert!(job.contains(" --memory 512m "), "{}", job);
+    assert!(!job.contains("--cpus"), "{}", job);
+}
+
+#[test]
+fn without_resources_docker_containers_are_unconstrained() {
+    let swarm = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let stack = read(
+        &swarm
+            .path()
+            .join("docker-deploy")
+            .join("prod")
+            .join("docker-compose.yaml"),
+    );
+    assert!(!stack.contains("resources"), "{}", stack);
+    let script = read(&swarm.path().join("docker-deploy").join("deploy.sh"));
+    assert!(
+        !script.contains("--limit-") && !script.contains("--reserve-"),
+        "{}",
+        script
+    );
+
+    let standalone = prepare(&envspec("docker", "", "type: traefik"));
+    let script = read(&standalone.path().join("docker-deploy").join("deploy.sh"));
+    assert!(!script.contains("--memory") && !script.contains("--cpus"), "{}", script);
+}
+
+#[test]
+fn an_unreadable_quantity_fails_before_anything_is_generated() {
+    let env = envspec_with_resources("docker", "swarm_mode: true", "type: nginx").replace("memory: 1Gi", "memory: 1GB");
+    let dir = tempfile::tempdir().unwrap();
+    common::write_project(dir.path(), &env);
+    let output = common::simpled(
+        dir.path(),
+        &["prepare-deployment", "prod", "--bundle", "bundle"],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Service 'api': resources.limits.memory '1GB'"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn kubernetes_keeps_writing_the_builtin_defaults() {
+    let dir = prepare(&envspec_with_resources("k8s", "", ""));
+    let out = dir.path().join("manifests");
+
+    let api = read(&out.join("deployment-api.yaml"));
+    assert!(
+        api.contains("            memory: 256Mi\n            cpu: 250m\n"),
+        "{}",
+        api
+    );
+    assert!(api.contains("            memory: 1Gi\n            cpu: 2\n"), "{}", api);
+    // Defaults set only a memory limit; the rest is the built-in 128Mi / 100m.
+    let db = read(&out.join("deployment-primary-db.yaml"));
+    assert!(
+        db.contains("          requests:\n            memory: 128Mi\n            cpu: 100m\n"),
+        "{}",
+        db
+    );
+    assert!(
+        db.contains("          limits:\n            memory: 512Mi\n            cpu: 100m\n"),
+        "{}",
+        db
+    );
+}

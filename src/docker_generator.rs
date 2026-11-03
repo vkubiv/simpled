@@ -1,4 +1,5 @@
 use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, DockerService, ServiceNetwork};
+use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
 use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
@@ -269,6 +270,22 @@ fn generate_standalone(
         }
 
         write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
+
+        // `docker run` has no CPU reservation; a CPU request is Swarm-only.
+        if let Some(resources) =
+            DockerResources::from_spec(&service.resources, &format!("Service '{}'", service.full_name))?
+        {
+            let (limits, reservations) = (resources.limits(), resources.reservations());
+            if let Some(memory) = limits.memory {
+                write!(deploy_sh, " --memory {}", memory)?;
+            }
+            if let Some(cpus) = limits.cpus {
+                write!(deploy_sh, " --cpus {}", cpus)?;
+            }
+            if let Some(memory) = reservations.memory {
+                write!(deploy_sh, " --memory-reservation {}", memory)?;
+            }
+        }
 
         for secret in &service.secrets {
             if let SecretMount::EnvVariable(var_name) = &secret.mount {
@@ -744,6 +761,21 @@ fn write_job_invocation(
             writeln!(deploy_sh, "  -e \"{}={}\" \\", name, value)?;
         } else {
             writeln!(deploy_sh, "  -e {} \\", sh_quote(&format!("{}={}", name, value)))?;
+        }
+    }
+
+    if let Some(resources) = service.deploy.as_ref().and_then(|d| d.resources.as_ref()) {
+        let (limits, reservations) = (resources.limits(), resources.reservations());
+        let flags = [
+            ("--limit-memory", limits.memory),
+            ("--limit-cpu", limits.cpus),
+            ("--reserve-memory", reservations.memory),
+            ("--reserve-cpu", reservations.cpus),
+        ];
+        for (flag, value) in flags {
+            if let Some(value) = value {
+                writeln!(deploy_sh, "  {} {} \\", flag, sh_quote(&value))?;
+            }
         }
     }
 
@@ -1503,14 +1535,8 @@ mod tests {
             depends_on: (!depends_on.is_empty()).then(|| depends_on.iter().map(|d| d.to_string()).collect()),
             resources: ResourcesSpec {
                 replicas: 1,
-                requests: ResourceLimits {
-                    memory: "128Mi".to_string(),
-                    cpu: "100m".to_string(),
-                },
-                limits: ResourceLimits {
-                    memory: "256Mi".to_string(),
-                    cpu: "200m".to_string(),
-                },
+                requests: ResourceLimits::default(),
+                limits: ResourceLimits::default(),
             },
             working_dir: None,
             excluded: false,

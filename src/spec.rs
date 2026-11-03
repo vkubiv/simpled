@@ -555,10 +555,25 @@ pub struct ResourcesSpec {
     pub limits: ResourceLimits,
 }
 
-#[derive(Debug, Clone)]
+/// A field is `None` when the env spec does not set it. Kubernetes writes the
+/// built-in default in its place; Docker leaves the container unconstrained.
+#[derive(Debug, Clone, Default)]
 pub struct ResourceLimits {
-    pub memory: String,
-    pub cpu: String,
+    pub memory: Option<String>,
+    pub cpu: Option<String>,
+}
+
+pub const DEFAULT_MEMORY: &str = "128Mi";
+pub const DEFAULT_CPU: &str = "100m";
+
+impl ResourceLimits {
+    pub fn memory_or_default(&self) -> &str {
+        self.memory.as_deref().unwrap_or(DEFAULT_MEMORY)
+    }
+
+    pub fn cpu_or_default(&self) -> &str {
+        self.cpu.as_deref().unwrap_or(DEFAULT_CPU)
+    }
 }
 
 #[derive(Debug, Clone)]

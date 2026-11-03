@@ -227,11 +227,19 @@ fn write_workload(output_dir: &Path, service: &ServiceResolvedSpec, deploy_date:
     }
     writeln!(file, "        resources:")?;
     writeln!(file, "          requests:")?;
-    writeln!(file, "            memory: {}", service.resources.requests.memory)?;
-    writeln!(file, "            cpu: {}", service.resources.requests.cpu)?;
+    writeln!(
+        file,
+        "            memory: {}",
+        service.resources.requests.memory_or_default()
+    )?;
+    writeln!(file, "            cpu: {}", service.resources.requests.cpu_or_default())?;
     writeln!(file, "          limits:")?;
-    writeln!(file, "            memory: {}", service.resources.limits.memory)?;
-    writeln!(file, "            cpu: {}", service.resources.limits.cpu)?;
+    writeln!(
+        file,
+        "            memory: {}",
+        service.resources.limits.memory_or_default()
+    )?;
+    writeln!(file, "            cpu: {}", service.resources.limits.cpu_or_default())?;
 
     writeln!(file, "        env:")?;
     writeln!(file, "        - name: DEPLOY_DATE")?;
@@ -891,12 +899,12 @@ mod tests {
             resources: crate::spec::ResourcesSpec {
                 replicas: 1,
                 requests: crate::spec::ResourceLimits {
-                    memory: "128Mi".to_string(),
-                    cpu: "100m".to_string(),
+                    memory: Some("128Mi".to_string()),
+                    cpu: Some("100m".to_string()),
                 },
                 limits: crate::spec::ResourceLimits {
-                    memory: "256Mi".to_string(),
-                    cpu: "200m".to_string(),
+                    memory: Some("256Mi".to_string()),
+                    cpu: Some("200m".to_string()),
                 },
             },
             working_dir: None,
@@ -908,7 +916,7 @@ mod tests {
     fn a_service_override_sets_its_own_replicas_and_resources() {
         let mut api = workload("api", ServiceType::Public);
         api.resources.replicas = 3;
-        api.resources.limits.memory = "1Gi".to_string();
+        api.resources.limits.memory = Some("1Gi".to_string());
         let dir = generate_to_temp(vec![api]);
 
         let deployment = fs::read_to_string(dir.path().join("deployment-api.yaml")).unwrap();

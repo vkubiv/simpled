@@ -6,6 +6,7 @@ mod app_bundle;
 mod bundle_repo;
 mod docker_compose;
 mod docker_generator;
+mod docker_resources;
 mod docs;
 mod env_loader;
 mod k8s_generator;

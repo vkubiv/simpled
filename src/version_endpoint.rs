@@ -81,19 +81,24 @@ pub fn service(deployment: &str, document: &str, env_type: &DeploymentEnvType) -
         entrypoint: None,
         healthcheck: None,
         depends_on: None,
+        // Kubernetes only, which is where these values were always written.
         resources: ResourcesSpec {
             replicas: 1,
-            requests: ResourceLimits {
-                memory: "16Mi".to_string(),
-                cpu: "10m".to_string(),
-            },
-            limits: ResourceLimits {
-                memory: "32Mi".to_string(),
-                cpu: "50m".to_string(),
-            },
+            requests: k8s_limits(on_k8s, "16Mi", "10m"),
+            limits: k8s_limits(on_k8s, "32Mi", "50m"),
         },
         working_dir: None,
         excluded: false,
+    }
+}
+
+fn k8s_limits(on_k8s: bool, memory: &str, cpu: &str) -> ResourceLimits {
+    if !on_k8s {
+        return ResourceLimits::default();
+    }
+    ResourceLimits {
+        memory: Some(memory.to_string()),
+        cpu: Some(cpu.to_string()),
     }
 }
 

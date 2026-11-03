@@ -6,9 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const DEFAULT_MEMORY: &str = "128Mi";
-const DEFAULT_CPU: &str = "100m";
-
 pub fn convert_env_spec(
     yaml: DeploymentEnvironmentSpecYaml,
     root: &Path,
@@ -942,14 +939,8 @@ fn convert_deployment(
     } else {
         ResourcesSpec {
             replicas: 1,
-            requests: ResourceLimits {
-                memory: DEFAULT_MEMORY.into(),
-                cpu: DEFAULT_CPU.into(),
-            },
-            limits: ResourceLimits {
-                memory: DEFAULT_MEMORY.into(),
-                cpu: DEFAULT_CPU.into(),
-            },
+            requests: ResourceLimits::default(),
+            limits: ResourceLimits::default(),
         }
     };
 
@@ -1008,44 +999,20 @@ fn convert_deployment_app(yaml: &DeploymentAppSpecYaml, root: &Path) -> Result<D
 }
 
 fn convert_defaults(yaml: &DefaultsSpecYaml) -> Result<ResourcesSpec> {
-    let replicas = yaml.replicas.unwrap_or(1);
-    let (requests, limits) = if let Some(res) = &yaml.resources {
-        (
-            convert_limits(res.requests.as_ref()),
-            convert_limits(res.limits.as_ref()),
-        )
-    } else {
-        (
-            ResourceLimits {
-                memory: DEFAULT_MEMORY.into(),
-                cpu: DEFAULT_CPU.into(),
-            },
-            ResourceLimits {
-                memory: DEFAULT_MEMORY.into(),
-                cpu: DEFAULT_CPU.into(),
-            },
-        )
-    };
-
+    let res = yaml.resources.as_ref();
     Ok(ResourcesSpec {
-        replicas,
-        requests,
-        limits,
+        replicas: yaml.replicas.unwrap_or(1),
+        requests: convert_limits(res.and_then(|r| r.requests.as_ref())),
+        limits: convert_limits(res.and_then(|r| r.limits.as_ref())),
     })
 }
 
 fn convert_limits(yaml: Option<&ResourceLimitsYaml>) -> ResourceLimits {
-    if let Some(l) = yaml {
-        ResourceLimits {
-            memory: l.memory.clone().unwrap_or_else(|| DEFAULT_MEMORY.into()),
-            cpu: l.cpu.clone().unwrap_or_else(|| DEFAULT_CPU.into()),
-        }
-    } else {
-        ResourceLimits {
-            memory: DEFAULT_MEMORY.into(),
-            cpu: DEFAULT_CPU.into(),
-        }
-    }
+    yaml.map(|l| ResourceLimits {
+        memory: l.memory.clone(),
+        cpu: l.cpu.clone(),
+    })
+    .unwrap_or_default()
 }
 
 /// Collects the prefixes of one route. `prefixes` entries default to
@@ -1143,14 +1110,8 @@ fn convert_deployment_service(
     } else {
         ResourcesSpec {
             replicas: yaml.replicas.unwrap_or(defaults.replicas),
-            requests: ResourceLimits {
-                memory: defaults.requests.memory.clone(),
-                cpu: defaults.requests.cpu.clone(),
-            },
-            limits: ResourceLimits {
-                memory: defaults.limits.memory.clone(),
-                cpu: defaults.limits.cpu.clone(),
-            },
+            requests: defaults.requests.clone(),
+            limits: defaults.limits.clone(),
         }
     };
 

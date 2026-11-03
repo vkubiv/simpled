@@ -735,7 +735,7 @@ deployments:
 | `secrets_env_prefix` | string | no | Reads every valueless secret from `<prefix><secret name>` in the environment, ignoring case. See [secrets_env_prefix](#secrets_env_prefix). |
 | `secrets_json` | string | no | Path to a JSON document holding a field per secret. See [secrets_json](#secrets_json). |
 | `secrets_aws` | string | no | AWS Secrets Manager secret holding that same document, for secrets with no source of their own. See [secrets_aws](#secrets_aws). |
-| `defaults` | object | no | Default replica count and resource limits applied to all services. |
+| `defaults` | object | no | Default replica count and resource limits applied to every service without a `resources` of its own. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
 | `exclude_services` | list | no | Services this deployment does not start. Only valid for `local`. See [exclude_services](#exclude_services). |
 
@@ -927,11 +927,52 @@ Some things outside the stack do not follow an instance: a tunnel or OAuth redir
 | `strip_prefix` | bool | Whether to strip the prefix before forwarding to upstream. Default `true`. |
 | `variant` | string | Image variant to use (must be declared in `appspec.yaml`). |
 | `replicas` | int | Number of pod/container replicas. Overrides `defaults.replicas`. Applied on Kubernetes and Swarm; standalone Docker and local runs always start one container. |
-| `resources` | object | CPU/memory requests and limits. Overrides `defaults.resources`. Kubernetes only; Docker targets do not constrain containers. |
+| `resources` | object | CPU/memory requests and limits, in Kubernetes notation. Overrides `defaults.resources` as a whole. Applied on every target; see [resources](#resources) for how Docker maps them. |
 | `ports` | list | Published host ports, `"external:internal"`. The gateway routes to `external`, so it must equal the container's port; use `expose` when no host port is wanted. |
 | `expose` | list | Container ports the gateway may route to **without** publishing them on the host. The first entry wins as the upstream port, ahead of `ports`. |
 | `working_dir` | string | Local only. Directory of a host-run (non-dockerized) service. See [working_dir](#working_dir). |
 | `depends_on` | list | Replaces the app spec's `depends_on` for this deployment. `[]` means nothing in the stack has to be up first. See [Jobs and deployment ordering](#jobs-and-deployment-ordering). |
+
+#### resources
+
+`requests` and `limits` each take `memory` and `cpu`, written the Kubernetes way:
+memory as bytes or with a `Ki`/`Mi`/`Gi`/`Ti` (binary) or `k`/`M`/`G`/`T`
+(decimal) suffix, CPU as cores (`0.5`, `2`) or millicores (`500m`). A service's
+own `resources` replaces `defaults.resources` whole; a field neither sets is
+left out.
+
+```yaml
+deployments:
+  prod:
+    defaults:
+      resources:
+        limits:
+          memory: 512Mi        # every service without its own resources
+    services:
+      web:
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 1Gi
+            cpu: "2"
+```
+
+| Target | `limits` | `requests` |
+|---|---|---|
+| Kubernetes | `resources.limits`; an unset field gets the built-in 128Mi / 100m | `resources.requests`, same default |
+| Swarm stack service | `deploy.resources.limits` (`memory`, `cpus`) | `deploy.resources.reservations` |
+| Swarm job | `docker service create --limit-memory` / `--limit-cpu` | `--reserve-memory` / `--reserve-cpu` |
+| Standalone Docker | `docker run --memory` / `--cpus` | `--memory-reservation`; a CPU request is ignored, `docker run` has no reservation for it |
+| Local (`simpled local`) | `deploy.resources.limits` in the compose file | `deploy.resources.reservations` |
+
+On Docker targets only what the env spec sets is applied: without `resources`
+a container is unconstrained, as before. Memory is converted to Docker's binary
+units (`512Mi` becomes `512m`, `1Gi` becomes `1g`), or to an exact byte count
+when the quantity is not a whole binary unit (`1G` becomes `1000000000`), and
+CPU to a decimal core count (`500m` becomes `0.5`). A value that is not a
+quantity, or a memory request above the memory limit, fails validation.
 
 #### expose
 
