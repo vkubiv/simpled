@@ -348,8 +348,11 @@ sync_object() {
 prune_objects() {
   kind="$1"; owner="$2"; shift 2
   for base in "$@"; do
-    docker "${kind}" ls --filter "label=${owner}" --filter "label=simpled.object=${base}" \
-        --format '{{.CreatedAt}}|{{.Name}}' \
+    # `ls` only shows relative ages ("4 minutes ago"), so the creation time is
+    # read from `inspect`, as a fixed-width UTC timestamp that sorts as text.
+    docker "${kind}" ls -q --filter "label=${owner}" --filter "label=simpled.object=${base}" \
+      | xargs -r docker "${kind}" inspect \
+          --format '{{.CreatedAt.UTC.Format "2006-01-02T15:04:05.000000000Z"}}|{{.Spec.Name}}' \
       | sort -r | tail -n +3 | cut -d'|' -f2 \
       | while read -r old; do
           if docker "${kind}" rm "${old}" >/dev/null 2>&1; then
