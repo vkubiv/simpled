@@ -97,6 +97,9 @@ deployments:
     )
 }
 
+/// What a Swarm deployment ships as its `simpled` binary in the tests.
+pub const STAND_IN_BINARY: &str = "#!/bin/sh\n# stand-in for the simpled binary\n";
+
 /// Writes the env spec, the app bundle directory and the config files into `root`.
 pub fn write_project(root: &Path, env: &str) {
     fs::write(root.join("envspec.yaml"), env).unwrap();
@@ -111,6 +114,14 @@ pub fn write_project(root: &Path, env: &str) {
 pub fn simpled(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_simpled"));
     command.current_dir(root).args(args);
+    // A Swarm deployment ships a simpled binary for the deploy target. A stand-in
+    // keeps the tests off the network (no release download) and fast (no copy of
+    // the test binary), and lets them recognize what was shipped.
+    let stand_in = root.join("target-simpled");
+    if !stand_in.exists() {
+        fs::write(&stand_in, STAND_IN_BINARY).unwrap();
+    }
+    command.env("SIMPLED_TARGET_BINARY", &stand_in);
     for (name, value) in env {
         command.env(name, value);
     }

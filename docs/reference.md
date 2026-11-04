@@ -285,6 +285,7 @@ Use `envspec.yaml` for Kubernetes and Docker environments. Use `localenv.yaml` f
 | `type` | string | no | `k8s`, `docker`, or `local`. Required in `envspec.yaml`; defaults to `local` in `localenv.yaml`. |
 | `swarm_mode` | bool | no | Enable Docker Swarm mode. Only valid when `type: docker`. |
 | `multi_node` | bool | no | Swarm only, default `true`: validate as if the swarm had several nodes. `false` keeps the environment on one node. See [multi_node](#multi_node). |
+| `target_platform` | string | no | Swarm only: `linux-amd64` (default) or `linux-arm64`, the platform of the deploy target, which the shipped simpled binary must run on. See [Deploy steps on Docker Swarm](#deploy-steps-on-docker-swarm). |
 | `registry` | map | no | Image registry prefix mappings. In `localenv.yaml`, used only when running a [released bundle](#running-a-released-bundle-locally). |
 | `gateway` | object | yes | Gateway (load balancer) configuration. The deprecated alias `ingress` is still accepted with a warning. |
 | `deployments` | map | yes | Named deployment configurations. |
@@ -1393,9 +1394,14 @@ Options:
   --download-bundle-from <SOURCE>      Download bundle: github-release
   --github-repo <OWNER/REPO>           GitHub repository
   --github-tag-prefix <PREFIX>         Prefix for GitHub release tag
+  --target-binary <PATH>               Swarm: the simpled binary to ship for the deploy
+                                       target (also SIMPLED_TARGET_BINARY)
 ```
 
 Must be run from the directory containing `envspec.yaml`.
+
+On Docker Swarm the output includes the simpled binary that runs the deploy steps
+on the target; see [Deploy steps on Docker Swarm](#deploy-steps-on-docker-swarm).
 
 Every relative path inside the spec (`environment: file.env`, `file:` secrets, `configs`,
 `secrets_folder`, `application.extra`) is resolved against the directory that holds the
@@ -1597,7 +1603,9 @@ Output directory: `docker-deploy/`
 
 | File | Description |
 |------|-------------|
-| `deploy.sh` | Deploy script: image prune, Swarm configs and secrets, ingress, then the job phases, then the stack, then pruning of old configs and secrets. Images no container uses are pruned *before* the rollout, so the release that is running at that point stays on the node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
+| `deploy.sh` | Deploy script: image prune, Swarm configs and secrets, ingress, then the job phases, then the stack, then pruning of old configs and secrets. The steps marked `./simpled step` are run by the binary next to it. Images no container uses are pruned *before* the rollout, so the release that is running at that point stays on the node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
+| `simpled` | The simpled binary that runs the deploy steps, the version that prepared the deployment |
+| `ingress/plan.json`, `<deployment>/plan.json` | What the deploy steps act on: the gateway's and the deployment's objects, and the deployment's jobs |
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
 | `<deployment>/<service>/` | Per-service `.env` file, read by `docker stack deploy` on the machine that runs it |
@@ -1606,6 +1614,47 @@ Output directory: `docker-deploy/`
 | `ingress/` | Traefik ingress stack. Its `traefik/` files are uploaded as Swarm configs too |
 
 The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
+
+### Deploy steps on Docker Swarm
+
+The Swarm `deploy.sh` stays the readable outline of a deploy: its order, its phases
+and every `docker stack deploy` are in it. The parts that would be a lot of shell are
+calls to the simpled binary shipped next to it:
+
+| Step | Does |
+|------|------|
+| `./simpled step check-nodes` | With `multi_node: false` only: stops unless exactly one node accepts tasks, and exports its ID for the `node.id` constraint. See [multi_node](#multi_node). |
+| `./simpled step sync-objects <plan>` | Creates the plan's configs and secrets that do not exist yet and exports their names. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm). |
+| `./simpled step run-job <plan> <job>` | Runs a job as a `replicated-job` service, waits until it completes or fails, prints its logs and removes the service. `JOB_TIMEOUT` (seconds, default 600) limits the wait. |
+| `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy. |
+
+A step that sets variables for the rest of the script prints `export` lines, which
+`deploy.sh` captures and then evaluates, so a failing step stops the script.
+
+Steps read only the plans `prepare-deployment` wrote, `ingress/plan.json` and
+`<deployment>/plan.json`, never the env or app spec: those depend on the CI
+environment, on files next to the spec and on the downloaded bundle. Every string a
+plan passes to Docker is in compose's interpolation syntax (`${NAME}` is a variable
+the script exported, `$$` a literal `$`), the same as the stack files, so a value
+reaches a job exactly as it reaches a stack service. A plan holds no more than the
+stack file does. A step refuses a plan prepared by another simpled version.
+
+The binary is the version that prepared the deployment, taken from, in order:
+
+1. `--target-binary <path>` on `prepare-deployment`, or `SIMPLED_TARGET_BINARY`;
+2. the running simpled itself, when it runs on Linux on the target's CPU, which is
+   the usual CI runner;
+3. that version's GitHub release, verified against the release's checksums.
+
+`target_platform` names the target: `linux-amd64` (default) or `linux-arm64`.
+Releases do not build a Linux arm64 binary yet, so for an arm64 target from any other
+machine, pass `--target-binary` with a simpled of the same version built for it.
+
+The same `rsync` of `docker-deploy/` that carries the stack files carries the
+binary, and `deploy.sh` makes it executable. The target needs nothing beyond Docker
+and, for `aws` secrets, the AWS CLI.
+
+---
 
 ### Configs and secrets on Docker Swarm
 
@@ -1620,7 +1669,7 @@ Swarm objects cannot be changed, so each one is named after its content:
 1. `prepare-deployment` writes the files to upload: `<deployment>/configs/<config>/<file>`
    and `<deployment>/secrets/<secret>`. A secret with an `aws` source is written there
    by `fetch-secrets.sh` on the target.
-2. Before deploying anything, `deploy.sh` hashes each file and creates the object
+2. Before deploying anything, `./simpled step sync-objects` hashes each file and creates the object
    `<base>_<first 12 hex digits of its sha256>` unless it exists already, for example
    `prod_shop-data_settings.json_3f9a1c2e4b5d`. The base is `<deployment>_<config>_<file>`
    or `<deployment>_<secret>`, and `gateway_<file>` for the gateway. The name is
@@ -1637,7 +1686,9 @@ Swarm objects cannot be changed, so each one is named after its content:
    environment, configs or secrets changed. Two exceptions restart on every deploy:
    the deployment's version service, whose answer includes the time of the deploy,
    and the gateway. To restart a service without changing anything, use
-   `docker service update --force <stack>_<service>`.
+   `docker service update --force <stack>_<service>`. The deploy log still says
+   `Updating service ...` for every service: `docker stack deploy` sends each one an
+   update, and Swarm only replaces the tasks of those whose spec differs.
 5. After every stack has deployed, `deploy.sh` removes older objects: of each base
    name it keeps the two newest, the current one and the previous one, which
    `docker service rollback` still needs. Docker refuses to remove an object a
@@ -1646,8 +1697,7 @@ Swarm objects cannot be changed, so each one is named after its content:
    gateway's files, `simpled.scope=environment`.
 
 A config file or secret larger than 500 KB, Swarm's limit for one object, fails
-`prepare-deployment`. The deploy target needs `sha256sum`, which every common Linux
-distribution has.
+`prepare-deployment`.
 
 Still a bind mount of the deploy directory: Traefik's Let's Encrypt store
 (`letsencrypt/`), on whichever node the gateway runs.

@@ -51,21 +51,34 @@ fn configs_become_swarm_configs_synced_before_the_stacks_deploy() {
         Some("${SIMPLED_GATEWAY_OBJECT_2}")
     );
 
+    // Each owner's plan lists its objects, which the steps sync and prune.
+    let plan = |path: &std::path::Path| -> serde_json::Value { serde_json::from_str(&read(path)).unwrap() };
+    let gateway = plan(&out.join("ingress").join("plan.json"));
+    assert_eq!(gateway["owner_label"], "simpled.scope=environment");
+    assert_eq!(gateway["objects"][0]["base"], "gateway_traefik.yml");
+    assert_eq!(gateway["objects"][0]["file"], "ingress/traefik/traefik.yml");
+    assert_eq!(gateway["objects"][1]["var"], "SIMPLED_GATEWAY_OBJECT_2");
+    let deployment = plan(&out.join("prod").join("plan.json"));
+    assert_eq!(deployment["owner_label"], "simpled.deployment=prod");
+    assert_eq!(deployment["objects"][0]["kind"], "config");
+    assert_eq!(deployment["objects"][0]["file"], "prod/configs/shop-data/settings.json");
+    assert_eq!(deployment["simpled_version"], env!("CARGO_PKG_VERSION"));
+
     let script = read(&out.join("deploy.sh"));
     let gateway = script
-        .find("SIMPLED_GATEWAY_OBJECT_1=\"$(sync_object config 'simpled.scope=environment' 'gateway_traefik.yml' 'ingress/traefik/traefik.yml')\"")
+        .find("gateway_objects=\"$(./simpled step sync-objects ingress/plan.json)\"\neval \"${gateway_objects}\"")
         .expect("gateway files are synced");
     let config = script
-        .find("SIMPLED_OBJECT_1=\"$(sync_object config 'simpled.deployment=prod' 'prod_shop-data_settings.json' 'prod/configs/shop-data/settings.json')\"")
+        .find("objects=\"$(./simpled step sync-objects prod/plan.json)\"\neval \"${objects}\"")
         .expect("deployment configs are synced");
     let first_deploy = script.find("docker stack deploy").unwrap();
     assert!(gateway < first_deploy && config < first_deploy, "{}", script);
 
-    // Pruning is scoped to each owner and comes after the last deploy.
+    // Pruning comes after the last deploy.
     let last_deploy = script.rfind("docker stack deploy").unwrap();
     for line in [
-        "prune_objects config 'simpled.scope=environment' 'gateway_traefik.yml' 'gateway_dynamic_conf.yml'",
-        "prune_objects config 'simpled.deployment=prod' 'prod_shop-data_settings.json'",
+        "./simpled step prune-objects ingress/plan.json",
+        "./simpled step prune-objects prod/plan.json",
     ] {
         assert!(
             script.find(line).is_some_and(|i| i > last_deploy),
@@ -96,11 +109,22 @@ fn a_job_mounts_its_configs_through_the_exported_names() {
     );
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
-    let script = read(&dir.path().join("docker-deploy").join("deploy.sh"));
+    let plan: serde_json::Value =
+        serde_json::from_str(&read(&dir.path().join("docker-deploy").join("prod").join("plan.json"))).unwrap();
+    let args: Vec<&str> = plan["jobs"][0]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
     assert!(
-        script.contains("  --config \"source=${SIMPLED_OBJECT_1},target=/data/settings.json,mode=444\" \\"),
-        "{}",
-        script
+        args.windows(2).any(|w| w
+            == [
+                "--config",
+                "source=${SIMPLED_OBJECT_1},target=/data/settings.json,mode=444"
+            ]),
+        "{:?}",
+        args
     );
 }
 
@@ -158,4 +182,59 @@ fn standalone_docker_keeps_its_bind_mounts() {
     let script = read(&dir.path().join("docker-deploy").join("deploy.sh"));
     assert!(!script.contains("sync_object"), "{}", script);
     assert!(script.contains("-v $(pwd)/configs/shop-data:/data"), "{}", script);
+}
+
+#[test]
+fn target_binary_flag_wins_over_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path(), &swarm());
+    fs::write(dir.path().join("arm-simpled"), "arm build").unwrap();
+    let output = simpled(
+        dir.path(),
+        &[
+            "prepare-deployment",
+            "prod",
+            "--bundle",
+            "bundle",
+            "--target-binary",
+            "arm-simpled",
+        ],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(read(&dir.path().join("docker-deploy").join("simpled")), "arm build");
+}
+
+#[test]
+fn target_platform_is_validated() {
+    let cases = [
+        (
+            envspec("docker", "swarm_mode: true\ntarget_platform: linux-riscv", ""),
+            "Unknown target_platform 'linux-riscv': expected linux-amd64 or linux-arm64",
+        ),
+        (
+            envspec("docker", "target_platform: linux-arm64", ""),
+            "target_platform cannot be set for standalone Docker environment",
+        ),
+        (
+            envspec("k8s", "target_platform: linux-arm64", ""),
+            "target_platform cannot be set for K8S environment",
+        ),
+    ];
+    for (env, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        write_project(dir.path(), &env);
+        let output = simpled(
+            dir.path(),
+            &["prepare-deployment", "prod", "--bundle", "bundle"],
+            &[("SHOP_DB_PASSWORD", "s3cr3t")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(expected),
+            "expected '{}' in: {}",
+            expected,
+            stderr
+        );
+    }
 }

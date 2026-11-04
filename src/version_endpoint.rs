@@ -233,6 +233,7 @@ deployments:
             &DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode: true,
                 multi_node: true,
+                target_platform: Default::default(),
             }),
         );
         assert!(docker.ports.is_empty(), "a host port would clash with the gateway");

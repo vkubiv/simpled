@@ -732,6 +732,7 @@ mod tests {
             DeploymentEnvType::Docker(crate::spec::DockerSpecificSpec {
                 swarm_mode: true,
                 multi_node: true,
+                target_platform: Default::default(),
             })
         }
 

@@ -70,6 +70,22 @@ fn stack(dir: &Path) -> serde_yaml::Value {
     .unwrap()
 }
 
+/// The `docker service create` arguments of the `migrate` job, from the plan.
+fn job_args(dir: &Path) -> Vec<String> {
+    let plan: serde_json::Value =
+        serde_json::from_str(&read(&dir.join("docker-deploy").join("prod").join("plan.json"))).unwrap();
+    plan["jobs"][0]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
+    args.windows(2).any(|w| w[0] == flag && w[1] == value)
+}
+
 fn constraints(service: &serde_yaml::Value) -> Vec<String> {
     service["deploy"]["placement"]["constraints"]
         .as_sequence()
@@ -129,13 +145,16 @@ fn bound_volumes_become_stack_volumes_and_pin_their_services() {
     let out = dir.path().join("docker-deploy");
     let script = read(&out.join("deploy.sh"));
     // The job mounts the volume the stack created, with the same NFS options.
+    let args = job_args(dir.path());
     assert!(
-        script.contains(
-            "--mount 'type=volume,source=prod_uploads,target=/uploads,volume-driver=local,\
-             volume-opt=device=:/shop/uploads,\"volume-opt=o=addr=fs.example.com,nfsvers=4.1\",volume-opt=type=nfs'"
+        has_pair(
+            &args,
+            "--mount",
+            "type=volume,source=prod_uploads,target=/uploads,volume-driver=local,\
+             volume-opt=device=:/shop/uploads,\"volume-opt=o=addr=fs.example.com,nfsvers=4.1\",volume-opt=type=nfs"
         ),
-        "{}",
-        script
+        "{:?}",
+        args
     );
     // Nothing bound lives under the deployment directory any more.
     assert!(!script.contains("/volumes/"), "{}", script);
@@ -298,20 +317,15 @@ fn single_node_keeps_the_1x_layout_and_pins_everything_to_the_deploying_node() {
 
     let script = read(&out.join("deploy.sh"));
     let check = script
-        .find("awk '$3 == \"Ready\" && $4 == \"Active\"")
+        .find("node_pin=\"$(./simpled step check-nodes)\"\neval \"${node_pin}\"")
         .expect("node check");
-    let export = script.find("export SIMPLED_NODE_ID").expect("node id export");
     let first_deploy = script.find("docker stack deploy").unwrap();
-    assert!(check < export && export < first_deploy, "{}", script);
+    assert!(check < first_deploy, "{}", script);
+    // The job is pinned too, with the variable left for the step to expand.
+    let args = job_args(dir.path());
     assert!(
-        script.contains("but the env spec sets multi_node: false."),
-        "{}",
-        script
-    );
-    // The job is pinned too, with the variable left for the shell to expand.
-    assert!(
-        script.contains("  --constraint \"node.id == ${SIMPLED_NODE_ID}\" \\"),
-        "{}",
-        script
+        has_pair(&args, "--constraint", "node.id == ${SIMPLED_NODE_ID}"),
+        "{:?}",
+        args
     );
 }

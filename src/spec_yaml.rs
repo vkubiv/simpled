@@ -142,6 +142,9 @@ pub struct DeploymentEnvironmentSpecYaml {
     // Swarm only, default true: validate as if the swarm had several nodes even
     // when it has one. `false` keeps everything on the node that runs deploy.sh.
     pub multi_node: Option<bool>,
+    // Swarm only: linux-amd64 (default) or linux-arm64, the platform of the deploy
+    // target the simpled binary is shipped to.
+    pub target_platform: Option<String>,
     pub gateway: Option<IngressSpecYaml>,
     // deprecated: use gateway instead
     pub ingress: Option<IngressSpecYaml>,
