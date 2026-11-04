@@ -20,6 +20,7 @@ mod secret_fetch;
 mod spec;
 mod spec_loader;
 mod spec_yaml;
+mod swarm_objects;
 mod test_spec;
 #[cfg(test)]
 mod test_support;
