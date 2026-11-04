@@ -339,6 +339,40 @@ pub struct DockerSpecificSpec {
     /// node and pins every service to the node it runs on. Always false outside
     /// Swarm.
     pub multi_node: bool,
+    /// Swarm only: the OS and CPU of the deploy target, which the shipped simpled
+    /// binary has to run on.
+    pub target_platform: TargetPlatform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum TargetPlatform {
+    #[default]
+    LinuxAmd64,
+    LinuxArm64,
+}
+
+impl TargetPlatform {
+    /// The architecture in release asset names.
+    pub fn arch(self) -> &'static str {
+        match self {
+            TargetPlatform::LinuxAmd64 => "amd64",
+            TargetPlatform::LinuxArm64 => "arm64",
+        }
+    }
+
+    /// The architecture as `std::env::consts::ARCH` names it.
+    pub fn rust_arch(self) -> &'static str {
+        match self {
+            TargetPlatform::LinuxAmd64 => "x86_64",
+            TargetPlatform::LinuxArm64 => "aarch64",
+        }
+    }
+}
+
+impl std::fmt::Display for TargetPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "linux-{}", self.arch())
+    }
 }
 
 /// Where a named volume lives in a Swarm environment.

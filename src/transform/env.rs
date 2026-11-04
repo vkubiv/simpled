@@ -17,6 +17,24 @@ pub fn convert_env_spec(
         .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
     let swarm_mode_opt = yaml.swarm_mode;
     let multi_node_opt = yaml.multi_node;
+    let target_platform_opt = yaml.target_platform.clone();
+    // Swarm-only top-level fields that are set, for rejecting them anywhere else.
+    let swarm_top_level = |env: &str, hint: &str| -> Result<()> {
+        for (field, set) in [
+            ("multi_node", multi_node_opt.is_some()),
+            ("target_platform", target_platform_opt.is_some()),
+        ] {
+            if set {
+                return Err(anyhow!(
+                    "{} cannot be set for {} environment: it only applies to Docker Swarm{}",
+                    field,
+                    env,
+                    hint
+                ));
+            }
+        }
+        Ok(())
+    };
     let gateway_yaml = match (yaml.gateway, yaml.ingress) {
         (Some(g), _) => g,
         (None, Some(i)) => {
@@ -94,11 +112,7 @@ pub fn convert_env_spec(
             if swarm_mode_opt.is_some() {
                 return Err(anyhow!("swarm_mode cannot be set for K8S environment"));
             }
-            if multi_node_opt.is_some() {
-                return Err(anyhow!(
-                    "multi_node cannot be set for K8S environment: it only applies to Docker Swarm"
-                ));
-            }
+            swarm_top_level("K8S", "")?;
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for K8S environment"));
             }
@@ -158,12 +172,18 @@ pub fn convert_env_spec(
             }
             if !swarm_mode {
                 reject_swarm_only("standalone Docker")?;
-                if multi_node_opt.is_some() {
-                    return Err(anyhow!(
-                        "multi_node cannot be set for standalone Docker environment: it only applies to Docker Swarm (swarm_mode: true)"
-                    ));
-                }
+                swarm_top_level("standalone Docker", " (swarm_mode: true)")?;
             }
+            let target_platform = match target_platform_opt.as_deref() {
+                None | Some("linux-amd64") => TargetPlatform::LinuxAmd64,
+                Some("linux-arm64") => TargetPlatform::LinuxArm64,
+                Some(other) => {
+                    return Err(anyhow!(
+                        "Unknown target_platform '{}': expected linux-amd64 or linux-arm64",
+                        other
+                    ))
+                }
+            };
             let multi_node = swarm_mode && multi_node_opt.unwrap_or(true);
             if swarm_mode && !multi_node && ingress.global {
                 return Err(anyhow!(
@@ -171,17 +191,17 @@ pub fn convert_env_spec(
                      while multi_node: false keeps everything on the node that runs deploy.sh"
                 ));
             }
-            DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode, multi_node })
+            DeploymentEnvType::Docker(DockerSpecificSpec {
+                swarm_mode,
+                multi_node,
+                target_platform,
+            })
         }
         DeploymentEnvTypeYaml::Local => {
             if swarm_mode_opt.is_some() {
                 return Err(anyhow!("swarm_mode cannot be set for Local environment"));
             }
-            if multi_node_opt.is_some() {
-                return Err(anyhow!(
-                    "multi_node cannot be set for Local environment: it only applies to Docker Swarm"
-                ));
-            }
+            swarm_top_level("Local", "")?;
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for Local environment"));
             }

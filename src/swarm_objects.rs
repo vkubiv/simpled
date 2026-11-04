@@ -12,12 +12,13 @@
 //!
 //! The stack files declare every object `external: true` with its name taken from
 //! a variable the deploy script exports, and `docker stack deploy` interpolates it.
+//! Creating and pruning them is done by `simpled step` (`deploy_steps`), from the
+//! objects listed in the plan.
 
 use crate::resolved_spec::{DeploymentResolvedSpec, ServiceResolvedSpec};
-use crate::secret_fetch::sh_quote;
 use crate::spec::SecretMount;
 use anyhow::{anyhow, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Swarm's limit for one config or secret.
@@ -27,7 +28,8 @@ const MAX_BASE_LEN: usize = 64 - 13;
 /// Read-only for everyone, so a service that does not run as root still reads it.
 const MODE: u32 = 0o444;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ObjectKind {
     Secret,
     Config,
@@ -124,47 +126,9 @@ impl SwarmObjects {
             .collect()
     }
 
-    /// The deploy script lines that create every object and export its name.
-    pub fn sync_lines(&self) -> Vec<String> {
-        self.objects
-            .iter()
-            .flat_map(|o| {
-                [
-                    format!(
-                        "{}=\"$(sync_object {} {} {} {})\"",
-                        o.var,
-                        o.kind.command(),
-                        sh_quote(&self.owner_label),
-                        sh_quote(&o.base),
-                        sh_quote(&o.file)
-                    ),
-                    format!("export {}", o.var),
-                ]
-            })
-            .collect()
-    }
-
-    /// The deploy script lines that prune older generations of every object.
-    pub fn prune_lines(&self) -> Vec<String> {
-        [ObjectKind::Secret, ObjectKind::Config]
-            .into_iter()
-            .filter_map(|kind| {
-                let bases: Vec<String> = self
-                    .objects
-                    .iter()
-                    .filter(|o| o.kind == kind)
-                    .map(|o| sh_quote(&o.base))
-                    .collect();
-                (!bases.is_empty()).then(|| {
-                    format!(
-                        "prune_objects {} {} {}",
-                        kind.command(),
-                        sh_quote(&self.owner_label),
-                        bases.join(" ")
-                    )
-                })
-            })
-            .collect()
+    /// The objects as the plan lists them, for the deploy steps.
+    pub fn plan_objects(&self) -> Vec<crate::deploy_plan::PlanObject> {
+        self.objects.iter().map(Into::into).collect()
     }
 }
 
@@ -326,43 +290,6 @@ fn check_size(len: usize, what: impl Fn() -> String) -> Result<()> {
     Ok(())
 }
 
-/// The deploy script functions behind `sync_lines` and `prune_lines`.
-pub const SHELL_FUNCTIONS: &str = r#"# sync_object <secret|config> <owner label> <base name> <file>: creates the Swarm
-# object <base name>_<first 12 hex digits of the file's sha256> unless it exists,
-# and prints its name. Objects are immutable, so new content is a new object.
-sync_object() {
-  kind="$1"; owner="$2"; base="$3"; file="$4"
-  hash="$(sha256sum "${file}" | cut -c1-12)"
-  name="${base}_${hash}"
-  if ! docker "${kind}" inspect "${name}" >/dev/null 2>&1; then
-    docker "${kind}" create --label "${owner}" --label "simpled.object=${base}" "${name}" "${file}" >/dev/null
-    echo "Created ${kind} ${name}" >&2
-  fi
-  printf '%s' "${name}"
-}
-
-# prune_objects <secret|config> <owner label> <base name>...: keeps the two newest
-# objects of each base name, the current one and the previous one, which a
-# `docker service rollback` still mounts. Docker refuses to remove an object a
-# service uses, so an older one still in use stays too.
-prune_objects() {
-  kind="$1"; owner="$2"; shift 2
-  for base in "$@"; do
-    # `ls` only shows relative ages ("4 minutes ago"), so the creation time is
-    # read from `inspect`, as a fixed-width UTC timestamp that sorts as text.
-    docker "${kind}" ls -q --filter "label=${owner}" --filter "label=simpled.object=${base}" \
-      | xargs -r docker "${kind}" inspect \
-          --format '{{.CreatedAt.UTC.Format "2006-01-02T15:04:05.000000000Z"}}|{{.Spec.Name}}' \
-      | sort -r | tail -n +3 | cut -d'|' -f2 \
-      | while read -r old; do
-          if docker "${kind}" rm "${old}" >/dev/null 2>&1; then
-            echo "Removed ${kind} ${old}"
-          fi
-        done
-  done
-}
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,22 +314,8 @@ mod tests {
         let b = objects.add(ObjectKind::Secret, "prod_key", "prod/secrets/key", "V_");
         assert_eq!(a.var, again.var);
         assert_eq!((a.var.as_str(), b.var.as_str()), ("V_1", "V_2"));
-        assert_eq!(
-            objects.sync_lines(),
-            vec![
-                "V_1=\"$(sync_object config 'simpled.deployment=prod' 'prod_cfg' 'prod/configs/cfg/a')\"",
-                "export V_1",
-                "V_2=\"$(sync_object secret 'simpled.deployment=prod' 'prod_key' 'prod/secrets/key')\"",
-                "export V_2",
-            ]
-        );
-        assert_eq!(
-            objects.prune_lines(),
-            vec![
-                "prune_objects secret 'simpled.deployment=prod' 'prod_key'",
-                "prune_objects config 'simpled.deployment=prod' 'prod_cfg'",
-            ]
-        );
+        assert_eq!(objects.plan_objects().len(), 2);
+        assert_eq!(objects.plan_objects()[1].file, "prod/secrets/key");
         assert_eq!(objects.externals(ObjectKind::Secret)["prod_key"].name, "${V_2}");
     }
 

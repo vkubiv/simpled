@@ -4,6 +4,8 @@ use std::path::Path;
 
 mod app_bundle;
 mod bundle_repo;
+mod deploy_plan;
+mod deploy_steps;
 mod docker_compose;
 mod docker_generator;
 mod docker_resources;
@@ -21,6 +23,7 @@ mod spec;
 mod spec_loader;
 mod spec_yaml;
 mod swarm_objects;
+mod target_binary;
 mod test_spec;
 #[cfg(test)]
 mod test_support;
@@ -50,6 +53,21 @@ enum Commands {
 
         #[command(flatten)]
         bundle: bundle_repo::BundleArgs,
+
+        /// Swarm: the simpled binary to ship next to deploy.sh, built for the deploy
+        /// target and of this same version. Needed only when this machine is not
+        /// Linux on the target's CPU and the version has no GitHub release to
+        /// download it from. Also read from SIMPLED_TARGET_BINARY.
+        #[arg(long)]
+        target_binary: Option<std::path::PathBuf>,
+    },
+
+    /// Steps of a Swarm deploy, run by the deploy.sh that prepare-deployment
+    /// writes, with the plan.json files next to it
+    #[command(hide = true)]
+    Step {
+        #[command(subcommand)]
+        command: StepCommands,
     },
 
     /// Used for local development and tests
@@ -141,6 +159,20 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum StepCommands {
+    /// multi_node: false. Fails unless exactly one node accepts tasks, and prints
+    /// `export SIMPLED_NODE_ID=...` for the constraint every service carries
+    CheckNodes,
+    /// Creates the plan's configs and secrets under their content-addressed names,
+    /// and prints an `export` line naming each one
+    SyncObjects { plan: std::path::PathBuf },
+    /// Removes the plan's configs and secrets older than the previous deploy
+    PruneObjects { plan: std::path::PathBuf },
+    /// Runs one job of the plan to completion
+    RunJob { plan: std::path::PathBuf, job: String },
 }
 
 #[derive(Subcommand)]
@@ -279,8 +311,12 @@ fn main() -> Result<()> {
         Commands::PrepareDeployment {
             deployment_name,
             bundle,
+            target_binary,
         } => {
-            prepare_deployment_command(deployment_name, bundle)?;
+            prepare_deployment_command(deployment_name, bundle, target_binary.as_deref())?;
+        }
+        Commands::Step { command } => {
+            step_command(command)?;
         }
         Commands::Local { command } => {
             local(command)?;
@@ -356,7 +392,76 @@ fn version_command() -> Result<()> {
     Ok(())
 }
 
-fn prepare_deployment_command(deployment_name: &str, bundle: &bundle_repo::BundleArgs) -> Result<()> {
+fn step_command(command: &StepCommands) -> Result<()> {
+    use deploy_plan::Plan;
+    use deploy_steps::{export_line, DockerCli};
+
+    // The plan and the binary come from the same prepare-deployment, so a
+    // mismatch means files from two deployments were mixed on the target.
+    let read_plan = |path: &std::path::Path| -> Result<Plan> {
+        let plan = Plan::read(path)?;
+        let running = env!("CARGO_PKG_VERSION");
+        if plan.simpled_version != running {
+            bail!(
+                "{} was prepared by simpled {}, but this is simpled {}. Run the deploy.sh and simpled binary \
+                 that came with the plan, from the same prepare-deployment",
+                path.display(),
+                plan.simpled_version,
+                running
+            );
+        }
+        Ok(plan)
+    };
+    let docker = DockerCli;
+    let deploy_dir = std::env::current_dir().context("Cannot read the current directory")?;
+
+    match command {
+        StepCommands::CheckNodes => {
+            println!(
+                "{}",
+                export_line("SIMPLED_NODE_ID", &deploy_steps::check_nodes(&docker)?)
+            );
+        }
+        StepCommands::SyncObjects { plan } => {
+            for (var, name) in deploy_steps::sync_objects(&docker, &read_plan(plan)?, &deploy_dir)? {
+                println!("{}", export_line(&var, &name));
+            }
+        }
+        StepCommands::PruneObjects { plan } => {
+            deploy_steps::prune_objects(&docker, &read_plan(plan)?)?;
+        }
+        StepCommands::RunJob { plan, job } => {
+            let plan = read_plan(plan)?;
+            let job = plan.job(job)?;
+            let timeout = match std::env::var("JOB_TIMEOUT") {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .with_context(|| format!("JOB_TIMEOUT '{}' is not a number of seconds", value))?,
+                Err(_) => job.timeout_seconds.into(),
+            };
+            let dir = deploy_dir.to_string_lossy().into_owned();
+            let lookup = move |name: &str| {
+                std::env::var(name)
+                    .ok()
+                    .or_else(|| (name == "DEPLOY_DIR").then(|| dir.clone()))
+            };
+            deploy_steps::run_job(
+                &docker,
+                job,
+                &lookup,
+                std::time::Duration::from_secs(timeout),
+                std::time::Duration::from_secs(2),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_deployment_command(
+    deployment_name: &str,
+    bundle: &bundle_repo::BundleArgs,
+    target_binary: Option<&Path>,
+) -> Result<()> {
     // 1. Load specs
     let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
 
@@ -385,6 +490,10 @@ fn prepare_deployment_command(deployment_name: &str, bundle: &bundle_repo::Bundl
         spec::DeploymentEnvType::Docker(ref docker_spec) => {
             let output_dir = Path::new("docker-deploy");
             docker_generator::generate(&resolved_spec, docker_spec, output_dir).context("Generation failed")?;
+            if docker_spec.swarm_mode {
+                target_binary::provide(&output_dir.join("simpled"), docker_spec.target_platform, target_binary)
+                    .context("Failed to ship the simpled binary that runs the deploy steps")?;
+            }
             println!("Docker deployment script generated in {:?}", output_dir);
         }
         spec::DeploymentEnvType::Local => {

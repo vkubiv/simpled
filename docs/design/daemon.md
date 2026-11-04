@@ -417,8 +417,8 @@ there is one mechanism in the generator.
    (`name: ${SIMPLED_OBJECT_<n>}`). The same value gives the same name, so nothing
    happens. A new value gives a new name, so it is a new object. Nothing is ever
    modified, which is what makes Swarm's immutability painless.
-2. **`./simpled step sync-objects` creates them** (§8.5); until the steps exist, a
-   `sync_object` shell function in `deploy.sh` does. It is idempotent: an object
+2. **`./simpled step sync-objects` creates them** (§8.5). It reads
+   the deployment's `plan.json` and is idempotent: an object
    that already exists under its hashed name is left alone. Each object is labelled
    with its owner (`simpled.deployment=prod`, §8.6) and its base name
    (`simpled.object=prod_shop-db_password`). The stack files reference them as
@@ -554,14 +554,21 @@ the lookup of the certificate secret (§7.1). `docker stack deploy` and
 `deploy.sh`, so the same `rsync` carries it and the version on the server is always
 the one that prepared the deployment:
 
-- When `prepare-deployment` runs on Linux on the same CPU type as the target, it
-  copies itself.
+- `--target-binary <path>` (or `SIMPLED_TARGET_BINARY`) names the binary to ship,
+  for an unreleased build or an offline machine.
+- Otherwise, when `prepare-deployment` runs on Linux on the same CPU type as the
+  target, it copies itself.
 - Otherwise it downloads that same version's release asset for the target and
-  verifies its checksum. This is what `simpled update` already does
-  (`bundle_repo/gh_release.rs`), so the code exists.
-- The target is `linux-amd64` unless the env spec sets
-  `docker.target_platform: linux-arm64`. It belongs in the env spec because the
-  platform is a property of the environment.
+  verifies it against the release's checksums, with the code `simpled update` uses.
+- The target is `linux-amd64` unless the env spec sets the top-level
+  `target_platform: linux-arm64` (Swarm only). It belongs in the env spec because
+  the platform is a property of the environment.
+- **Open:** releases build no `simpled_linux_arm64` asset yet, so for an arm64
+  target the download fails with a message pointing to `--target-binary`. The
+  release workflow needs an `aarch64-unknown-linux-gnu` build, ideally static
+  (musl) for both Linux targets.
+- Before acting, every step checks that its plan was written by the same simpled
+  version, so files from two prepares mixed on a target fail loudly.
 
 `step` commands are hidden from the main `--help`. Each one prints what it does
 (`created prod_db_password_3f9a1c2e`, `job migrate: completed in 14s`), so the deploy
@@ -576,8 +583,11 @@ variables, on files next to the spec, on `extends`, and on the downloaded bundle
 | `ingress/plan.json` | The environment: gateway, daemon, environment objects, `multi_node`, the env spec hash, the simpled version |
 | `<deployment>/plan.json` | One deployment: its objects with their hashes, its jobs, constraints and phases |
 
-A plan never holds secret values, only names, hashes and file paths; the values stay
-in the secret files. It is its own struct with its own format, not a serialization of
+A plan holds no more than the stack file does. File secrets appear only as paths, and
+`aws` secrets only as variables that `fetch-secrets.sh` exports. A literal secret
+mounted as an environment variable appears in a job's arguments with its value, as it
+does in the stack file's `environment:` and in the service spec Docker keeps. It is
+its own struct with its own format, not a serialization of
 `EnvironmentResolvedSpec`, so refactoring the resolver does not change the file.
 
 ### 8.6 Several deployments in one env spec
@@ -620,7 +630,7 @@ nothing deletes it. The gateway stops routing to it. A later
 | Swarm, named volumes without a binding | Error with a ready-to-paste block. Or set `multi_node: false` to keep the 1.x behavior on one node. |
 | Swarm, relative bind paths | Error. Or `multi_node: false`. |
 | Swarm, config or secret files on a shared volume | Nothing to change: they become Swarm objects automatically. |
-| Target on a different CPU type than CI (for example arm64) | Set `docker.target_platform`. |
+| Target on a different CPU type than CI (for example arm64) | Set `target_platform`, and pass `--target-binary` until releases build an arm64 binary. |
 | `gateway.type: nginx`, `tls.secret` on Docker | Already rejected (removed before 2.0.0). |
 
 ---

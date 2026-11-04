@@ -1,6 +1,7 @@
+use crate::deploy_plan::{escape, Plan, PlanJob};
 use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork, DockerService, ServiceNetwork};
 use crate::docker_resources::DockerResources;
-use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
+use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
 use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBinding};
 use crate::swarm_objects::{self, ObjectKind, SwarmObjects};
@@ -21,6 +22,8 @@ const TRAEFIK_PING_ROUTER: &str = "simpled-ping";
 const TRAEFIK_RESOLVER: &str = "myresolver";
 /// Placeholder backend for redirect-only routers, which still have to name one.
 const TRAEFIK_REDIRECT_SERVICE: &str = "redirect-noop";
+/// The gateway's plan, relative to the deploy directory.
+const INGRESS_PLAN: &str = "ingress/plan.json";
 /// Stack file holding only the services the jobs depend on (phase 1 of a deploy).
 const DEPS_COMPOSE_FILE: &str = "docker-compose.deps.yaml";
 /// Default seconds to wait for one job to reach a terminal state.
@@ -47,88 +50,6 @@ const WAIT_HEALTHY_FUNCTION: &str = r#"wait_healthy() {
   echo "Timed out after ${HEALTH_TIMEOUT}s waiting for ${name} to become healthy." >&2
   exit 1
 }
-"#;
-
-/// `run_job` helper embedded in the generated Swarm deploy script.
-///
-/// Swarm's run-to-completion primitive (`--mode replicated-job`) exists only in
-/// the CLI/API — compose's `deploy.mode` does not accept it, so a job placed in a
-/// stack file is deployed as an ordinary replicated service that never converges.
-/// Creating the job as a standalone service instead gives a real pass/fail signal.
-const RUN_JOB_FUNCTION: &str = r#"run_job() {
-  job_name="$1"
-  shift
-  echo "Running job ${job_name}..."
-
-  # A service left over from an earlier deploy (or from an older simpled that put
-  # jobs in the stack file) would make `docker service create` fail on the name.
-  docker service rm "${job_name}" >/dev/null 2>&1 || true
-
-  # Detached: with --detach=false the CLI waits on a job whose task failed, printing
-  # "non-zero exit" forever, so the timeout below never got a chance to run.
-  create_status=0
-  docker service create \
-    --name "${job_name}" \
-    --mode replicated-job \
-    --restart-condition none \
-    --detach \
-    --quiet \
-    --with-registry-auth \
-    "$@" >/dev/null || create_status=$?
-  if [ "${create_status}" -ne 0 ]; then
-    echo "Job ${job_name} could not be created (exit code ${create_status})." >&2
-    exit 1
-  fi
-
-  # The task is polled for a terminal state rather than trusting the exit code of
-  # `docker service create` alone, which reports on the rollout, not on the
-  # process the job ran.
-  waited=0
-  state=""
-  while [ "${waited}" -lt "${JOB_TIMEOUT}" ]; do
-    state="$(docker service ps "${job_name}" --format '{{.CurrentState}}' 2>/dev/null | head -n 1)"
-    case "${state}" in
-      Complete*|Failed*|Rejected*|Orphaned*|Shutdown*) break ;;
-    esac
-    sleep 2
-    waited=$((waited + 2))
-  done
-
-  case "${state}" in
-    Complete*)
-      docker service logs --tail 50 "${job_name}" || true
-      docker service rm "${job_name}" >/dev/null 2>&1 || true
-      echo "Job ${job_name} completed."
-      ;;
-    *)
-      echo "Job ${job_name} did not complete (state: ${state:-unknown}, create exit code: ${create_status})." >&2
-      docker service logs --tail 200 "${job_name}" >&2 || true
-      docker service rm "${job_name}" >/dev/null 2>&1 || true
-      exit 1
-      ;;
-  esac
-}
-"#;
-
-/// `multi_node: false`: the environment lives on the one node that accepts
-/// tasks (`Ready` and `Active`). The script refuses a swarm with more than one
-/// such node, and exports that node's ID for the `node.id` constraint every
-/// service carries. The node is not necessarily the one running the script: a
-/// drained manager with a single worker pins everything to the worker.
-const SINGLE_NODE_CHECK: &str = r#"# multi_node: false keeps this environment on the one node that accepts tasks.
-schedulable="$(docker node ls --format '{{.ID}} {{.Hostname}} {{.Status}} {{.Availability}}' | awk '$3 == "Ready" && $4 == "Active" { print $1, $2 }')"
-schedulable_count="$(printf '%s\n' "${schedulable}" | grep -c . || true)"
-if [ "${schedulable_count}" -eq 0 ]; then
-  echo "No node in this swarm accepts tasks: every node is down or drained." >&2
-  exit 1
-fi
-if [ "${schedulable_count}" -gt 1 ]; then
-  echo "This swarm has ${schedulable_count} nodes that accept tasks ($(printf '%s\n' "${schedulable}" | awk '{ print $2 }' | paste -sd, - | sed 's/,/, /g')), but the env spec sets multi_node: false." >&2
-  echo "Set multi_node: true and bind the volumes (simpled docs reference --section volumes), or drain the extra nodes (docker node update --availability drain <node>)." >&2
-  exit 1
-fi
-SIMPLED_NODE_ID="$(printf '%s\n' "${schedulable}" | awk '{ print $1 }')"
-export SIMPLED_NODE_ID
 "#;
 
 /// The constraint that keeps a service on the one schedulable node. The stack
@@ -563,33 +484,81 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
 
     let gateway_objects = generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone())?;
 
-    // 5. Deploy Script
+    // 5. Plans, which the deploy steps read.
+    let plan_jobs = jobs
+        .iter()
+        .map(|job| {
+            let docker_service = prepared
+                .get(&job.full_name)
+                .ok_or_else(|| anyhow!("Job {} was not prepared", job.full_name))?;
+            Ok(PlanJob {
+                name: job.full_name.clone(),
+                service: format!("{}_{}", deployment.name, job.full_name),
+                args: job_args(
+                    &deployment.name,
+                    &job.full_name,
+                    docker_service,
+                    &network_name,
+                    &deployment.volume_bindings,
+                )?,
+                timeout_seconds: JOB_TIMEOUT_SECONDS,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let deployment_plan_path = format!("{}/plan.json", deployment.name);
+    Plan {
+        simpled_version: env!("CARGO_PKG_VERSION").to_string(),
+        owner_label: deployment_objects.objects.owner_label.clone(),
+        objects: deployment_objects.objects.plan_objects(),
+        jobs: plan_jobs.clone(),
+    }
+    .write(&output_dir.join(&deployment_plan_path))?;
+    Plan {
+        simpled_version: env!("CARGO_PKG_VERSION").to_string(),
+        owner_label: gateway_objects.owner_label.clone(),
+        objects: gateway_objects.plan_objects(),
+        jobs: vec![],
+    }
+    .write(&output_dir.join(INGRESS_PLAN))?;
+
+    // 6. Deploy Script
     let mut deploy_sh = create_executable(&output_dir.join("deploy.sh"))?;
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
+    writeln!(deploy_sh, "cd \"$(dirname \"$0\")\"")?;
+    writeln!(deploy_sh)?;
+    writeln!(
+        deploy_sh,
+        "# The steps below that would be a lot of shell are run by the simpled binary"
+    )?;
+    writeln!(
+        deploy_sh,
+        "# shipped next to this script, the version that prepared the deployment. They"
+    )?;
+    writeln!(
+        deploy_sh,
+        "# read <deployment>/plan.json and ingress/plan.json. A step that sets variables"
+    )?;
+    writeln!(
+        deploy_sh,
+        "# for the rest of the script prints `export` lines; they are captured first, so"
+    )?;
+    writeln!(
+        deploy_sh,
+        "# a failing step stops the script (`set -e`), and then evaluated."
+    )?;
+    writeln!(deploy_sh, "chmod +x ./simpled")?;
+    writeln!(deploy_sh)?;
     write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
     if single_node(resolved_spec) {
-        write!(deploy_sh, "{}", SINGLE_NODE_CHECK)?;
+        writeln!(
+            deploy_sh,
+            "# multi_node: false keeps this environment on the one node that accepts tasks."
+        )?;
+        writeln!(deploy_sh, "node_pin=\"$(./simpled step check-nodes)\"")?;
+        writeln!(deploy_sh, "eval \"${{node_pin}}\"")?;
         writeln!(deploy_sh)?;
-    }
-    if !jobs.is_empty() {
-        writeln!(
-            deploy_sh,
-            "# Absolute paths are needed for the bind mounts of jobs, which are created"
-        )?;
-        writeln!(
-            deploy_sh,
-            "# with `docker service create` instead of being part of the stack file."
-        )?;
-        writeln!(deploy_sh, "DEPLOY_DIR=\"$(pwd)\"")?;
-        writeln!(
-            deploy_sh,
-            "# Seconds to wait for a single job to finish before giving up."
-        )?;
-        writeln!(deploy_sh, "JOB_TIMEOUT=\"${{JOB_TIMEOUT:-{}}}\"", JOB_TIMEOUT_SECONDS)?;
-        writeln!(deploy_sh)?;
-        write_run_job_function(&mut deploy_sh)?;
     }
     writeln!(
         deploy_sh,
@@ -671,15 +640,13 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     // Every Swarm object the stacks and jobs mount exists before anything is
     // deployed. Their names are exported for the stack files to interpolate.
     writeln!(deploy_sh)?;
-    write!(deploy_sh, "{}", swarm_objects::SHELL_FUNCTIONS)?;
-    writeln!(deploy_sh)?;
     writeln!(deploy_sh, "echo 'Syncing configs and secrets...'")?;
-    for line in gateway_objects
-        .sync_lines()
-        .into_iter()
-        .chain(deployment_objects.objects.sync_lines())
-    {
-        writeln!(deploy_sh, "{}", line)?;
+    for (var, plan) in [
+        ("gateway_objects", INGRESS_PLAN.to_string()),
+        ("objects", deployment_plan_path.clone()),
+    ] {
+        writeln!(deploy_sh, "{}=\"$(./simpled step sync-objects {})\"", var, plan)?;
+        writeln!(deploy_sh, "eval \"${{{}}}\"", var)?;
     }
     writeln!(deploy_sh)?;
 
@@ -741,17 +708,12 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
 
         writeln!(deploy_sh)?;
         writeln!(deploy_sh, "echo '== Phase 2/3: running jobs =='")?;
-        for job in &jobs {
-            let docker_service = prepared
-                .get(&job.full_name)
-                .ok_or_else(|| anyhow!("Job {} was not prepared", job.full_name))?;
-            write_job_invocation(
-                &mut deploy_sh,
-                &deployment.name,
-                &job.full_name,
-                docker_service,
-                &network_name,
-                &deployment.volume_bindings,
+        for job in &plan_jobs {
+            writeln!(
+                deploy_sh,
+                "./simpled step run-job {} {}",
+                deployment_plan_path,
+                sh_quote(&job.name)
             )?;
         }
 
@@ -780,13 +742,8 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         deploy_sh,
         "echo 'Removing configs and secrets older than the previous deploy...'"
     )?;
-    for line in gateway_objects
-        .prune_lines()
-        .into_iter()
-        .chain(deployment_objects.objects.prune_lines())
-    {
-        writeln!(deploy_sh, "{}", line)?;
-    }
+    writeln!(deploy_sh, "./simpled step prune-objects {}", INGRESS_PLAN)?;
+    writeln!(deploy_sh, "./simpled step prune-objects {}", deployment_plan_path)?;
 
     Ok(())
 }
@@ -809,54 +766,34 @@ fn write_fetch_secrets_call(deploy_sh: &mut File, fetch_script: &FetchScript) ->
     Ok(())
 }
 
-fn write_run_job_function(deploy_sh: &mut File) -> Result<()> {
-    write!(deploy_sh, "{}", RUN_JOB_FUNCTION)?;
-    writeln!(deploy_sh)?;
-    Ok(())
-}
-
-/// Emit the `run_job` call for one job, translating the compose representation of
-/// the service into `docker service create` flags. Everything a job needs is
-/// covered: env file, inline environment (including env-variable secrets), bind
-/// mounts (configs, file secrets, volumes), entrypoint and command. Ports and
-/// healthchecks are not translated — neither is meaningful for a task that is
-/// expected to exit.
-fn write_job_invocation(
-    deploy_sh: &mut File,
+/// The `docker service create` arguments of one job, after the flags every job
+/// gets: a translation of the compose representation of the service. Everything
+/// a job needs is covered: env file, inline environment (including env-variable
+/// secrets), configs and file secrets, volumes, placement, resources, entrypoint
+/// and command. Ports and healthchecks are not translated; neither means anything
+/// for a task that is expected to exit.
+///
+/// Every argument is a template (`deploy_plan`): the inline environment already
+/// is one, as compose reads it from the stack file too, and every literal is
+/// escaped. `${DEPLOY_DIR}` is the deploy directory, the object variables are the
+/// ones `step sync-objects` exported.
+fn job_args(
     deployment_name: &str,
     job_name: &str,
     service: &DockerService,
     network_name: &str,
     volume_bindings: &std::collections::BTreeMap<String, VolumeBinding>,
-) -> Result<()> {
-    // Named like a stack service so it is recognizable in `docker service ls`
-    // while it runs; the job is removed again once it completes.
-    let service_name = format!("{}_{}", deployment_name, job_name);
-
-    writeln!(deploy_sh, "run_job {} \\", sh_quote(&service_name))?;
-    writeln!(deploy_sh, "  --network {} \\", sh_quote(network_name))?;
+) -> Result<Vec<String>> {
+    let mut args: Vec<String> = vec!["--network".into(), escape(network_name)];
 
     for env_file in &service.env_file {
-        writeln!(
-            deploy_sh,
-            "  --env-file \"{}\" \\",
-            node_path(deployment_name, env_file)
-        )?;
+        args.push("--env-file".into());
+        args.push(node_path(deployment_name, env_file));
     }
 
-    let mut env_names: Vec<&String> = service.environment.keys().collect();
-    env_names.sort();
-    for name in env_names {
-        let value = &service.environment[name];
-        // A deferred secret is carried as a `${SIMPLED_SECRET_*}` placeholder that
-        // the stack file has `docker stack deploy` interpolate. A job bypasses the
-        // stack file, so the placeholder has to be left unquoted for the shell to
-        // expand it here instead. Everything else is quoted verbatim.
-        if is_secret_placeholder(value) {
-            writeln!(deploy_sh, "  -e \"{}={}\" \\", name, value)?;
-        } else {
-            writeln!(deploy_sh, "  -e {} \\", sh_quote(&format!("{}={}", name, value)))?;
-        }
+    for (name, value) in &service.environment {
+        args.push("-e".into());
+        args.push(format!("{}={}", escape(name), value));
     }
 
     if let Some(resources) = service.deploy.as_ref().and_then(|d| d.resources.as_ref()) {
@@ -869,38 +806,37 @@ fn write_job_invocation(
         ];
         for (flag, value) in flags {
             if let Some(value) = value {
-                writeln!(deploy_sh, "  {} {} \\", flag, sh_quote(&value))?;
+                args.push(flag.into());
+                args.push(escape(&value));
             }
         }
     }
 
     if let Some(placement) = service.deploy.as_ref().and_then(|d| d.placement.as_ref()) {
         for constraint in &placement.constraints {
-            // The node pin names a shell variable, so it is double-quoted for the
-            // shell to expand; every other constraint is taken literally.
-            if constraint == NODE_PIN {
-                writeln!(deploy_sh, "  --constraint \"{}\" \\", constraint)?;
+            args.push("--constraint".into());
+            // The node pin names the variable `step check-nodes` exported.
+            args.push(if constraint == NODE_PIN {
+                constraint.clone()
             } else {
-                writeln!(deploy_sh, "  --constraint {} \\", sh_quote(constraint))?;
-            }
+                escape(constraint)
+            });
         }
         for preference in &placement.preferences {
-            writeln!(
-                deploy_sh,
-                "  --placement-pref {} \\",
-                sh_quote(&format!("spread={}", preference.spread))
-            )?;
+            args.push("--placement-pref".into());
+            args.push(escape(&format!("spread={}", preference.spread)));
         }
     }
 
-    // Double-quoted: the object's name is in a variable the script exported.
     for (flag, mounts) in [("--secret", &service.secrets), ("--config", &service.configs)] {
         for object in mounts {
-            writeln!(
-                deploy_sh,
-                "  {} \"source=${{{}}},target={},mode={:o}\" \\",
-                flag, object.var, object.target, object.mode
-            )?;
+            args.push(flag.into());
+            args.push(format!(
+                "source=${{{}}},target={},mode={:o}",
+                object.var,
+                escape(&object.target),
+                object.mode
+            ));
         }
     }
 
@@ -910,6 +846,7 @@ fn write_job_invocation(
         let Some((source, target)) = volume.split_once(':') else {
             return Err(anyhow!("Job {} has an invalid volume entry '{}'", job_name, volume));
         };
+        args.push("--mount".into());
         // A Docker volume the stack declares: `docker stack deploy` names it
         // `<stack>_<name>`, so the job mounts that same volume.
         if let Some(docker_volume) = volume_bindings
@@ -929,15 +866,14 @@ fn write_job_invocation(
                     mount.push_str(&format!(",{}", opt));
                 }
             }
-            writeln!(deploy_sh, "  --mount {} \\", sh_quote(&mount))?;
+            args.push(escape(&mount));
             continue;
         }
-        writeln!(
-            deploy_sh,
-            "  --mount \"type=bind,source={},target={}\" \\",
+        args.push(format!(
+            "type=bind,source={},target={}",
             node_path(deployment_name, source),
-            target
-        )?;
+            escape(target)
+        ));
     }
 
     // `docker service create --entrypoint` overrides only the executable, so any
@@ -946,38 +882,33 @@ fn write_job_invocation(
     // (25.0+); jobs that do not override the entrypoint work on any version.
     let mut trailing_args: Vec<String> = Vec::new();
     if let Some(entrypoint) = &service.entrypoint {
-        let mut args = entrypoint.to_args();
-        if !args.is_empty() {
-            writeln!(deploy_sh, "  --entrypoint {} \\", sh_quote(&args.remove(0)))?;
-            trailing_args.extend(args);
+        let mut entry = entrypoint.to_args();
+        if !entry.is_empty() {
+            args.push("--entrypoint".into());
+            args.push(escape(&entry.remove(0)));
+            trailing_args.extend(entry);
         }
     }
     if let Some(command) = &service.command {
         trailing_args.extend(command.to_args());
     }
 
-    write!(deploy_sh, "  {}", sh_quote(&service.image))?;
-    for arg in trailing_args {
-        write!(deploy_sh, " {}", sh_quote(&arg))?;
-    }
-    writeln!(deploy_sh)?;
-
-    Ok(())
-}
-
-/// Whether an env value is the `${SIMPLED_SECRET_*}` reference `prepare_service`
-/// writes for a secret that is only fetched on the deploy target.
-fn is_secret_placeholder(value: &str) -> bool {
-    value.starts_with(&format!("${{{}", SHELL_VAR_PREFIX)) && value.ends_with('}')
+    args.push(escape(&service.image));
+    args.extend(trailing_args.iter().map(|a| escape(a)));
+    Ok(args)
 }
 
 /// Absolute path on the deployment node for a path written relative to the stack
 /// file. Already-absolute paths (a user-declared host mount) are left alone.
 fn node_path(deployment_name: &str, path: &str) -> String {
     if path.starts_with('/') {
-        path.to_string()
+        escape(path)
     } else {
-        format!("$DEPLOY_DIR/{}/{}", deployment_name, path.trim_start_matches("./"))
+        format!(
+            "${{DEPLOY_DIR}}/{}/{}",
+            escape(deployment_name),
+            escape(path.trim_start_matches("./"))
+        )
     }
 }
 
@@ -1558,6 +1489,7 @@ mod tests {
             env_type: DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode: true,
                 multi_node: true,
+                target_platform: Default::default(),
             }),
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
@@ -1714,6 +1646,7 @@ mod tests {
         let docker_spec = DockerSpecificSpec {
             swarm_mode: true,
             multi_node: true,
+            target_platform: Default::default(),
         };
         generate(spec, &docker_spec, dir.path()).unwrap();
         let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
@@ -1811,7 +1744,7 @@ mkdir -p \"/var/"
         // The deps-only subset must not prune, or phase 3 would have to bring
         // back every service it removed.
         assert!(!script.contains("docker-compose.deps.yaml prod --with-registry-auth --prune"));
-        let job = script.find("run_job 'prod_migrate'").unwrap();
+        let job = script.find("./simpled step run-job prod/plan.json 'migrate'").unwrap();
         let phase3 = script
             .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false\n")
             .unwrap();
@@ -1832,10 +1765,24 @@ mkdir -p \"/var/"
         assert!(stack.contains("primary-db:") && stack.contains("api:"));
         assert!(!stack.contains("migrate:"));
 
-        // The job still gets its generated environment file.
+        // The job still gets its generated environment file, through the plan.
         assert!(dir.path().join("prod").join("migrate").join(".env").exists());
-        assert!(script.contains("--env-file \"$DEPLOY_DIR/prod/migrate/.env\""));
-        assert!(script.contains("--mode replicated-job"));
+        let plan = Plan::read(&dir.path().join("prod").join("plan.json")).unwrap();
+        let job = plan.job("migrate").unwrap();
+        assert_eq!(job.service, "prod_migrate");
+        assert_eq!(job.timeout_seconds, JOB_TIMEOUT_SECONDS);
+        assert!(
+            job.args
+                .windows(2)
+                .any(|w| w == ["--env-file", "${DEPLOY_DIR}/prod/migrate/.env"]),
+            "{:?}",
+            job.args
+        );
+        assert!(
+            job.args.windows(2).any(|w| w == ["--network", DOCKER_NETWORK]),
+            "{:?}",
+            job.args
+        );
     }
 
     #[test]
@@ -1851,7 +1798,7 @@ mkdir -p \"/var/"
         let phase1 = script
             .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false")
             .unwrap();
-        let job = script.find("run_job 'prod_migrate'").unwrap();
+        let job = script.find("./simpled step run-job prod/plan.json 'migrate'").unwrap();
         assert!(phase1 < job);
         assert!(script.contains("All services were started in phase 1"));
         assert!(!dir.path().join("prod").join(DEPS_COMPOSE_FILE).exists());
@@ -1869,7 +1816,7 @@ mkdir -p \"/var/"
         let nothing_first = script
             .find("No job dependencies declared, nothing to start first.")
             .unwrap();
-        let job = script.find("run_job 'prod_migrate'").unwrap();
+        let job = script.find("./simpled step run-job prod/plan.json 'migrate'").unwrap();
         let stack = script
             .find("docker stack deploy -c prod/docker-compose.yaml prod --with-registry-auth --prune --detach=false")
             .unwrap();
@@ -1887,8 +1834,8 @@ mkdir -p \"/var/"
         ]);
         let (_dir, script) = generate_swarm_to_temp(&spec);
 
-        let migrate = script.find("run_job 'prod_migrate'").unwrap();
-        let seed = script.find("run_job 'prod_seed'").unwrap();
+        let migrate = script.find("./simpled step run-job prod/plan.json 'migrate'").unwrap();
+        let seed = script.find("./simpled step run-job prod/plan.json 'seed'").unwrap();
         assert!(migrate < seed, "a job that depends on another job runs after it");
     }
 
@@ -1902,6 +1849,7 @@ mkdir -p \"/var/"
         let docker_spec = DockerSpecificSpec {
             swarm_mode: false,
             multi_node: false,
+            target_platform: Default::default(),
         };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
@@ -1948,6 +1896,7 @@ mkdir -p \"/var/"
         let docker_spec = DockerSpecificSpec {
             swarm_mode: false,
             multi_node: false,
+            target_platform: Default::default(),
         };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
@@ -2006,9 +1955,18 @@ mkdir -p \"/var/"
         assert!(fetch.contains("printf '%s' \"$SIMPLED_SECRET_SHOP_TLS_KEY\" > 'prod/secrets/shop-tls_key'"));
         assert!(!dir.path().join("prod").join("secrets").join("shop-tls_key").exists());
         let sync = script
-            .find("SIMPLED_OBJECT_1=\"$(sync_object secret 'simpled.deployment=prod' 'prod_shop-tls_key' 'prod/secrets/shop-tls_key')\"")
-            .expect("the secret is synced");
+            .find("objects=\"$(./simpled step sync-objects prod/plan.json)\"")
+            .expect("the deployment's objects are synced");
         assert!(source < sync && sync < deploy, "{}", script);
+        let plan = Plan::read(&dir.path().join("prod").join("plan.json")).unwrap();
+        assert_eq!(plan.owner_label, "simpled.deployment=prod");
+        assert_eq!(plan.objects[0].base, "prod_shop-tls_key");
+        assert_eq!(plan.objects[0].file, "prod/secrets/shop-tls_key");
+        assert_eq!(plan.objects[0].var, "SIMPLED_OBJECT_1");
+        // A secret with an `aws` source is only fetched on the target, so
+        // nothing about its value goes into the plan.
+        let text = fs::read_to_string(dir.path().join("prod").join("plan.json")).unwrap();
+        assert!(!text.contains("prod/shop/tls"), "{}", text);
 
         // The stack file references the env secret through its variable, and the
         // file secret as an external Swarm secret.
@@ -2030,7 +1988,7 @@ mkdir -p \"/var/"
 
         // Pruned only at the end, after every stack deploy succeeded.
         let prune = script
-            .find("prune_objects secret 'simpled.deployment=prod' 'prod_shop-tls_key'")
+            .find("./simpled step prune-objects prod/plan.json")
             .expect("old generations are pruned");
         assert!(script.rfind("docker stack deploy").unwrap() < prune, "{}", script);
     }
@@ -2043,11 +2001,38 @@ mkdir -p \"/var/"
         )]);
         spec.current_deployment.secrets = vec![aws_secret("shop-db_password", "prod/shop/db", None)];
 
-        let (_dir, script) = generate_swarm_to_temp(&spec);
+        let (dir, _script) = generate_swarm_to_temp(&spec);
 
-        // A job is created outside the stack file, so the placeholder has to be
-        // left unquoted for the deploy script's own shell to expand it.
-        assert!(script.contains("-e \"DB_PASSWORD=${SIMPLED_SECRET_SHOP_DB_PASSWORD}\""));
+        // The job's plan carries the same template the stack file does, which
+        // `step run-job` expands from the variable fetch-secrets.sh exported.
+        let plan = Plan::read(&dir.path().join("prod").join("plan.json")).unwrap();
+        let args = &plan.job("migrate").unwrap().args;
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-e", "DB_PASSWORD=${SIMPLED_SECRET_SHOP_DB_PASSWORD}"]),
+            "{:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn a_literal_dollar_reaches_a_job_unchanged() {
+        let mut spec = spec(vec![with_secrets(
+            service("migrate", ServiceType::Job, &[]),
+            &[("shop-db_password", SecretMount::EnvVariable("DB_PASSWORD".to_string()))],
+        )]);
+        spec.current_deployment.secrets = vec![SecretResolvedSpec {
+            name: "shop-db_password".to_string(),
+            value: SecretResolvedValue::Literal("pa$word".to_string()),
+        }];
+        let (dir, _script) = generate_swarm_to_temp(&spec);
+
+        let plan = Plan::read(&dir.path().join("prod").join("plan.json")).unwrap();
+        let args = &plan.job("migrate").unwrap().args;
+        let value = args.iter().find(|a| a.starts_with("DB_PASSWORD=")).unwrap();
+        // Escaped for compose, and expanded back by the step the way compose does.
+        let expanded = crate::deploy_plan::interpolate(value, |_| None).unwrap();
+        assert_eq!(expanded, "DB_PASSWORD=pa$word");
     }
 
     #[test]
@@ -2069,6 +2054,7 @@ mkdir -p \"/var/"
         let docker_spec = DockerSpecificSpec {
             swarm_mode: false,
             multi_node: false,
+            target_platform: Default::default(),
         };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
@@ -2103,6 +2089,7 @@ mkdir -p \"/var/"
         let docker_spec = DockerSpecificSpec {
             swarm_mode: false,
             multi_node: false,
+            target_platform: Default::default(),
         };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
@@ -2130,6 +2117,7 @@ mkdir -p \"/var/"
         let docker_spec = DockerSpecificSpec {
             swarm_mode: false,
             multi_node: false,
+            target_platform: Default::default(),
         };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 

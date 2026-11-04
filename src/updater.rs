@@ -52,10 +52,12 @@ fn parse_version(tag: &str) -> Result<Version> {
 }
 
 fn fetch_latest_release() -> Result<Release> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    fetch_release(&format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO))
+}
 
+fn fetch_release(url: &str) -> Result<Release> {
     let mut builder = reqwest::blocking::Client::new()
-        .get(&url)
+        .get(url)
         .header("User-Agent", "simpled");
 
     if let Ok(token) = env::var("GITHUB_TOKEN") {
@@ -132,84 +134,14 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
     }
 
     let asset_name = platform_asset_name()?;
-    let asset = release.assets.iter().find(|a| a.name == asset_name).with_context(|| {
-        format!(
-            "No binary found for this platform in release {} (expected asset '{}')",
-            release.tag_name, asset_name
-        )
-    })?;
-    // Without the digest list nothing vouches for the download, so the update
-    // is refused rather than installed unverified.
-    let checksums_asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == CHECKSUMS_ASSET)
-        .with_context(|| {
-            format!(
-                "Release {} carries no {}, so the downloaded binary cannot be verified; refusing to install it",
-                release.tag_name, CHECKSUMS_ASSET
-            )
-        })?;
-
     let current_exe = resolve_current_exe()?;
     ensure_writable(&current_exe)?;
 
-    let checksums = String::from_utf8(download_asset(&checksums_asset.url)?)
-        .with_context(|| format!("{} is not valid UTF-8", CHECKSUMS_ASSET))?;
-    let expected = expected_sha256(&checksums, &asset_name).with_context(|| {
-        format!(
-            "{} of release {} has no entry for {}",
-            CHECKSUMS_ASSET, release.tag_name, asset_name
-        )
-    })?;
-
-    println!("Downloading {}...", asset_name);
-    let archive_bytes = download_asset(&asset.url)?;
-
-    let actual = sha256_hex(&archive_bytes);
-    if actual != expected {
-        bail!(
-            "Checksum mismatch for {}: expected {} but downloaded {}. The download is corrupt or has been tampered with; nothing was installed.",
-            asset_name,
-            expected,
-            actual
-        );
-    }
-    println!("Checksum verified.");
+    let binary_name = if cfg!(windows) { "simpled.exe" } else { "simpled" };
+    let binary = verified_binary(&release, &asset_name, binary_name)?;
 
     let tmp_path = current_exe.with_extension("update_tmp");
-
-    let gz = GzDecoder::new(Cursor::new(archive_bytes));
-    let mut archive = Archive::new(gz);
-
-    let binary_name = if cfg!(windows) { "simpled.exe" } else { "simpled" };
-    let mut found = false;
-    for entry in archive.entries().context("Failed to read archive entries")? {
-        let mut entry = entry.context("Failed to read archive entry")?;
-        let path = entry.path().context("Failed to read entry path")?;
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if file_name == binary_name {
-            let mut tmp_file = std::fs::File::create(&tmp_path).context("Failed to create temp file for update")?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tmp_file
-                    .set_permissions(std::fs::Permissions::from_mode(0o755))
-                    .context("Failed to set permissions on temp file")?;
-            }
-
-            std::io::copy(&mut entry, &mut tmp_file).context("Failed to extract binary from archive")?;
-            tmp_file.flush().context("Failed to flush update file")?;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        let _ = std::fs::remove_file(&tmp_path);
-        bail!("Binary '{}' not found inside archive", binary_name);
-    }
+    write_executable(&tmp_path, &binary).context("Failed to write the update")?;
 
     if let Err(e) = replace_exe(&current_exe, &tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -217,6 +149,88 @@ pub fn check_and_update(check_only: bool) -> Result<()> {
     }
 
     println!("Updated to {}. Restart simpled to use the new version.", latest);
+    Ok(())
+}
+
+/// The simpled binary inside one asset of `release`, downloaded and checked
+/// against the release's `sha256sums.txt`. Without that digest list nothing
+/// vouches for the download, so it is refused rather than used unverified.
+fn verified_binary(release: &Release, asset_name: &str, binary_name: &str) -> Result<Vec<u8>> {
+    let asset = release.assets.iter().find(|a| a.name == asset_name).with_context(|| {
+        format!(
+            "Release {} has no binary for this platform (expected asset '{}')",
+            release.tag_name, asset_name
+        )
+    })?;
+    let checksums_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == CHECKSUMS_ASSET)
+        .with_context(|| {
+            format!(
+                "Release {} carries no {}, so the downloaded binary cannot be verified; refusing to use it",
+                release.tag_name, CHECKSUMS_ASSET
+            )
+        })?;
+
+    let checksums = String::from_utf8(download_asset(&checksums_asset.url)?)
+        .with_context(|| format!("{} is not valid UTF-8", CHECKSUMS_ASSET))?;
+    let expected = expected_sha256(&checksums, asset_name).with_context(|| {
+        format!(
+            "{} of release {} has no entry for {}",
+            CHECKSUMS_ASSET, release.tag_name, asset_name
+        )
+    })?;
+
+    eprintln!("Downloading {} from release {}...", asset_name, release.tag_name);
+    let archive_bytes = download_asset(&asset.url)?;
+    let actual = sha256_hex(&archive_bytes);
+    if actual != expected {
+        bail!(
+            "Checksum mismatch for {}: expected {} but downloaded {}. The download is corrupt or has been tampered with; it was not used.",
+            asset_name,
+            expected,
+            actual
+        );
+    }
+    eprintln!("Checksum verified.");
+
+    let mut archive = Archive::new(GzDecoder::new(Cursor::new(archive_bytes)));
+    for entry in archive.entries().context("Failed to read archive entries")? {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to read entry path")?;
+        if path.file_name().and_then(|n| n.to_str()) == Some(binary_name) {
+            let mut binary = Vec::new();
+            std::io::copy(&mut entry, &mut binary).context("Failed to extract binary from archive")?;
+            return Ok(binary);
+        }
+    }
+    bail!("Binary '{}' not found inside {}", binary_name, asset_name)
+}
+
+/// The Linux binary of this exact simpled version for `arch` (`amd64`, `arm64`),
+/// from its GitHub release, verified. What `prepare-deployment` ships to a Swarm
+/// deploy target when it cannot copy itself.
+pub fn release_linux_binary(arch: &str) -> Result<Vec<u8>> {
+    let tag = format!("v{}", CURRENT_VERSION);
+    let release = fetch_release(&format!(
+        "https://api.github.com/repos/{}/releases/tags/{}",
+        GITHUB_REPO, tag
+    ))
+    .with_context(|| format!("Cannot look up release {} of {}", tag, GITHUB_REPO))?;
+    verified_binary(&release, &format!("simpled_linux_{}.tar.gz", arch), "simpled")
+}
+
+/// Writes `bytes` to `path`, executable on unix.
+pub fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    file.write_all(bytes)?;
+    file.flush()?;
     Ok(())
 }
 

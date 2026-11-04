@@ -6,8 +6,29 @@
 
 mod common;
 
-use common::{envspec, prepare, read};
+use common::{envspec, prepare, read, STAND_IN_BINARY};
 use std::fs;
+use std::path::Path;
+
+/// The `docker service create` arguments of a job, from the deployment's plan.
+fn job_args(out: &Path, job: &str) -> Vec<String> {
+    let plan: serde_json::Value = serde_json::from_str(&read(&out.join("prod").join("plan.json"))).unwrap();
+    plan["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["name"] == job)
+        .unwrap_or_else(|| panic!("no job {} in {}", job, plan))["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
+    args.windows(2).any(|w| w[0] == flag && w[1] == value)
+}
 
 #[test]
 fn kubernetes_manifests_cover_every_kind_of_service() {
@@ -93,7 +114,13 @@ fn swarm_stack_carries_replicas_and_keeps_jobs_out() {
     );
 
     let script = read(&out.join("deploy.sh"));
-    assert!(script.contains("run_job 'prod_migrate'"), "{}", script);
+    assert!(
+        script.contains("./simpled step run-job prod/plan.json 'migrate'"),
+        "{}",
+        script
+    );
+    // The binary that runs the steps ships with the deployment.
+    assert_eq!(read(&out.join("simpled")), STAND_IN_BINARY);
 }
 
 /// The fixture env spec with deployment-wide `defaults.resources` and an `api`
@@ -149,10 +176,13 @@ fn swarm_stack_and_jobs_are_limited_by_their_resources() {
     assert!(db["limits"]["cpus"].is_null(), "{}", stack);
     assert!(db["reservations"].is_null(), "{}", stack);
 
-    let script = read(&out.join("deploy.sh"));
-    assert!(script.contains("  --limit-memory '512m' \\\n"), "{}", script);
-    assert!(!script.contains("--limit-cpu"), "{}", script);
-    assert!(!script.contains("--reserve-"), "{}", script);
+    let args = job_args(&out, "migrate");
+    assert!(has_pair(&args, "--limit-memory", "512m"), "{:?}", args);
+    assert!(
+        !args.iter().any(|a| a == "--limit-cpu" || a.starts_with("--reserve-")),
+        "{:?}",
+        args
+    );
 }
 
 #[test]
@@ -566,13 +596,14 @@ fn swarm_services_take_their_update_policy_and_placement() {
     );
 
     // A job is placed like the services, and never updated.
-    let script = read(&out.join("deploy.sh"));
+    let args = job_args(&out, "migrate");
+    assert!(has_pair(&args, "--constraint", "node.role == worker"), "{:?}", args);
     assert!(
-        script.contains("  --constraint 'node.role == worker' \\\n  --placement-pref 'spread=node.labels.az' \\\n"),
-        "{}",
-        script
+        has_pair(&args, "--placement-pref", "spread=node.labels.az"),
+        "{:?}",
+        args
     );
-    assert!(!script.contains("--update-"), "{}", script);
+    assert!(!args.iter().any(|a| a.starts_with("--update-")), "{:?}", args);
 }
 
 #[test]
@@ -583,11 +614,11 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
     for key in ["update_config", "rollback_config", "placement"] {
         assert!(!stack.contains(key), "{}", stack);
     }
-    let script = read(&out.join("deploy.sh"));
+    let args = job_args(&out, "migrate");
     assert!(
-        !script.contains("--constraint") && !script.contains("--placement-pref"),
-        "{}",
-        script
+        !args.iter().any(|a| a == "--constraint" || a == "--placement-pref"),
+        "{:?}",
+        args
     );
     let ingress = read(&out.join("ingress").join("docker-compose.yaml"));
     assert!(!ingress.contains("deploy:"), "{}", ingress);
