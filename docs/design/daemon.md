@@ -430,10 +430,13 @@ there is one mechanism in the generator.
 5. **Limits enforced by validation:**
    - At most 500 KB per object. A larger config file fails with a clear message. It
      never falls back to a bind mount without saying so.
-   - Configs accept any absolute target path. Whether secrets accept a target outside
-     `/run/secrets/` depends on the Docker version and has to be checked in a spike.
-     If it is not supported, a secret mounted elsewhere is a validation error on
-     Swarm.
+   - Configs and secrets both accept any absolute target path, so a secret keeps the
+     path the app spec gives it (`/etc/app/key.pem`). Checked on Docker 29.7 with
+     `docker service create` and with `docker stack deploy` and `external: true`
+     objects: the file appears read-only on tmpfs at that path. A relative target
+     stays under `/run/secrets/`. (When testing from Git Bash on Windows, set
+     `MSYS_NO_PATHCONV=1`, or the shell rewrites `/etc/...` into a Windows path
+     before Docker sees it.)
    - Mode `0444`, so a service that does not run as root can still read its secret.
 6. Env-variable secrets (`variable:`) are unchanged. They live in the service spec,
    which already reaches every node.
@@ -646,8 +649,8 @@ nothing deletes it. The gateway stops routing to it. A later
    every environment now has a container with the Docker socket. The alternative is
    `gateway.daemon.enabled: false`, which brings back a static version answer with
    no health.
-2. **Secret target paths, to confirm in a spike:** whether Swarm secrets accept an
-   absolute target outside `/run/secrets/` on the Docker versions you run (§8.2).
+2. ~~**Secret target paths.**~~ Resolved: absolute targets work for secrets too
+   (§8.2).
 4. **Health of excluded or zero-replica services.** These probably do not count
    toward health, but some services are scaled to 0 on purpose.
 5. **Several deployments on one domain.** `/health` follows `/version`'s ownership
