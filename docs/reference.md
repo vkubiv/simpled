@@ -1632,7 +1632,12 @@ Swarm objects cannot be changed, so each one is named after its content:
    naming the same objects.
 4. The same content gives the same name, so a deploy that changes nothing creates
    nothing. New content is a new object, which changes the services that mount it,
-   and Swarm does a rolling update of exactly those.
+   and Swarm does a rolling update of exactly those. Nothing time-dependent is
+   written into a Swarm service, so a deploy restarts only the services whose image,
+   environment, configs or secrets changed. Two exceptions restart on every deploy:
+   the deployment's version service, whose answer includes the time of the deploy,
+   and the gateway. To restart a service without changing anything, use
+   `docker service update --force <stack>_<service>`.
 5. After every stack has deployed, `deploy.sh` removes older objects: of each base
    name it keeps the two newest, the current one and the previous one, which
    `docker service rollback` still needs. Docker refuses to remove an object a

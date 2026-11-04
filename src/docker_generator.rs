@@ -6,7 +6,7 @@ use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBind
 use crate::swarm_objects::{self, ObjectKind, SwarmObjects};
 use crate::version_endpoint;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -457,7 +457,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
             docker_service.configs = configs.clone();
         }
 
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "default".to_string(),
             ServiceNetwork {
@@ -504,7 +504,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     let prerequisites = deployment.job_prerequisites();
 
     let compose_network = || {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "default".to_string(),
             DockerComposeNetwork {
@@ -515,7 +515,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         networks
     };
 
-    let stack_services: HashMap<String, DockerService> = long_running
+    let stack_services: BTreeMap<String, DockerService> = long_running
         .iter()
         .filter_map(|s| prepared.get(&s.full_name).map(|d| (s.full_name.clone(), d.clone())))
         .collect();
@@ -539,7 +539,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     let deps_only = !jobs.is_empty() && !prerequisites.is_empty() && prerequisites.len() < long_running.len();
 
     if deps_only {
-        let dep_services: HashMap<String, DockerService> = prerequisites
+        let dep_services: BTreeMap<String, DockerService> = prerequisites
             .iter()
             .filter_map(|s| prepared.get(&s.full_name).map(|d| (s.full_name.clone(), d.clone())))
             .collect();

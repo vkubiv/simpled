@@ -1,7 +1,7 @@
 use crate::docker_compose::*;
 use crate::resolved_spec::*;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -93,7 +93,7 @@ where
 
     println!("Starting services for deployment: {}", spec.current_deployment.name);
 
-    let mut services_map = HashMap::new();
+    let mut services_map = BTreeMap::new();
 
     for service in spec.current_deployment.services.iter() {
         write_working_dir(service, spec)?;
@@ -114,7 +114,7 @@ where
         if !included.contains(&service.full_name) {
             continue;
         }
-        let mut depends_on = HashMap::new();
+        let mut depends_on = BTreeMap::new();
         for dep in service.dependencies() {
             if !included.contains(dep) {
                 continue;
@@ -150,7 +150,7 @@ where
             .map(|name| (name.clone(), DockerVolume::default()))
             .collect()
     } else {
-        HashMap::new()
+        BTreeMap::new()
     };
 
     let compose = DockerCompose {
@@ -158,7 +158,7 @@ where
         configs: Default::default(),
         name: Some(target.project.clone()),
         services: services_map,
-        networks: HashMap::new(),
+        networks: BTreeMap::new(),
         volumes,
     };
 
