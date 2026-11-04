@@ -409,14 +409,19 @@ Every config file, file secret and gateway file (`traefik.yml`, `dynamic_conf.ym
 certificates) becomes a native Swarm config or secret, whatever `multi_node` says, so
 there is one mechanism in the generator.
 
-1. **Names carry a hash of the content:** `prod_db_password_3f9a1c2e`, truncated to
-   fit Swarm's 64-character limit. The same value gives the same name, so nothing
+1. **Names carry a hash of the content:** `prod_db_password_3f9a1c2e4b5d`, the base
+   cut to fit Swarm's 64-character limit. The hash is taken on the deploy target,
+   from the file actually uploaded, not when the deployment is prepared: a secret
+   with an `aws` source only has a value there, and this treats every object the
+   same way. The name is exported in a variable that the stack files interpolate
+   (`name: ${SIMPLED_OBJECT_<n>}`). The same value gives the same name, so nothing
    happens. A new value gives a new name, so it is a new object. Nothing is ever
    modified, which is what makes Swarm's immutability painless.
-2. **`./simpled step sync-objects` creates them** (§8.5). It is idempotent: an object
+2. **`./simpled step sync-objects` creates them** (§8.5); until the steps exist, a
+   `sync_object` shell function in `deploy.sh` does. It is idempotent: an object
    that already exists under its hashed name is left alone. Each object is labelled
-   with its owner (`simpled.deployment=prod`, §8.6) and its spec name
-   (`simpled.secret=db_password`). The stack files reference them as
+   with its owner (`simpled.deployment=prod`, §8.6) and its base name
+   (`simpled.object=prod_shop-db_password`). The stack files reference them as
    `external: true`. They are created by this step and not by `docker stack deploy`, because jobs run through
    `docker service create` and need the objects to exist (`--secret source=…,target=…`),
    and `aws` secrets exist as files only after `fetch-secrets.sh` has run on the target.

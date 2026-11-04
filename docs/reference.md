@@ -1597,14 +1597,57 @@ Output directory: `docker-deploy/`
 
 | File | Description |
 |------|-------------|
-| `deploy.sh` | Deploy script: image prune, ingress, then the job phases, then the stack. Images no container uses are pruned *before* the rollout, so the release that is running at that point stays on the node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
+| `deploy.sh` | Deploy script: image prune, Swarm configs and secrets, ingress, then the job phases, then the stack, then pruning of old configs and secrets. Images no container uses are pruned *before* the rollout, so the release that is running at that point stays on the node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
-| `<deployment>/<service>/` | Per-service `.env`, config and secret files |
+| `<deployment>/<service>/` | Per-service `.env` file, read by `docker stack deploy` on the machine that runs it |
+| `<deployment>/configs/`, `<deployment>/secrets/` | The files the deployment's Swarm configs and secrets are created from. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm) |
 | `<deployment>/volumes/<name>/` | Only for unbound volumes, which `multi_node: false` allows |
-| `ingress/` | Traefik ingress stack |
+| `ingress/` | Traefik ingress stack. Its `traefik/` files are uploaded as Swarm configs too |
 
 The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
+
+### Configs and secrets on Docker Swarm
+
+On Swarm, every config file, every secret mounted as a file and the gateway's own
+files (`traefik.yml`, `dynamic_conf.yml`) are native Swarm configs and secrets, not
+bind mounts of the deploy directory. Swarm keeps them in its Raft store, so every
+node can run a task that mounts them, not only the node that ran `deploy.sh`.
+Secrets mounted as environment variables are unchanged.
+
+Swarm objects cannot be changed, so each one is named after its content:
+
+1. `prepare-deployment` writes the files to upload: `<deployment>/configs/<config>/<file>`
+   and `<deployment>/secrets/<secret>`. A secret with an `aws` source is written there
+   by `fetch-secrets.sh` on the target.
+2. Before deploying anything, `deploy.sh` hashes each file and creates the object
+   `<base>_<first 12 hex digits of its sha256>` unless it exists already, for example
+   `prod_shop-data_settings.json_3f9a1c2e4b5d`. The base is `<deployment>_<config>_<file>`
+   or `<deployment>_<secret>`, and `gateway_<file>` for the gateway. The name is
+   exported in a variable (`SIMPLED_OBJECT_<n>`, `SIMPLED_GATEWAY_OBJECT_<n>`).
+3. The stack files declare each object `external: true` with `name: ${SIMPLED_OBJECT_<n>}`,
+   which `docker stack deploy` interpolates, and services mount it at the path the app
+   spec gives, with mode `0444`. A config mounted as a directory becomes one object per
+   file, mounted at `<mount path>/<file>`. A job gets `--config` and `--secret` flags
+   naming the same objects.
+4. The same content gives the same name, so a deploy that changes nothing creates
+   nothing. New content is a new object, which changes the services that mount it,
+   and Swarm does a rolling update of exactly those.
+5. After every stack has deployed, `deploy.sh` removes older objects: of each base
+   name it keeps the two newest, the current one and the previous one, which
+   `docker service rollback` still needs. Docker refuses to remove an object a
+   service still uses, so that one stays too. Pruning only touches objects labelled
+   with the deployment being deployed (`simpled.deployment=<name>`), or, for the
+   gateway's files, `simpled.scope=environment`.
+
+A config file or secret larger than 500 KB, Swarm's limit for one object, fails
+`prepare-deployment`. The deploy target needs `sha256sum`, which every common Linux
+distribution has.
+
+Still a bind mount of the deploy directory: Traefik's Let's Encrypt store
+(`letsencrypt/`), on whichever node the gateway runs.
+
+---
 
 ### Volumes on Docker Swarm
 

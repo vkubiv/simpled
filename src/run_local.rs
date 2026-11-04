@@ -154,6 +154,8 @@ where
     };
 
     let compose = DockerCompose {
+        secrets: Default::default(),
+        configs: Default::default(),
         name: Some(target.project.clone()),
         services: services_map,
         networks: HashMap::new(),

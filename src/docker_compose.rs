@@ -25,6 +25,12 @@ pub struct DockerCompose {
     // bind directory under `volumes/`.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub volumes: HashMap<String, DockerVolume>,
+    // Swarm only: the content-addressed objects the services mount, created by
+    // the deploy script (`swarm_objects`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secrets: std::collections::BTreeMap<String, crate::swarm_objects::ExternalObject>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub configs: std::collections::BTreeMap<String, crate::swarm_objects::ExternalObject>,
 }
 
 #[derive(Serialize, Default, Clone, Debug, PartialEq)]
@@ -127,6 +133,11 @@ pub struct DockerService {
     pub expose: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
+    // Swarm only: where the service mounts its configs and file secrets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<crate::swarm_objects::ObjectMount>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub configs: Vec<crate::swarm_objects::ObjectMount>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -318,8 +329,12 @@ pub fn prepare_service_with(
         }
     }
 
+    // On Swarm, configs and file secrets are Swarm objects the stack generator
+    // attaches (`swarm_objects`), not bind mounts of files next to the stack.
+    let objects_on_swarm = matches!(&spec.env_type, spec::DeploymentEnvType::Docker(d) if d.swarm_mode);
+
     // Configs
-    for config_option in &service.configs {
+    for config_option in service.configs.iter().filter(|_| !objects_on_swarm) {
         if let Some(config_spec) = spec
             .current_deployment
             .configs
@@ -401,6 +416,7 @@ pub fn prepare_service_with(
                     environment.insert(var_name.clone(), value);
                 }
 
+                SecretMount::FilePath(_) if objects_on_swarm => {}
                 SecretMount::FilePath(mount_path) => {
                     let rel_path = mount_path.trim_start_matches('/');
                     let host_path = svc_dir.join(rel_path);
@@ -494,6 +510,8 @@ pub fn prepare_service_with(
         ports,
         expose: service.expose.clone(),
         volumes,
+        secrets: vec![],
+        configs: vec![],
         env_file: vec![format!("./{}/.env", service.full_name)],
         environment,
         networks: HashMap::new(),
@@ -729,7 +747,7 @@ mod tests {
                 config("shop-settings", &[("settings.json", "{}")]),
                 config("shop-data", &[("a.json", "1"), ("b.json", "2")]),
             ];
-            let spec = resolved_env(swarm(), deployment);
+            let spec = resolved_env(DeploymentEnvType::Local, deployment);
 
             let out = tempfile::tempdir().unwrap();
             let service = prepare_service(&api, &spec, out.path()).unwrap();
@@ -816,7 +834,7 @@ mod tests {
                 deferred("shop-tls_key"),
                 literal("shop-tls_cert", "pem"),
             ];
-            let spec = resolved_env(swarm(), deployment);
+            let spec = resolved_env(DeploymentEnvType::Local, deployment);
 
             let out = tempfile::tempdir().unwrap();
             let service = prepare_service(&api, &spec, out.path()).unwrap();
@@ -835,6 +853,33 @@ mod tests {
                 fs::read_to_string(out.path().join("api/run/secrets/tls.crt")).unwrap(),
                 "pem"
             );
+        }
+
+        #[test]
+        fn on_swarm_configs_and_file_secrets_are_not_bind_mounted() {
+            let mut api = resolved_service("api", ServiceType::Public, &[]);
+            api.configs = vec![ServiceConfigOption {
+                config_name: "shop-data".to_string(),
+                mount_path: "/data".to_string(),
+            }];
+            api.secrets = vec![ServiceSecret {
+                name: "shop-tls_key".to_string(),
+                mount: SecretMount::FilePath("/run/secrets/tls.key".to_string()),
+            }];
+            let mut deployment = resolved_deployment(vec![]);
+            deployment.configs = vec![config("shop-data", &[("a.json", "1")])];
+            deployment.secrets = vec![SecretResolvedSpec {
+                name: "shop-tls_key".to_string(),
+                value: SecretResolvedValue::Literal("pem".to_string()),
+            }];
+            let spec = resolved_env(swarm(), deployment);
+
+            let out = tempfile::tempdir().unwrap();
+            let service = prepare_service(&api, &spec, out.path()).unwrap();
+            // The stack generator attaches them as Swarm objects instead.
+            assert!(service.volumes.is_empty(), "{:?}", service.volumes);
+            assert!(!out.path().join("api/data").exists());
+            assert!(!out.path().join("api/run").exists());
         }
 
         #[test]

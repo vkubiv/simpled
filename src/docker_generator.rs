@@ -3,6 +3,7 @@ use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
 use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBinding};
+use crate::swarm_objects::{self, ObjectKind, SwarmObjects};
 use crate::version_endpoint;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -437,8 +438,24 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         fetch_script.fetch(secret, reference);
     }
 
+    // Configs and file secrets become Swarm objects. The files they are created
+    // from are written here, or, for a deferred secret, by the fetch script.
+    let deployment_objects = swarm_objects::collect(deployment)?;
+    for (path, content) in &deployment_objects.files {
+        let path = output_dir.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, content)?;
+    }
+    let mut fetched_files: Vec<&str> = Vec::new();
+
     for service in &deployment.services {
         let mut docker_service = prepare_service(service, resolved_spec, &app_dir)?;
+        if let Some((secrets, configs)) = deployment_objects.mounts.get(&service.full_name) {
+            docker_service.secrets = secrets.clone();
+            docker_service.configs = configs.clone();
+        }
 
         let mut networks = HashMap::new();
         networks.insert(
@@ -453,14 +470,12 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
             pin_to_deploy_node(&mut docker_service);
         }
 
-        // File-mounted deferred secrets: the bind mount is in the stack file, but
-        // the file it points at is only created once the script has run. The path
-        // mirrors what `prepare_service` uses, relative to the deploy directory
-        // rather than to the stack file.
+        // File-mounted deferred secrets: the fetch script writes the value to the
+        // file its Swarm object is created from, before the objects are synced.
         for secret_option in &service.secrets {
-            let SecretMount::FilePath(mount_path) = &secret_option.mount else {
+            if !matches!(secret_option.mount, SecretMount::FilePath(_)) {
                 continue;
-            };
+            }
             let Some(secret) = deployment
                 .secrets
                 .iter()
@@ -468,11 +483,10 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
             else {
                 continue;
             };
-            let rel_path = mount_path.trim_start_matches('/');
-            fetch_script.write_to_file(
-                secret,
-                &format!("{}/{}/{}", deployment.name, service.full_name, rel_path),
-            );
+            if !fetched_files.contains(&secret.name.as_str()) {
+                fetched_files.push(&secret.name);
+                fetch_script.write_to_file(secret, &swarm_objects::secret_file(&deployment.name, &secret.name));
+            }
         }
 
         prepared.insert(service.full_name.clone(), docker_service);
@@ -511,6 +525,8 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         services: stack_services,
         networks: compose_network(),
         volumes: crate::docker_compose::stack_volumes(resolved_spec),
+        secrets: deployment_objects.objects.externals(ObjectKind::Secret),
+        configs: deployment_objects.objects.externals(ObjectKind::Config),
     };
 
     let compose_path = &app_dir.join("docker-compose.yaml");
@@ -533,6 +549,8 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
             services: dep_services,
             networks: compose_network(),
             volumes: crate::docker_compose::stack_volumes(resolved_spec),
+            secrets: deployment_objects.objects.externals(ObjectKind::Secret),
+            configs: deployment_objects.objects.externals(ObjectKind::Config),
         };
 
         let deps_path = app_dir.join(DEPS_COMPOSE_FILE);
@@ -543,7 +561,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     let ingress_dir = output_dir.join("ingress");
     fs::create_dir_all(&ingress_dir)?;
 
-    generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone())?;
+    let gateway_objects = generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone())?;
 
     // 5. Deploy Script
     let mut deploy_sh = create_executable(&output_dir.join("deploy.sh"))?;
@@ -650,6 +668,21 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         }
     }
 
+    // Every Swarm object the stacks and jobs mount exists before anything is
+    // deployed. Their names are exported for the stack files to interpolate.
+    writeln!(deploy_sh)?;
+    write!(deploy_sh, "{}", swarm_objects::SHELL_FUNCTIONS)?;
+    writeln!(deploy_sh)?;
+    writeln!(deploy_sh, "echo 'Syncing configs and secrets...'")?;
+    for line in gateway_objects
+        .sync_lines()
+        .into_iter()
+        .chain(deployment_objects.objects.sync_lines())
+    {
+        writeln!(deploy_sh, "{}", line)?;
+    }
+    writeln!(deploy_sh)?;
+
     // --prune removes services that still carry the stack label but are no
     // longer in the file, e.g. after the ingress type was switched.
     writeln!(
@@ -739,6 +772,20 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
                 "echo 'All services were started in phase 1, nothing left to deploy.'"
             )?;
         }
+    }
+
+    // Only reached when everything above succeeded (`set -e`).
+    writeln!(deploy_sh)?;
+    writeln!(
+        deploy_sh,
+        "echo 'Removing configs and secrets older than the previous deploy...'"
+    )?;
+    for line in gateway_objects
+        .prune_lines()
+        .into_iter()
+        .chain(deployment_objects.objects.prune_lines())
+    {
+        writeln!(deploy_sh, "{}", line)?;
     }
 
     Ok(())
@@ -842,6 +889,17 @@ fn write_job_invocation(
                 deploy_sh,
                 "  --placement-pref {} \\",
                 sh_quote(&format!("spread={}", preference.spread))
+            )?;
+        }
+    }
+
+    // Double-quoted: the object's name is in a variable the script exported.
+    for (flag, mounts) in [("--secret", &service.secrets), ("--config", &service.configs)] {
+        for object in mounts {
+            writeln!(
+                deploy_sh,
+                "  {} \"source=${{{}}},target={},mode={:o}\" \\",
+                flag, object.var, object.target, object.mode
             )?;
         }
     }
@@ -977,11 +1035,12 @@ fn generate_traefik_standalone(
     Ok(())
 }
 
+/// Returns the gateway's Swarm objects, which the deploy script syncs.
 fn generate_traefik_swarm(
     resolved_spec: &EnvironmentResolvedSpec,
     ingress_dir: &Path,
     network_name: String,
-) -> Result<()> {
+) -> Result<SwarmObjects> {
     let traefik_dir = ingress_dir.join("traefik");
     fs::create_dir_all(&traefik_dir)?;
 
@@ -1008,23 +1067,44 @@ fn generate_traefik_swarm(
     writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
     write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress, single_node(resolved_spec))?;
     write_swarm_host_ports(&mut stack, has_tls)?;
-    writeln!(stack, "    volumes:")?;
-    writeln!(stack, "      - ./traefik/traefik.yml:/etc/traefik/traefik.yml")?;
-    writeln!(
-        stack,
-        "      - ./traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml"
-    )?;
+
+    // The gateway's own files are Swarm configs, owned by the environment rather
+    // than by a deployment, so every node running a gateway task has them.
+    let mut objects = SwarmObjects::new("simpled.scope=environment".to_string());
+    writeln!(stack, "    configs:")?;
+    for (file, target) in [
+        ("traefik.yml", "/etc/traefik/traefik.yml"),
+        ("dynamic_conf.yml", "/etc/traefik/dynamic_conf.yml"),
+    ] {
+        let object = objects.add(
+            ObjectKind::Config,
+            &format!("gateway_{}", file),
+            &format!("ingress/traefik/{}", file),
+            "SIMPLED_GATEWAY_OBJECT_",
+        );
+        writeln!(stack, "      - source: {}", object.base)?;
+        writeln!(stack, "        target: {}", target)?;
+        writeln!(stack, "        mode: 0444")?;
+    }
 
     // Traefik's ACME store, kept next to the deployment so a redeploy keeps it.
+    // Still a directory on one node; the daemon's certificates replace it.
     if letsencrypt.is_some() {
+        writeln!(stack, "    volumes:")?;
         writeln!(stack, "      - ../letsencrypt:/letsencrypt")?;
-        // Make sure dir exists
         fs::create_dir_all(ingress_dir.parent().unwrap().join("letsencrypt"))?;
     }
 
     write_swarm_compose_network(&mut stack, &network_name)?;
 
-    Ok(())
+    writeln!(stack, "configs:")?;
+    for (key, external) in objects.externals(ObjectKind::Config) {
+        writeln!(stack, "  {}:", key)?;
+        writeln!(stack, "    external: true")?;
+        writeln!(stack, "    name: \"{}\"", external.name)?;
+    }
+
+    Ok(objects)
 }
 
 fn write_traefik_static_config(
@@ -1921,14 +2001,38 @@ mkdir -p \"/var/"
         assert!(fetch.contains("export SIMPLED_SECRET_SHOP_DB_PASSWORD"));
         // Only the secret that asked for a filter pulls jq into the requirements.
         assert!(fetch.contains("command -v jq"));
-        assert!(fetch.contains("printf '%s' \"$SIMPLED_SECRET_SHOP_TLS_KEY\" > 'prod/api/run/secrets/tls.key'"));
+        // The file a file secret's Swarm object is created from is written by the
+        // fetch script, and only then synced.
+        assert!(fetch.contains("printf '%s' \"$SIMPLED_SECRET_SHOP_TLS_KEY\" > 'prod/secrets/shop-tls_key'"));
+        assert!(!dir.path().join("prod").join("secrets").join("shop-tls_key").exists());
+        let sync = script
+            .find("SIMPLED_OBJECT_1=\"$(sync_object secret 'simpled.deployment=prod' 'prod_shop-tls_key' 'prod/secrets/shop-tls_key')\"")
+            .expect("the secret is synced");
+        assert!(source < sync && sync < deploy, "{}", script);
 
-        // The stack file references the secret instead of carrying its value, and
-        // the file behind the bind mount is left for the fetch script to create.
+        // The stack file references the env secret through its variable, and the
+        // file secret as an external Swarm secret.
         let stack = fs::read_to_string(dir.path().join("prod").join("docker-compose.yaml")).unwrap();
         assert!(stack.contains("DB_PASSWORD: ${SIMPLED_SECRET_SHOP_DB_PASSWORD}"));
-        assert!(stack.contains("./api/run/secrets/tls.key:/run/secrets/tls.key"));
-        assert!(!dir.path().join("prod").join("api").join("run/secrets/tls.key").exists());
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
+        let mount = &parsed["services"]["api"]["secrets"][0];
+        assert_eq!(mount["source"].as_str(), Some("prod_shop-tls_key"), "{}", stack);
+        assert_eq!(mount["target"].as_str(), Some("/run/secrets/tls.key"), "{}", stack);
+        assert_eq!(mount["mode"].as_u64(), Some(0o444), "{}", stack);
+        assert_eq!(parsed["secrets"]["prod_shop-tls_key"]["external"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["secrets"]["prod_shop-tls_key"]["name"].as_str(),
+            Some("${SIMPLED_OBJECT_1}"),
+            "{}",
+            stack
+        );
+        assert!(parsed["services"]["api"]["volumes"].is_null(), "{}", stack);
+
+        // Pruned only at the end, after every stack deploy succeeded.
+        let prune = script
+            .find("prune_objects secret 'simpled.deployment=prod' 'prod_shop-tls_key'")
+            .expect("old generations are pruned");
+        assert!(script.rfind("docker stack deploy").unwrap() < prune, "{}", script);
     }
 
     #[test]
