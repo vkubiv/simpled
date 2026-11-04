@@ -230,7 +230,10 @@ deployments:
         let docker = super::service(
             "prod",
             &doc,
-            &DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode: true }),
+            &DeploymentEnvType::Docker(DockerSpecificSpec {
+                swarm_mode: true,
+                multi_node: true,
+            }),
         );
         assert!(docker.ports.is_empty(), "a host port would clash with the gateway");
         assert_eq!(docker.expose, vec!["80".to_string()]);

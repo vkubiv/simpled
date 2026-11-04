@@ -258,11 +258,15 @@ volumes:
 
 Host paths (`./relative` or `/absolute`) do not need to be declared.
 
-On Docker Swarm, a bind source that does not exist makes Swarm reject the task,
-so the generated `deploy.sh` creates every host path a deployment mounts before
-the stack starts: relative paths under the deployment directory, absolute paths
-only when nothing is there yet. An existing path of any kind — a directory, a
-file, a socket such as `/var/run/docker.sock` — is left as it is.
+On Docker Swarm, the env spec says where each named volume lives, and relative
+paths are rejected unless `multi_node: false`; see
+[Volumes on Docker Swarm](#volumes-on-docker-swarm).
+
+A bind source that does not exist makes Swarm reject the task, so the generated
+`deploy.sh` creates every host path a deployment mounts on the node it runs on, before
+the stack starts: relative paths under the deployment directory, absolute paths only
+when nothing is there yet. An existing path of any kind — a directory, a file, a
+socket such as `/var/run/docker.sock` — is left as it is.
 
 ---
 
@@ -280,6 +284,7 @@ Use `envspec.yaml` for Kubernetes and Docker environments. Use `localenv.yaml` f
 |-------|------|----------|-------------|
 | `type` | string | no | `k8s`, `docker`, or `local`. Required in `envspec.yaml`; defaults to `local` in `localenv.yaml`. |
 | `swarm_mode` | bool | no | Enable Docker Swarm mode. Only valid when `type: docker`. |
+| `multi_node` | bool | no | Swarm only, default `true`: validate as if the swarm had several nodes. `false` keeps the environment on one node. See [multi_node](#multi_node). |
 | `registry` | map | no | Image registry prefix mappings. In `localenv.yaml`, used only when running a [released bundle](#running-a-released-bundle-locally). |
 | `gateway` | object | yes | Gateway (load balancer) configuration. The deprecated alias `ingress` is still accepted with a warning. |
 | `deployments` | map | yes | Named deployment configurations. |
@@ -824,6 +829,7 @@ deployments:
 | `defaults` | object | no | Default `replicas`, `resources`, and on Swarm `update` and `placement`, applied to every service that does not set its own. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
 | `exclude_services` | list | no | Services this deployment does not start. Only valid for `local`. See [exclude_services](#exclude_services). |
+| `volumes` | map | no | Swarm only: where each named volume lives (`node`, `path`, `nfs`). Required on Swarm for every mounted volume unless `multi_node: false`. Under `extends`, a child rebinds single volumes. See [Volumes on Docker Swarm](#volumes-on-docker-swarm). |
 
 ¹ Required unless supplied by an `extends` base, or omitted on an `abstract` template.
 
@@ -1595,9 +1601,91 @@ Output directory: `docker-deploy/`
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
 | `<deployment>/<service>/` | Per-service `.env`, config and secret files |
+| `<deployment>/volumes/<name>/` | Only for unbound volumes, which `multi_node: false` allows |
 | `ingress/` | Traefik ingress stack |
 
 The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
+
+### Volumes on Docker Swarm
+
+An app spec only names its volumes. On Swarm the env spec says where each one lives,
+per deployment:
+
+```yaml
+type: docker
+swarm_mode: true
+multi_node: true          # the default
+
+deployments:
+  prod:
+    volumes:
+      pg-data:
+        node: db-1                      # a Docker volume on node db-1
+      uploads:
+        nfs: fs-1.efs.example.com:/shop/uploads
+      media:
+        path: /mnt/shared/shop/media    # a host path that exists on every node
+      legacy:
+        node: app-1
+        path: /srv/shop/legacy          # a host directory on node app-1
+```
+
+| Binding | Generated | Where its services run |
+|---------|-----------|------------------------|
+| `node` | A Docker volume (local driver), declared in the stack file. Swarm creates it as `<deployment>_<volume>` on the node where a task first needs it. | Pinned: `node.hostname == <node>` is added to the service's placement. |
+| `node` + `path` | A bind mount of that directory. It must already exist on that node: `deploy.sh` runs elsewhere and cannot create it. | Pinned to that node. |
+| `path` | A bind mount of a path that exists on every node, such as a shared mount. `deploy.sh` creates it when it is missing. | Anywhere. |
+| `nfs` | A Docker volume with the local driver's NFS options. Each node mounts the export itself when a task needs it, so the nodes need no `/etc/fstab` entry. | Anywhere. |
+
+`nfs` takes `server:/export/path`, or the long form when mount options are needed:
+
+```yaml
+uploads:
+  nfs:
+    address: fs-1.efs.example.com
+    path: /shop/uploads
+    options: nfsvers=4.1      # appended to addr=<address>
+```
+
+A service follows its volumes, so a service without volumes runs on any node. A job
+that mounts a volume gets the same placement and mounts the same Docker volume
+(`docker service create --mount type=volume,source=<deployment>_<volume>,...`).
+
+Validation:
+
+| Case | Result |
+|------|--------|
+| A mounted volume with no binding | Error, listing the volumes in a block ready to paste. Only with `multi_node: true`. |
+| A relative bind path (`./data:/data`), in the app spec or in a deployment's service `volumes` | Error: use a config for files the service only reads, or a bound volume for data it writes. Only with `multi_node: true`. Absolute host paths such as `/var/run/docker.sock` stay allowed. |
+| A binding for a volume the app does not declare | Error. |
+| One service mounting volumes pinned to two different nodes | Error: no node can run it. |
+| A pinned volume on a service with `update.order: start-first` | Error: for a moment two tasks would write the same directory. |
+| More than one replica on a pinned volume | Warning: every replica runs on that node and shares the directory. |
+| A postgres, mysql, mariadb or mongo image on `nfs` or `path` | Warning: databases on NFS are prone to corruption. |
+| A binding on `k8s`, `local` or standalone Docker | Error. |
+
+#### multi_node
+
+| Value | Meaning |
+|-------|---------|
+| `true` (default) | The environment is validated as if the swarm had several nodes, even when it has one, so a spec that passes keeps working when nodes are added. Every mounted volume needs a binding, and relative bind paths are rejected. |
+| `false` | The environment lives on one node. Unbound volumes are directories under `<deployment>/volumes/` and relative bind paths are allowed, as in simpled 1.x. |
+
+With `multi_node: false`, `deploy.sh` first counts the nodes that accept tasks
+(`Ready` and `Active` in `docker node ls`) and stops before deploying anything
+unless there is exactly one. The message names the nodes. Drained or down nodes do
+not count, so a new node can join drained and be activated once the spec says
+`multi_node: true`. Every service, job and the gateway then carries the
+constraint `node.id == ${SIMPLED_NODE_ID}`, the ID of that one node, which
+`deploy.sh` exports and `docker stack deploy` interpolates. This keeps Swarm from
+rescheduling a task onto a node added between two deploys. The node is not
+necessarily the one running `deploy.sh`: with a drained manager and one active
+worker, everything runs on the worker.
+
+`multi_node` is only valid with `swarm_mode: true`, and `multi_node: false` cannot be
+combined with `gateway.global: true`.
+
+---
 
 ### Local (`type: local`)
 

@@ -240,6 +240,9 @@ pub struct DeploymentResolvedSpec {
     pub secrets: Vec<SecretResolvedSpec>,
     pub services: Vec<ServiceResolvedSpec>,
     pub volumes: Vec<String>,
+    /// Swarm only: where each bound volume lives. A volume missing here is the
+    /// 1.x bind directory under `<deployment>/volumes/`.
+    pub volume_bindings: std::collections::BTreeMap<String, crate::spec::VolumeBinding>,
     /// The deployment's variables as a process on this machine sees them:
     /// `environment` with `undockerized_environment` applied on top and
     /// `$secret(...)` references expanded. This is what a test suite forwards from.

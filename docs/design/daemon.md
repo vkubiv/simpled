@@ -390,12 +390,15 @@ multi_node: true        # the default
      reference --section volumes), or drain the extra nodes
      (docker node update --availability drain worker-1).
      ```
-  2. **Every service, job and the gateway is pinned to the node that runs
-     `deploy.sh`.** `deploy.sh` reads its own node ID with
-     `docker info --format '{{.Swarm.NodeID}}'` and passes it into the stacks as a
-     `node.id == …` constraint. The check alone runs only at deploy time, while Swarm
-     can reschedule a task onto a newly added node at any moment in between, after a
-     crash or a reboot. With one node the pin costs nothing.
+  2. **Every service, job and the gateway is pinned to that one schedulable node.**
+     `deploy.sh` takes its ID from the same `docker node ls` output and exports it
+     for a `node.id == ${SIMPLED_NODE_ID}` constraint, which `docker stack deploy`
+     interpolates. That node is not necessarily the one running `deploy.sh`: with a
+     drained manager and one active worker, everything runs on the worker. The check
+     alone runs only at deploy time, while Swarm can reschedule a task onto a newly
+     added node at any moment in between, after a crash or a reboot. With one node
+     the pin costs nothing. With no schedulable node at all, `deploy.sh` stops and
+     says so.
 - `multi_node` is Swarm only, and is rejected anywhere else, like `gateway.global`.
 - `multi_node: false` together with `gateway.global: true` is an error: a gateway on
   every node, but everything pinned to one node.
@@ -486,8 +489,9 @@ volumes runs anywhere. Validation, with `multi_node: true`:
 7. A binding for a volume the app spec does not declare is an error, as with any
    unknown name.
 
-`path` and `nfs` also work on standalone Docker. `node` is Swarm only. Local runs and
-Kubernetes are unchanged.
+Bindings are Swarm only for now. Standalone Docker could take `path` and `nfs`, but
+its `docker run` commands mount no named volumes at all today, which has to be fixed
+first. Local runs and Kubernetes are unchanged.
 
 **Migrating from 1.x:** data lives in `<deploy dir>/<deployment>/volumes/<name>` on the
 node that ran `deploy.sh`. Binding the volume with `node` plus a `path` pointing at

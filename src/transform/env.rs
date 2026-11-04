@@ -16,6 +16,7 @@ pub fn convert_env_spec(
         .env_type
         .ok_or_else(|| anyhow!("'type' field is required in env spec"))?;
     let swarm_mode_opt = yaml.swarm_mode;
+    let multi_node_opt = yaml.multi_node;
     let gateway_yaml = match (yaml.gateway, yaml.ingress) {
         (Some(g), _) => g,
         (None, Some(i)) => {
@@ -93,6 +94,11 @@ pub fn convert_env_spec(
             if swarm_mode_opt.is_some() {
                 return Err(anyhow!("swarm_mode cannot be set for K8S environment"));
             }
+            if multi_node_opt.is_some() {
+                return Err(anyhow!(
+                    "multi_node cannot be set for K8S environment: it only applies to Docker Swarm"
+                ));
+            }
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for K8S environment"));
             }
@@ -152,12 +158,29 @@ pub fn convert_env_spec(
             }
             if !swarm_mode {
                 reject_swarm_only("standalone Docker")?;
+                if multi_node_opt.is_some() {
+                    return Err(anyhow!(
+                        "multi_node cannot be set for standalone Docker environment: it only applies to Docker Swarm (swarm_mode: true)"
+                    ));
+                }
             }
-            DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode })
+            let multi_node = swarm_mode && multi_node_opt.unwrap_or(true);
+            if swarm_mode && !multi_node && ingress.global {
+                return Err(anyhow!(
+                    "gateway global cannot be combined with multi_node: false: a gateway task on every node, \
+                     while multi_node: false keeps everything on the node that runs deploy.sh"
+                ));
+            }
+            DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode, multi_node })
         }
         DeploymentEnvTypeYaml::Local => {
             if swarm_mode_opt.is_some() {
                 return Err(anyhow!("swarm_mode cannot be set for Local environment"));
+            }
+            if multi_node_opt.is_some() {
+                return Err(anyhow!(
+                    "multi_node cannot be set for Local environment: it only applies to Docker Swarm"
+                ));
             }
             if ingress_type_str.is_some() {
                 return Err(anyhow!("ingress_type cannot be set for Local environment"));
@@ -351,6 +374,8 @@ fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> De
         // Replaced, not unioned: a full list reads as "what this deployment leaves
         // out", and a child can bring a service back that its base excluded.
         exclude_services: child.exclude_services.clone().or_else(|| base.exclude_services.clone()),
+        // Keyed by volume name: a child rebinds one volume and keeps the rest.
+        volumes: merge_opt_map(base.volumes.as_ref(), child.volumes.as_ref(), |_, c| c.clone()),
     }
 }
 
@@ -844,6 +869,12 @@ fn swarm_only_setting(ingress: &IngressSpec, deployments: &[DeploymentSpec]) -> 
     let mut deployments: Vec<&DeploymentSpec> = deployments.iter().collect();
     deployments.sort_by(|a, b| a.name.cmp(&b.name));
     for deployment in deployments {
+        if let Some(volume) = deployment.volumes.keys().next() {
+            return Some(format!(
+                "volume binding '{}' in deployment '{}'",
+                volume, deployment.name
+            ));
+        }
         if let Some(f) = field(&deployment.defaults) {
             return Some(format!("{} in deployment '{}' defaults", f, deployment.name));
         }
@@ -1181,6 +1212,12 @@ fn convert_deployment(
         ));
     }
 
+    let mut volumes = std::collections::BTreeMap::new();
+    for (volume, binding) in yaml.volumes.iter().flatten() {
+        let owner = format!("Volume '{}' in deployment '{}'", volume, name);
+        volumes.insert(volume.clone(), convert_volume_binding(binding, &owner)?);
+    }
+
     Ok(DeploymentSpec {
         primary_host,
         name,
@@ -1192,6 +1229,68 @@ fn convert_deployment(
         defaults,
         services,
         exclude_services,
+        volumes,
+    })
+}
+
+/// One volume's binding: exactly one of `node`, `path` (alone or with `node`)
+/// and `nfs`.
+fn convert_volume_binding(yaml: &VolumeBindingYaml, owner: &str) -> Result<VolumeBinding> {
+    let non_empty = |field: &str, value: &Option<String>| -> Result<Option<String>> {
+        match value.as_deref().map(str::trim) {
+            Some("") => bail!("{}: {} must not be empty", owner, field),
+            other => Ok(other.map(str::to_string)),
+        }
+    };
+    let node = non_empty("node", &yaml.node)?;
+    let path = non_empty("path", &yaml.path)?;
+    if let Some(path) = &path {
+        if !path.starts_with('/') {
+            bail!(
+                "{}: path '{}' must be absolute: a relative path would be resolved on whichever node ran deploy.sh",
+                owner,
+                path
+            );
+        }
+    }
+
+    match (node, path, &yaml.nfs) {
+        (None, None, None) => bail!("{}: set one of node, path or nfs", owner),
+        (_, _, Some(_)) if yaml.node.is_some() || yaml.path.is_some() => {
+            bail!("{}: nfs cannot be combined with node or path", owner)
+        }
+        (Some(node), None, None) => Ok(VolumeBinding::Node { node }),
+        (Some(node), Some(path), None) => Ok(VolumeBinding::NodePath { node, path }),
+        (None, Some(path), None) => Ok(VolumeBinding::Path { path }),
+        (None, None, Some(nfs)) => Ok(VolumeBinding::Nfs(convert_nfs(nfs, owner)?)),
+        _ => unreachable!("every combination with nfs is handled above"),
+    }
+}
+
+fn convert_nfs(yaml: &NfsBindingYaml, owner: &str) -> Result<NfsVolume> {
+    let (address, path, options) = match yaml {
+        NfsBindingYaml::Short(short) => {
+            let (address, path) = short.split_once(':').ok_or_else(|| {
+                anyhow!(
+                    "{}: nfs '{}' must be written as <server>:<export path>, e.g. fs-1.efs.example.com:/shop/uploads",
+                    owner,
+                    short
+                )
+            })?;
+            (address.to_string(), path.to_string(), None)
+        }
+        NfsBindingYaml::Long { address, path, options } => (address.clone(), path.clone(), options.clone()),
+    };
+    if address.trim().is_empty() {
+        bail!("{}: nfs needs a server address", owner);
+    }
+    if !path.starts_with('/') {
+        bail!("{}: nfs export path '{}' must be absolute", owner, path);
+    }
+    Ok(NfsVolume {
+        address: address.trim().to_string(),
+        path,
+        options: options.filter(|o| !o.trim().is_empty()),
     })
 }
 

@@ -731,6 +731,7 @@ mod tests {
                 secrets: vec![],
                 services: vec![],
                 volumes: vec![],
+                volume_bindings: Default::default(),
                 host_environment: vec![],
             },
         }

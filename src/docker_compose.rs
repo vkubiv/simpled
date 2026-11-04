@@ -1,7 +1,9 @@
 use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, ServiceResolvedSpec};
 use crate::spec;
-use crate::spec::{EnvVariable, Healthcheck, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType};
+use crate::spec::{
+    EnvVariable, Healthcheck, SecretMount, ServiceCommand, ServiceType, ServiceVolumeType, VolumeBinding,
+};
 use anyhow::Context;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -18,14 +20,52 @@ pub struct DockerCompose {
     pub services: HashMap<String, DockerService>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub networks: HashMap<String, DockerComposeNetwork>,
-    // Docker-managed named volumes. Only an isolated (test) run declares them;
-    // everywhere else a named volume is a bind directory under `volumes/`.
+    // Docker-managed named volumes: a test run's, and on Swarm the volumes the
+    // env spec binds to a node or to NFS. Everywhere else a named volume is a
+    // bind directory under `volumes/`.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub volumes: HashMap<String, DockerVolume>,
 }
 
-#[derive(Serialize, Default)]
-pub struct DockerVolume {}
+#[derive(Serialize, Default, Clone, Debug, PartialEq)]
+pub struct DockerVolume {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub driver_opts: std::collections::BTreeMap<String, String>,
+}
+
+impl DockerVolume {
+    /// The stack-level definition of a bound volume, or `None` for a binding
+    /// that is a bind mount of a host path.
+    pub fn for_binding(binding: &VolumeBinding) -> Option<DockerVolume> {
+        match binding {
+            VolumeBinding::Node { .. } => Some(DockerVolume::default()),
+            VolumeBinding::Nfs(nfs) => Some(DockerVolume {
+                driver: Some("local".to_string()),
+                driver_opts: [
+                    ("type".to_string(), "nfs".to_string()),
+                    ("o".to_string(), nfs.mount_options()),
+                    ("device".to_string(), format!(":{}", nfs.path)),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            VolumeBinding::NodePath { .. } | VolumeBinding::Path { .. } => None,
+        }
+    }
+}
+
+/// Every Docker-managed volume a Swarm deployment binds, keyed by the name its
+/// services mount it under. `docker stack deploy` creates each one as
+/// `<stack>_<name>` on the node where a task first needs it.
+pub fn stack_volumes(spec: &EnvironmentResolvedSpec) -> HashMap<String, DockerVolume> {
+    spec.current_deployment
+        .volume_bindings
+        .iter()
+        .filter_map(|(name, binding)| DockerVolume::for_binding(binding).map(|v| (name.clone(), v)))
+        .collect()
+}
 
 /// Compose project name for a local run.
 ///
@@ -260,9 +300,18 @@ pub fn prepare_service_with(
             ServiceVolumeType::Named(name) if isolated => {
                 volumes.push(format!("{}:{}", name, volume.mount_path));
             }
-            ServiceVolumeType::Named(name) => {
-                volumes.push(format!("./volumes/{}:{}", name, volume.mount_path));
-            }
+            ServiceVolumeType::Named(name) => match spec.current_deployment.volume_bindings.get(name) {
+                // A Docker volume the stack file declares (`stack_volumes`).
+                Some(VolumeBinding::Node { .. } | VolumeBinding::Nfs(_)) => {
+                    volumes.push(format!("{}:{}", name, volume.mount_path));
+                }
+                Some(VolumeBinding::NodePath { path, .. } | VolumeBinding::Path { path }) => {
+                    volumes.push(format!("{}:{}", path, volume.mount_path));
+                }
+                // Unbound: the 1.x directory next to the stack file, which only
+                // `multi_node: false` allows on Swarm.
+                None => volumes.push(format!("./volumes/{}:{}", name, volume.mount_path)),
+            },
             ServiceVolumeType::Path(from_path) => {
                 volumes.push(format!("{}:{}", from_path, volume.mount_path));
             }
@@ -656,7 +705,10 @@ mod tests {
         }
 
         fn swarm() -> DeploymentEnvType {
-            DeploymentEnvType::Docker(crate::spec::DockerSpecificSpec { swarm_mode: true })
+            DeploymentEnvType::Docker(crate::spec::DockerSpecificSpec {
+                swarm_mode: true,
+                multi_node: true,
+            })
         }
 
         #[test]

@@ -139,6 +139,9 @@ pub struct DeploymentEnvironmentSpecYaml {
     pub env_type: Option<DeploymentEnvTypeYaml>,
     // if env_type is Docker, swarm_mode can be set. In other cases it will cause an error
     pub swarm_mode: Option<bool>,
+    // Swarm only, default true: validate as if the swarm had several nodes even
+    // when it has one. `false` keeps everything on the node that runs deploy.sh.
+    pub multi_node: Option<bool>,
     pub gateway: Option<IngressSpecYaml>,
     // deprecated: use gateway instead
     pub ingress: Option<IngressSpecYaml>,
@@ -258,6 +261,30 @@ pub struct DeploymentSpecYaml {
     // handed to the developer to run by hand. Under `extends` a child's list
     // replaces the base's.
     pub exclude_services: Option<Vec<String>>,
+    // Swarm only: where each of the app's named volumes lives in this
+    // environment. The app spec only names its volumes; this is the adapter.
+    pub volumes: Option<HashMap<String, VolumeBindingYaml>>,
+}
+
+// Exactly one of `node`, `path` (with or without `node`) or `nfs`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeBindingYaml {
+    pub node: Option<String>,
+    pub path: Option<String>,
+    pub nfs: Option<NfsBindingYaml>,
+}
+
+// `server:/export/path`, or the long form when mount options are needed.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum NfsBindingYaml {
+    Short(String),
+    Long {
+        address: String,
+        path: String,
+        options: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
