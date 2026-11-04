@@ -45,19 +45,19 @@ pub fn resolve(
         env_by_host: HashMap::new(),
         public_routes: HashSet::new(),
     };
-    let resolved_services = app_spec
+    let mut resolved_services = app_spec
         .all_services()
         .map(|app_service| services.resolve_service(app_service))
         .collect::<Result<Vec<_>>>()?;
 
     check_public_services_are_routed(deployment, app_spec)?;
+    apply_volume_bindings(env_spec, app_spec, deployment, &mut resolved_services)?;
 
     let version_document = crate::version_endpoint::document(
         &deployment.application.name,
         &app_spec.version.to_string(),
         &deployment.name,
     );
-    let mut resolved_services = resolved_services;
     let is_local = env_spec.env_type == DeploymentEnvType::Local;
     if !is_local {
         resolved_services.push(crate::version_endpoint::service(
@@ -74,6 +74,7 @@ pub fn resolve(
         secrets: secrets.specs,
         services: resolved_services,
         volumes: app_spec.volumes.clone(),
+        volume_bindings: deployment.volumes.clone(),
         host_environment: undockerized_values,
     };
 
@@ -593,6 +594,201 @@ impl ServiceResolver<'_> {
 
 /// A public service the deployment configures but gives no prefix would never
 /// be reachable through the gateway, which is almost certainly a mistake.
+/// Swarm: checks every service's volumes against the env spec's bindings, and
+/// pins a service to the node its volumes live on.
+///
+/// With `multi_node` (the default) an unbound named volume and a relative bind
+/// path are errors, because both are directories on whichever node ran
+/// deploy.sh. That holds on a one-node swarm too, so a spec that passes keeps
+/// working when nodes are added.
+fn apply_volume_bindings(
+    env_spec: &DeploymentEnvironmentSpec,
+    app_spec: &AppSpec,
+    deployment: &DeploymentSpec,
+    services: &mut [ServiceResolvedSpec],
+) -> Result<()> {
+    let DeploymentEnvType::Docker(docker) = &env_spec.env_type else {
+        return Ok(());
+    };
+    if !docker.swarm_mode {
+        return Ok(());
+    }
+
+    for volume in deployment.volumes.keys() {
+        if !app_spec.volumes.contains(volume) {
+            return Err(anyhow!(
+                "Deployment '{}' binds volume '{}', but the app does not declare it. Declared volumes: {}",
+                deployment.name,
+                volume,
+                if app_spec.volumes.is_empty() {
+                    "none".to_string()
+                } else {
+                    app_spec.volumes.join(", ")
+                }
+            ));
+        }
+    }
+
+    if docker.multi_node {
+        check_volumes_are_bound(deployment, services)?;
+        check_no_relative_bind_paths(deployment, services)?;
+    }
+
+    for service in services.iter_mut() {
+        pin_to_volume_node(deployment, service)?;
+        warn_database_on_shared_storage(deployment, service);
+    }
+    Ok(())
+}
+
+fn named_volumes(service: &ServiceResolvedSpec) -> impl Iterator<Item = &String> {
+    service.volumes.iter().filter_map(|v| match &v.name {
+        ServiceVolumeType::Named(name) => Some(name),
+        ServiceVolumeType::Path(_) => None,
+    })
+}
+
+fn check_volumes_are_bound(deployment: &DeploymentSpec, services: &[ServiceResolvedSpec]) -> Result<()> {
+    let mut unbound: Vec<&String> = services
+        .iter()
+        .flat_map(named_volumes)
+        .filter(|name| !deployment.volumes.contains_key(*name))
+        .collect();
+    unbound.sort();
+    unbound.dedup();
+    if unbound.is_empty() {
+        return Ok(());
+    }
+
+    let mut snippet = format!("deployments:\n  {}:\n    volumes:\n", deployment.name);
+    for volume in &unbound {
+        snippet.push_str(&format!("      {}:\n        node: <node hostname>\n", volume));
+    }
+    let names: Vec<&str> = unbound.iter().map(|v| v.as_str()).collect();
+    Err(anyhow!(
+        "Deployment '{}' does not say where {} {}: {}. On Docker Swarm every named volume needs a binding, \
+         so its data stays put when the swarm has more than one node. For example:\n\n{}\n\
+         Each volume takes one of: node (a Docker volume on that node), node + path (a directory on that node), \
+         path (a path that exists on every node) or nfs (server:/export). \
+         To keep everything on a single node as in simpled 1.x, set multi_node: false.",
+        deployment.name,
+        if names.len() == 1 {
+            "this volume"
+        } else {
+            "these volumes"
+        },
+        if names.len() == 1 { "lives" } else { "live" },
+        names.join(", "),
+        snippet
+    ))
+}
+
+fn check_no_relative_bind_paths(deployment: &DeploymentSpec, services: &[ServiceResolvedSpec]) -> Result<()> {
+    for service in services {
+        for volume in &service.volumes {
+            if let ServiceVolumeType::Path(path) = &volume.name {
+                if !path.starts_with('/') {
+                    return Err(anyhow!(
+                        "Service '{}' mounts the relative path '{}' at {}. On Docker Swarm a relative path is a directory \
+                         on whichever node ran deploy.sh, so a task on any other node finds nothing there. \
+                         Use a config for files the service only reads, or a named volume bound under \
+                         deployments.{}.volumes for data it writes. To keep everything on a single node as in \
+                         simpled 1.x, set multi_node: false.",
+                        service.full_name,
+                        path,
+                        volume.mount_path,
+                        deployment.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A service follows its volumes: one mounting a volume that lives on a node
+/// runs on that node, jobs included.
+fn pin_to_volume_node(deployment: &DeploymentSpec, service: &mut ServiceResolvedSpec) -> Result<()> {
+    let mut pinned: Vec<(String, String)> = named_volumes(service)
+        .filter_map(|name| {
+            deployment
+                .volumes
+                .get(name)
+                .and_then(VolumeBinding::node)
+                .map(|node| (node.to_string(), name.clone()))
+        })
+        .collect();
+    pinned.sort();
+    pinned.dedup();
+    let Some((node, volume)) = pinned.first().cloned() else {
+        return Ok(());
+    };
+    if let Some((other_node, other_volume)) = pinned.iter().find(|(n, _)| *n != node) {
+        return Err(anyhow!(
+            "Service '{}' mounts volume '{}' on node {} and volume '{}' on node {}. No node can run it: bind both volumes to the same node",
+            service.full_name,
+            volume,
+            node,
+            other_volume,
+            other_node
+        ));
+    }
+
+    if service.resources.update.as_ref().and_then(|u| u.order) == Some(UpdateOrder::StartFirst) {
+        return Err(anyhow!(
+            "Service '{}' mounts volume '{}', which lives on node {}, and updates start-first. For a moment the old and \
+             the new task would write the same directory, which is how a database gets corrupted. Use update.order: stop-first",
+            service.full_name,
+            volume,
+            node
+        ));
+    }
+    if service.resources.replicas > 1 && !matches!(service.service_type, ServiceType::Job) {
+        eprintln!(
+            "Warning: service '{}' runs {} replicas on volume '{}', which lives on node {}. Every replica runs on that node and shares the directory.",
+            service.full_name, service.resources.replicas, volume, node
+        );
+    }
+
+    let constraint = format!("node.hostname == {}", node);
+    let placement = service.resources.placement.get_or_insert_with(|| Placement {
+        constraints: vec![],
+        spread: vec![],
+    });
+    if !placement.constraints.contains(&constraint) {
+        placement.constraints.push(constraint);
+    }
+    Ok(())
+}
+
+/// NFS locking and fsync semantics are a known source of corrupted databases.
+fn warn_database_on_shared_storage(deployment: &DeploymentSpec, service: &ServiceResolvedSpec) {
+    const DATABASES: [&str; 4] = ["postgres", "mysql", "mariadb", "mongo"];
+    let image_name = service
+        .image
+        .rsplit('/')
+        .next()
+        .unwrap_or(&service.image)
+        .split([':', '@'])
+        .next()
+        .unwrap_or_default();
+    if !DATABASES.iter().any(|db| image_name.starts_with(db)) {
+        return;
+    }
+    for volume in named_volumes(service) {
+        if matches!(
+            deployment.volumes.get(volume),
+            Some(VolumeBinding::Path { .. } | VolumeBinding::Nfs(_))
+        ) {
+            eprintln!(
+                "Warning: service '{}' ({}) keeps volume '{}' on shared storage. Databases on NFS are prone to corruption; \
+                 bind it to a node instead (node: <hostname>).",
+                service.full_name, image_name, volume
+            );
+        }
+    }
+}
+
 fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppSpec) -> Result<()> {
     for app_service in app_spec.all_services() {
         if !matches!(app_service.service_type, ServiceType::Public) {

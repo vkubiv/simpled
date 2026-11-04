@@ -334,6 +334,52 @@ pub enum DeploymentEnvType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DockerSpecificSpec {
     pub swarm_mode: bool,
+    /// Swarm only: validate as if the swarm had several nodes even when it has
+    /// one. When false, deploy.sh refuses a swarm with more than one schedulable
+    /// node and pins every service to the node it runs on. Always false outside
+    /// Swarm.
+    pub multi_node: bool,
+}
+
+/// Where a named volume lives in a Swarm environment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VolumeBinding {
+    /// A Docker volume (local driver) on one node.
+    Node { node: String },
+    /// A host directory on one node.
+    NodePath { node: String, path: String },
+    /// A host path that exists on every node, such as a shared mount.
+    Path { path: String },
+    /// A Docker volume backed by NFS, mounted by whichever node runs the task.
+    Nfs(NfsVolume),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NfsVolume {
+    pub address: String,
+    pub path: String,
+    /// Extra NFS mount options, appended after `addr=<address>`.
+    pub options: Option<String>,
+}
+
+impl VolumeBinding {
+    /// The node every service mounting this volume has to run on.
+    pub fn node(&self) -> Option<&str> {
+        match self {
+            VolumeBinding::Node { node } | VolumeBinding::NodePath { node, .. } => Some(node),
+            _ => None,
+        }
+    }
+}
+
+impl NfsVolume {
+    /// `o=` option of the local driver's NFS mount.
+    pub fn mount_options(&self) -> String {
+        match &self.options {
+            Some(options) => format!("addr={},{}", self.address, options),
+            None => format!("addr={}", self.address),
+        }
+    }
 }
 
 // DeploymentEnvironmentSpec definitions
@@ -436,6 +482,8 @@ pub struct DeploymentSpec {
     pub services: HashMap<String, DeploymentServiceSpec>,
     /// Local only: services this deployment does not start.
     pub exclude_services: Vec<String>,
+    /// Swarm only: where each named volume lives, keyed by volume name.
+    pub volumes: std::collections::BTreeMap<String, VolumeBinding>,
 }
 
 #[derive(Debug, Clone)]

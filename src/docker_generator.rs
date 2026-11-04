@@ -2,7 +2,7 @@ use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork
 use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
-use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType};
+use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBinding};
 use crate::version_endpoint;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -108,6 +108,50 @@ const RUN_JOB_FUNCTION: &str = r#"run_job() {
   esac
 }
 "#;
+
+/// `multi_node: false`: the environment lives on the one node that accepts
+/// tasks (`Ready` and `Active`). The script refuses a swarm with more than one
+/// such node, and exports that node's ID for the `node.id` constraint every
+/// service carries. The node is not necessarily the one running the script: a
+/// drained manager with a single worker pins everything to the worker.
+const SINGLE_NODE_CHECK: &str = r#"# multi_node: false keeps this environment on the one node that accepts tasks.
+schedulable="$(docker node ls --format '{{.ID}} {{.Hostname}} {{.Status}} {{.Availability}}' | awk '$3 == "Ready" && $4 == "Active" { print $1, $2 }')"
+schedulable_count="$(printf '%s\n' "${schedulable}" | grep -c . || true)"
+if [ "${schedulable_count}" -eq 0 ]; then
+  echo "No node in this swarm accepts tasks: every node is down or drained." >&2
+  exit 1
+fi
+if [ "${schedulable_count}" -gt 1 ]; then
+  echo "This swarm has ${schedulable_count} nodes that accept tasks ($(printf '%s\n' "${schedulable}" | awk '{ print $2 }' | paste -sd, - | sed 's/,/, /g')), but the env spec sets multi_node: false." >&2
+  echo "Set multi_node: true and bind the volumes (simpled docs reference --section volumes), or drain the extra nodes (docker node update --availability drain <node>)." >&2
+  exit 1
+fi
+SIMPLED_NODE_ID="$(printf '%s\n' "${schedulable}" | awk '{ print $1 }')"
+export SIMPLED_NODE_ID
+"#;
+
+/// The constraint that keeps a service on the one schedulable node. The stack
+/// file carries it as written and `docker stack deploy` interpolates it from the
+/// variable `SINGLE_NODE_CHECK` exports.
+const NODE_PIN: &str = "node.id == ${SIMPLED_NODE_ID}";
+
+/// Swarm with `multi_node: false`.
+fn single_node(spec: &EnvironmentResolvedSpec) -> bool {
+    matches!(&spec.env_type, crate::spec::DeploymentEnvType::Docker(d) if d.swarm_mode && !d.multi_node)
+}
+
+fn pin_to_deploy_node(service: &mut DockerService) {
+    let deploy = service.deploy.get_or_insert_with(Default::default);
+    let placement = deploy
+        .placement
+        .get_or_insert_with(|| crate::docker_compose::DockerPlacement {
+            constraints: vec![],
+            preferences: vec![],
+        });
+    if !placement.constraints.iter().any(|c| c == NODE_PIN) {
+        placement.constraints.push(NODE_PIN.to_string());
+    }
+}
 
 pub fn generate(
     resolved_spec: &EnvironmentResolvedSpec,
@@ -370,7 +414,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     let app_dir = output_dir.join(&deployment.name);
     fs::create_dir_all(&app_dir)?;
 
-    for volume in &deployment.volumes {
+    for volume in unbound_volumes(deployment) {
         let volume_sub_dir = app_dir.clone().join("volumes").join(volume);
         fs::create_dir_all(volume_sub_dir)?;
     }
@@ -405,6 +449,9 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         );
 
         docker_service.networks = networks;
+        if single_node(resolved_spec) {
+            pin_to_deploy_node(&mut docker_service);
+        }
 
         // File-mounted deferred secrets: the bind mount is in the stack file, but
         // the file it points at is only created once the script has run. The path
@@ -463,7 +510,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         name: None,
         services: stack_services,
         networks: compose_network(),
-        volumes: HashMap::new(),
+        volumes: crate::docker_compose::stack_volumes(resolved_spec),
     };
 
     let compose_path = &app_dir.join("docker-compose.yaml");
@@ -485,7 +532,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
             name: None,
             services: dep_services,
             networks: compose_network(),
-            volumes: HashMap::new(),
+            volumes: crate::docker_compose::stack_volumes(resolved_spec),
         };
 
         let deps_path = app_dir.join(DEPS_COMPOSE_FILE);
@@ -504,6 +551,10 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
+    if single_node(resolved_spec) {
+        write!(deploy_sh, "{}", SINGLE_NODE_CHECK)?;
+        writeln!(deploy_sh)?;
+    }
     if !jobs.is_empty() {
         writeln!(
             deploy_sh,
@@ -547,8 +598,9 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     // file location, i.e. the deployment directory.
     let mut volume_dirs: Vec<String> = Vec::new();
 
-    // Named volumes are bound as `./volumes/<name>` inside the deployment dir.
-    for volume in &deployment.volumes {
+    // Unbound named volumes are bound as `./volumes/<name>` inside the deployment
+    // dir. A bound one is a Docker volume, or a host path handled below.
+    for volume in unbound_volumes(deployment) {
         volume_dirs.push(format!("{}/volumes/{}", deployment.name, volume));
     }
 
@@ -572,6 +624,14 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
                     absolute_dirs.push(from_path.clone());
                 }
             }
+        }
+    }
+    // A `path` binding is meant to exist on every node, such as a shared mount,
+    // so creating it here creates it for all of them. A `node` + `path` one
+    // lives on another node, where this script cannot create it.
+    for binding in deployment.volume_bindings.values() {
+        if let VolumeBinding::Path { path } = binding {
+            absolute_dirs.push(path.clone());
         }
     }
 
@@ -658,6 +718,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
                 &job.full_name,
                 docker_service,
                 &network_name,
+                &deployment.volume_bindings,
             )?;
         }
 
@@ -719,6 +780,7 @@ fn write_job_invocation(
     job_name: &str,
     service: &DockerService,
     network_name: &str,
+    volume_bindings: &std::collections::BTreeMap<String, VolumeBinding>,
 ) -> Result<()> {
     // Named like a stack service so it is recognizable in `docker service ls`
     // while it runs; the job is removed again once it completes.
@@ -767,7 +829,13 @@ fn write_job_invocation(
 
     if let Some(placement) = service.deploy.as_ref().and_then(|d| d.placement.as_ref()) {
         for constraint in &placement.constraints {
-            writeln!(deploy_sh, "  --constraint {} \\", sh_quote(constraint))?;
+            // The node pin names a shell variable, so it is double-quoted for the
+            // shell to expand; every other constraint is taken literally.
+            if constraint == NODE_PIN {
+                writeln!(deploy_sh, "  --constraint \"{}\" \\", constraint)?;
+            } else {
+                writeln!(deploy_sh, "  --constraint {} \\", sh_quote(constraint))?;
+            }
         }
         for preference in &placement.preferences {
             writeln!(
@@ -784,6 +852,28 @@ fn write_job_invocation(
         let Some((source, target)) = volume.split_once(':') else {
             return Err(anyhow!("Job {} has an invalid volume entry '{}'", job_name, volume));
         };
+        // A Docker volume the stack declares: `docker stack deploy` names it
+        // `<stack>_<name>`, so the job mounts that same volume.
+        if let Some(docker_volume) = volume_bindings
+            .get(source)
+            .and_then(crate::docker_compose::DockerVolume::for_binding)
+        {
+            let mut mount = format!("type=volume,source={}_{},target={}", deployment_name, source, target);
+            if let Some(driver) = &docker_volume.driver {
+                mount.push_str(&format!(",volume-driver={}", driver));
+            }
+            for (key, value) in &docker_volume.driver_opts {
+                // `--mount` is CSV, so an option whose value has a comma is quoted.
+                let opt = format!("volume-opt={}={}", key, value);
+                if opt.contains(',') {
+                    mount.push_str(&format!(",\"{}\"", opt));
+                } else {
+                    mount.push_str(&format!(",{}", opt));
+                }
+            }
+            writeln!(deploy_sh, "  --mount {} \\", sh_quote(&mount))?;
+            continue;
+        }
         writeln!(
             deploy_sh,
             "  --mount \"type=bind,source={},target={}\" \\",
@@ -916,7 +1006,7 @@ fn generate_traefik_swarm(
     writeln!(stack, "services:")?;
     writeln!(stack, "  traefik:")?;
     writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
-    write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress)?;
+    write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress, single_node(resolved_spec))?;
     write_swarm_host_ports(&mut stack, has_tls)?;
     writeln!(stack, "    volumes:")?;
     writeln!(stack, "      - ./traefik/traefik.yml:/etc/traefik/traefik.yml")?;
@@ -999,31 +1089,50 @@ fn write_traefik_trusted_ips(file: &mut File, trusted_proxies: &[String]) -> Res
 }
 
 /// `deploy:` of the gateway service, written only when the env spec asks for
-/// global mode or a placement, so the stack is otherwise what it always was.
-fn write_swarm_ingress_deploy(stack: &mut File, ingress: &IngressResolvedSpec) -> Result<()> {
-    if !ingress.global && ingress.placement.is_none() {
+/// global mode or a placement, or `multi_node: false` pins it, so the stack is
+/// otherwise what it always was.
+fn write_swarm_ingress_deploy(stack: &mut File, ingress: &IngressResolvedSpec, pin: bool) -> Result<()> {
+    if !ingress.global && ingress.placement.is_none() && !pin {
         return Ok(());
     }
     writeln!(stack, "    deploy:")?;
     if ingress.global {
         writeln!(stack, "      mode: global")?;
     }
-    if let Some(placement) = &ingress.placement {
+    let mut constraints: Vec<&str> = ingress
+        .placement
+        .iter()
+        .flat_map(|p| p.constraints.iter().map(String::as_str))
+        .collect();
+    if pin {
+        constraints.push(NODE_PIN);
+    }
+    let spread: &[String] = ingress.placement.as_ref().map(|p| p.spread.as_slice()).unwrap_or(&[]);
+    if !constraints.is_empty() || !spread.is_empty() {
         writeln!(stack, "      placement:")?;
-        if !placement.constraints.is_empty() {
+        if !constraints.is_empty() {
             writeln!(stack, "        constraints:")?;
-            for constraint in &placement.constraints {
+            for constraint in constraints {
                 writeln!(stack, "          - {}", serde_json::to_string(constraint)?)?;
             }
         }
-        if !placement.spread.is_empty() {
+        if !spread.is_empty() {
             writeln!(stack, "        preferences:")?;
-            for spread in &placement.spread {
+            for spread in spread {
                 writeln!(stack, "          - spread: {}", serde_json::to_string(spread)?)?;
             }
         }
     }
     Ok(())
+}
+
+/// Named volumes the env spec does not bind: each is a directory under
+/// `<deployment>/volumes/`, as in simpled 1.x.
+fn unbound_volumes(deployment: &crate::resolved_spec::DeploymentResolvedSpec) -> impl Iterator<Item = &String> {
+    deployment
+        .volumes
+        .iter()
+        .filter(|v| !deployment.volume_bindings.contains_key(*v))
 }
 
 fn write_swarm_host_ports(stack: &mut File, has_tls: bool) -> Result<()> {
@@ -1366,7 +1475,10 @@ mod tests {
     fn spec(services: Vec<ServiceResolvedSpec>) -> EnvironmentResolvedSpec {
         EnvironmentResolvedSpec {
             ports: Default::default(),
-            env_type: DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode: true }),
+            env_type: DeploymentEnvType::Docker(DockerSpecificSpec {
+                swarm_mode: true,
+                multi_node: true,
+            }),
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
                 version_document: None,
@@ -1386,6 +1498,7 @@ mod tests {
                 secrets: vec![],
                 services,
                 volumes: vec![],
+                volume_bindings: Default::default(),
                 host_environment: vec![],
             },
         }
@@ -1518,7 +1631,10 @@ mod tests {
 
     fn generate_swarm_to_temp(spec: &EnvironmentResolvedSpec) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let docker_spec = DockerSpecificSpec { swarm_mode: true };
+        let docker_spec = DockerSpecificSpec {
+            swarm_mode: true,
+            multi_node: true,
+        };
         generate(spec, &docker_spec, dir.path()).unwrap();
         let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
         (dir, script)
@@ -1703,7 +1819,10 @@ mkdir -p \"/var/"
             healthy(service("primary-db", ServiceType::Internal, &[])),
             service("migrate", ServiceType::Job, &["primary-db"]),
         ]);
-        let docker_spec = DockerSpecificSpec { swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            swarm_mode: false,
+            multi_node: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -1746,7 +1865,10 @@ mkdir -p \"/var/"
             name: "shop-tls_key".to_string(),
             value: SecretResolvedValue::Literal("pem".to_string()),
         }];
-        let docker_spec = DockerSpecificSpec { swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            swarm_mode: false,
+            multi_node: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -1840,7 +1962,10 @@ mkdir -p \"/var/"
                 value: SecretResolvedValue::Literal("k3y".to_string()),
             },
         ];
-        let docker_spec = DockerSpecificSpec { swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            swarm_mode: false,
+            multi_node: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -1871,7 +1996,10 @@ mkdir -p \"/var/"
             "echo it's alive && sleep 1".to_string()
         ]));
         let mut spec = spec(vec![api]);
-        let docker_spec = DockerSpecificSpec { swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            swarm_mode: false,
+            multi_node: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -1895,7 +2023,10 @@ mkdir -p \"/var/"
     fn standalone_containers_carry_the_name_traefik_targets() {
         let mut spec = spec(vec![service("api", ServiceType::Public, &[])]);
         spec.ingress = ingress_with_limits(&[("api", "/", None)]);
-        let docker_spec = DockerSpecificSpec { swarm_mode: false };
+        let docker_spec = DockerSpecificSpec {
+            swarm_mode: false,
+            multi_node: false,
+        };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
