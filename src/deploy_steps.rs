@@ -390,12 +390,12 @@ pub fn lock(
         if started.elapsed() >= timing.wait {
             let _ = std::fs::remove_file(lock_file);
             let mut message = format!(
-                "Another deploy holds the swarm's deploy lock: deployment '{}' from {}, for {} minutes. \
-                 Gave up after waiting {} minutes; SIMPLED_LOCK_WAIT (seconds) waits longer.",
+                "Another deploy holds the swarm's deploy lock: deployment '{}' from {}, for {}. \
+                 Gave up after waiting {}; SIMPLED_LOCK_WAIT (seconds) waits longer.",
                 holder.deployment,
                 holder.host,
-                age.as_secs() / 60,
-                timing.wait.as_secs() / 60
+                human(age),
+                human(timing.wait)
             );
             if age >= timing.stale_after {
                 message.push_str(&format!(
@@ -408,14 +408,25 @@ pub fn lock(
         }
         if !announced {
             eprintln!(
-                "Waiting for the deploy lock, held by deployment '{}' from {} for {} minutes...",
+                "Waiting for the deploy lock, held by deployment '{}' from {} for {}...",
                 holder.deployment,
                 holder.host,
-                age.as_secs() / 60
+                human(age)
             );
             announced = true;
         }
         std::thread::sleep(timing.poll);
+    }
+}
+
+/// `45 seconds`, `1 minute`, `12 minutes`.
+fn human(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    match secs {
+        1 => "1 second".to_string(),
+        s if s < 60 => format!("{} seconds", s),
+        60..=119 => "1 minute".to_string(),
+        s => format!("{} minutes", s / 60),
     }
 }
 
@@ -871,7 +882,11 @@ mod tests {
         let err = lock(&docker, "shop", "ci-7", &|| 700, &dir.path().join("lock"), &timing(0))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("deployment 'blog' from ci-3, for 10 minutes"), "{}", err);
+        assert!(
+            err.contains("deployment 'blog' from ci-3, for 10 minutes. Gave up after waiting 0 seconds"),
+            "{}",
+            err
+        );
         assert!(!err.contains("probably died"), "{}", err);
 
         // Held for an hour: probably left by a deploy that died.
