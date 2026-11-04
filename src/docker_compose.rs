@@ -6,7 +6,7 @@ use crate::spec::{
 };
 use anyhow::Context;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,14 +17,14 @@ pub struct DockerCompose {
     // takes the stack name on the command line and ignores this key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub services: HashMap<String, DockerService>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub networks: HashMap<String, DockerComposeNetwork>,
+    pub services: BTreeMap<String, DockerService>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub networks: BTreeMap<String, DockerComposeNetwork>,
     // Docker-managed named volumes: a test run's, and on Swarm the volumes the
     // env spec binds to a node or to NFS. Everywhere else a named volume is a
     // bind directory under `volumes/`.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub volumes: HashMap<String, DockerVolume>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub volumes: BTreeMap<String, DockerVolume>,
     // Swarm only: the content-addressed objects the services mount, created by
     // the deploy script (`swarm_objects`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -65,7 +65,7 @@ impl DockerVolume {
 /// Every Docker-managed volume a Swarm deployment binds, keyed by the name its
 /// services mount it under. `docker stack deploy` creates each one as
 /// `<stack>_<name>` on the node where a task first needs it.
-pub fn stack_volumes(spec: &EnvironmentResolvedSpec) -> HashMap<String, DockerVolume> {
+pub fn stack_volumes(spec: &EnvironmentResolvedSpec) -> BTreeMap<String, DockerVolume> {
     spec.current_deployment
         .volume_bindings
         .iter()
@@ -140,17 +140,17 @@ pub struct DockerService {
     pub configs: Vec<crate::swarm_objects::ObjectMount>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_file: Vec<String>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub environment: HashMap<String, String>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub networks: HashMap<String, ServiceNetwork>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub networks: BTreeMap<String, ServiceNetwork>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deploy: Option<DeployConfig>,
     // Start-order dependencies. `docker stack deploy` ignores this key, so it is
     // only filled in for compose files that are run with `docker compose up`;
     // Swarm ordering is handled by the phases of the generated deploy script.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub depends_on: HashMap<String, DependsOnCondition>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub depends_on: BTreeMap<String, DependsOnCondition>,
 }
 
 #[derive(Serialize, Clone)]
@@ -304,7 +304,7 @@ pub fn prepare_service_with(
     }
 
     let mut volumes = Vec::new();
-    let mut environment = HashMap::new();
+    let mut environment = BTreeMap::new();
 
     for volume in &service.volumes {
         match &volume.name {
@@ -447,11 +447,17 @@ pub fn prepare_service_with(
         .map(|port| format!("{}:{}", port.external, port.internal))
         .collect();
 
-    let deploy_date = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    environment.insert("DEPLOY_DATE".to_string(), deploy_date.to_string());
+    // Not on Swarm: a timestamp in the spec would change it on every prepare and
+    // restart every service on every deploy. There, configs and secrets are Swarm
+    // objects named after their content, so a service's spec changes, and Swarm
+    // rolls it, exactly when its image, environment, configs or secrets do.
+    if !objects_on_swarm {
+        let deploy_date = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        environment.insert("DEPLOY_DATE".to_string(), deploy_date.to_string());
+    }
 
     // Job services run to completion and must not be restarted by Swarm.
     // Swarm's default restart policy is `condition: any`, which would keep
@@ -514,9 +520,9 @@ pub fn prepare_service_with(
         configs: vec![],
         env_file: vec![format!("./{}/.env", service.full_name)],
         environment,
-        networks: HashMap::new(),
+        networks: BTreeMap::new(),
         deploy,
-        depends_on: HashMap::new(),
+        depends_on: BTreeMap::new(),
     })
 }
 
