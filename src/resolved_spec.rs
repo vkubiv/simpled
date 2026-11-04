@@ -79,14 +79,6 @@ impl RedirectRule {
             format!("http://{}", to)
         }
     }
-
-    pub fn status_code(&self) -> u16 {
-        if self.permanent {
-            301
-        } else {
-            302
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

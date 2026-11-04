@@ -15,8 +15,8 @@ fn version_document(conf: &str) -> serde_json::Value {
 }
 
 #[test]
-fn a_swarm_deployment_ships_its_version_service_and_nginx_routes_to_it() {
-    let dir = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+fn a_swarm_deployment_ships_its_version_service() {
+    let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
 
     let stack = read(&out.join("prod").join("docker-compose.yaml"));
@@ -37,17 +37,6 @@ fn a_swarm_deployment_ships_its_version_service_and_nginx_routes_to_it() {
     assert_eq!(doc["version"], "1.2.3");
     assert_eq!(doc["deployment"], "prod");
     assert!(doc["deployed_at"].as_u64().unwrap() > 0);
-
-    // Resolved per request, so a gateway naming a deployment that has not been
-    // redeployed yet still starts.
-    let nginx = read(&out.join("ingress").join("nginx").join("default.conf"));
-    assert!(nginx.contains(&format!("location = {} {{", PATH)), "{}", nginx);
-    assert!(nginx.contains("resolver 127.0.0.11"), "{}", nginx);
-    assert!(
-        nginx.contains("set $simpled_version simpled-version-prod;"),
-        "{}",
-        nginx
-    );
 }
 
 #[test]

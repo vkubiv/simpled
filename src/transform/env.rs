@@ -28,6 +28,7 @@ pub fn convert_env_spec(
     let has_trusted_proxies = gateway_yaml.trusted_proxies.as_ref().is_some_and(|p| !p.is_empty());
     let ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
     let tls_upstream = ingress.tls.as_ref().is_some_and(|t| t.upstream);
+    let has_tls_secret = ingress.tls.as_ref().is_some_and(|t| t.secret.is_some());
     let registry = yaml.registry.unwrap_or_default();
 
     // Resolve `extends` inheritance before anything inspects the deployments, so
@@ -119,11 +120,27 @@ pub fn convert_env_spec(
         }
         DeploymentEnvTypeYaml::Docker => {
             let swarm_mode = swarm_mode_opt.unwrap_or(false);
-            let ingress_type = match ingress_type_str.as_deref() {
-                Some("nginx") => DockerIngressType::Nginx,
-                Some("traefik") | None => DockerIngressType::Traefik,
-                Some(other) => return Err(anyhow!("Unknown ingress type: {}", other)),
-            };
+            match ingress_type_str.as_deref() {
+                Some("traefik") | None => {}
+                Some("nginx") => {
+                    return Err(anyhow!(
+                        "gateway type nginx is no longer supported: Traefik is the only Docker gateway. \
+                         Remove gateway.type from the env spec"
+                    ))
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "Unknown gateway type: {} (the Docker gateway is traefik)",
+                        other
+                    ))
+                }
+            }
+            if has_tls_secret {
+                return Err(anyhow!(
+                    "gateway tls.secret cannot be set for Docker environment: the Traefik gateway gets its \
+                     certificate from Let's Encrypt (tls.letsencrypt), or TLS ends in front of it (tls.upstream)"
+                ));
+            }
             if concrete.values().any(|d| d.secrets_folder.is_some()) {
                 return Err(anyhow!("secrets_folder cannot be set for Docker environment"));
             }
@@ -133,18 +150,10 @@ pub fn convert_env_spec(
             if concrete.values().any(|d| d.exclude_services.is_some()) {
                 return Err(anyhow!("exclude_services cannot be set for Docker environment"));
             }
-            if tls_upstream && ingress_type == DockerIngressType::Nginx {
-                return Err(anyhow!(
-                    "gateway tls.upstream is only supported with the traefik gateway (type: traefik)"
-                ));
-            }
             if !swarm_mode {
                 reject_swarm_only("standalone Docker")?;
             }
-            DeploymentEnvType::Docker(DockerSpecificSpec {
-                swarm_mode,
-                ingress_type,
-            })
+            DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode })
         }
         DeploymentEnvTypeYaml::Local => {
             if swarm_mode_opt.is_some() {
@@ -792,7 +801,7 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
     if global && tls.as_ref().is_some_and(|t| t.letsencrypt.is_some()) {
         return Err(anyhow!(
             "gateway global cannot be combined with tls.letsencrypt: every gateway task would run its own ACME client \
-             and the HTTP-01 challenge would reach a random node. Terminate TLS upstream (tls.upstream) or bring a certificate (tls.secret)"
+             and the HTTP-01 challenge would reach a random node. Terminate TLS upstream (tls.upstream) instead"
         ));
     }
     if global && placement.as_ref().is_some_and(|p| !p.spread.is_empty()) {

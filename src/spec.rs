@@ -332,14 +332,7 @@ pub enum DeploymentEnvType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum DockerIngressType {
-    Nginx,
-    Traefik,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct DockerSpecificSpec {
-    pub ingress_type: DockerIngressType,
     pub swarm_mode: bool,
 }
 

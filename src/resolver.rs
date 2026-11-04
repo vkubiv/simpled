@@ -1157,7 +1157,6 @@ mod tests {
         };
         assert_eq!(rule.target_url(true), "https://www.somesite.com");
         assert_eq!(rule.target_url(false), "http://www.somesite.com");
-        assert_eq!(rule.status_code(), 302);
 
         let absolute = RedirectRule {
             from_domain: "somesite.com".to_string(),
@@ -1165,7 +1164,6 @@ mod tests {
             permanent: true,
         };
         assert_eq!(absolute.target_url(false), "https://elsewhere.example");
-        assert_eq!(absolute.status_code(), 301);
     }
 
     fn secrets() -> HashMap<String, String> {

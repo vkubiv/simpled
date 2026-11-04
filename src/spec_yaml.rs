@@ -185,7 +185,9 @@ pub struct IngressSpecYaml {
     // certificate, since the redirect has to be served over HTTPS too.
     pub redirects: Option<Vec<RedirectSpecYaml>>,
 
-    // if env_type is Docker, ingress_type can be nginx or traefik(default). In other cases it will cause an error
+    // Only `traefik` is accepted, and only on Docker: Traefik is the one Docker
+    // gateway. Kept so a spec that still names it parses, and `nginx` gets an
+    // error that says what happened instead of an unknown-field one.
     #[serde(rename = "type")]
     pub ingress_type: Option<String>,
 }
