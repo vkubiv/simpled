@@ -2,7 +2,7 @@ use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork
 use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec, SHELL_VAR_PREFIX};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
-use crate::spec::{DockerIngressType, DockerSpecificSpec, SecretMount, ServiceVolumeType};
+use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType};
 use crate::version_endpoint;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -14,12 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DOCKER_NETWORK: &str = "common_network";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
 // would change the ingress underneath a deployment that touched nothing else.
-// nginx and certbot are pinned exactly. Traefik stays on v2 because v3
-// changes the configuration format.
-const NGINX_IMAGE: &str = "nginx:1.31.6-alpine";
+// Traefik stays on v2 because v3 changes the configuration format.
 const TRAEFIK_IMAGE: &str = "traefik:v2.10";
 const TRAEFIK_PING_ROUTER: &str = "simpled-ping";
-const CERTBOT_IMAGE: &str = "certbot/certbot:v5.8.0";
 const TRAEFIK_RESOLVER: &str = "myresolver";
 /// Placeholder backend for redirect-only routers, which still have to name one.
 const TRAEFIK_REDIRECT_SERVICE: &str = "redirect-noop";
@@ -122,17 +119,13 @@ pub fn generate(
     }
 
     if docker_spec.swarm_mode {
-        generate_swarm(resolved_spec, docker_spec, output_dir)
+        generate_swarm(resolved_spec, output_dir)
     } else {
-        generate_standalone(resolved_spec, docker_spec, output_dir)
+        generate_standalone(resolved_spec, output_dir)
     }
 }
 
-fn generate_standalone(
-    resolved_spec: &EnvironmentResolvedSpec,
-    docker_spec: &DockerSpecificSpec,
-    output_dir: &Path,
-) -> Result<()> {
+fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> Result<()> {
     let deployment = &resolved_spec.current_deployment;
 
     // Create subdirs
@@ -364,25 +357,13 @@ fn generate_standalone(
 
     // Ingress Container
     if !resolved_spec.ingress.rules.is_empty() {
-        match docker_spec.ingress_type {
-            DockerIngressType::Nginx => {
-                generate_nginx_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name)?
-            }
-
-            DockerIngressType::Traefik => {
-                generate_traefik_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name)?;
-            }
-        }
+        generate_traefik_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name)?;
     }
 
     Ok(())
 }
 
-fn generate_swarm(
-    resolved_spec: &EnvironmentResolvedSpec,
-    docker_spec: &DockerSpecificSpec,
-    output_dir: &Path,
-) -> Result<()> {
+fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) -> Result<()> {
     let deployment = &resolved_spec.current_deployment;
 
     // Application folder
@@ -515,10 +496,7 @@ fn generate_swarm(
     let ingress_dir = output_dir.join("ingress");
     fs::create_dir_all(&ingress_dir)?;
 
-    match docker_spec.ingress_type {
-        DockerIngressType::Nginx => generate_nginx_swarm(resolved_spec, &ingress_dir, network_name.clone())?,
-        DockerIngressType::Traefik => generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone())?,
-    }
+    generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone())?;
 
     // 5. Deploy Script
     let mut deploy_sh = create_executable(&output_dir.join("deploy.sh"))?;
@@ -855,341 +833,6 @@ fn node_path(deployment_name: &str, path: &str) -> String {
     }
 }
 
-fn generate_nginx_standalone(
-    resolved_spec: &EnvironmentResolvedSpec,
-    output_dir: &Path,
-    deploy_sh: &mut File,
-    network_name: String,
-) -> Result<()> {
-    if !resolved_spec.ingress.rules.is_empty() || !resolved_spec.ingress.redirects.is_empty() {
-        let nginx_dir = output_dir.join("nginx");
-        fs::create_dir_all(&nginx_dir)?;
-        generate_nginx_config(&resolved_spec.ingress, &nginx_dir.join("default.conf"))?;
-    }
-
-    writeln!(deploy_sh, "echo 'Starting Nginx ingress...'")?;
-    writeln!(deploy_sh, "docker rm -f nginx-ingress || true")?;
-    write!(
-        deploy_sh,
-        "docker run -d --name nginx-ingress --network {}",
-        network_name
-    )?;
-    write!(deploy_sh, " -p 80:80")?;
-
-    let has_tls = resolved_spec.ingress.tls.is_some();
-    if has_tls {
-        write!(deploy_sh, " -p 443:443")?;
-    }
-
-    write!(
-        deploy_sh,
-        " -v $(pwd)/nginx/default.conf:/etc/nginx/conf.d/default.conf"
-    )?;
-
-    if has_tls {
-        fs::create_dir_all(output_dir.join("certs"))?;
-        write!(deploy_sh, " -v $(pwd)/certs:/etc/nginx/certs")?;
-    }
-
-    if let Some(tls) = &resolved_spec.ingress.tls {
-        if tls.letsencrypt.is_some() {
-            write!(deploy_sh, " -v $(pwd)/letsencrypt:/var/www/letsencrypt")?;
-            fs::create_dir_all(output_dir.join("letsencrypt"))?;
-        }
-    }
-
-    write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
-    writeln!(deploy_sh, " {}", NGINX_IMAGE)?;
-
-    if let Some(tls) = &resolved_spec.ingress.tls {
-        if let Some(le) = &tls.letsencrypt {
-            let mut certbot_sh = File::create(output_dir.join("certbot.sh"))?;
-            writeln!(certbot_sh, "docker run -it --rm --name certbot \\")?;
-            writeln!(certbot_sh, "  -v $(pwd)/letsencrypt:/var/www/letsencrypt \\")?;
-            writeln!(certbot_sh, "  -v $(pwd)/certs:/etc/nginx/certs \\")?;
-            writeln!(
-                certbot_sh,
-                "  {} certonly --webroot --webroot-path=/var/www/letsencrypt \\",
-                CERTBOT_IMAGE
-            )?;
-            writeln!(certbot_sh, "  --email {} --agree-tos --no-eff-email \\", le.email)?;
-            // One certificate covers every domain, so pin the lineage name
-            // rather than letting it default to whichever domain comes first —
-            // the nginx config points every server block at this directory.
-            let requested = certificate_domains(&resolved_spec.ingress);
-            if let Some(primary) = requested.first() {
-                writeln!(certbot_sh, "  --cert-name {} \\", primary)?;
-            }
-            for domain in requested {
-                writeln!(certbot_sh, "   -d {} \\", domain)?;
-            }
-            writeln!(certbot_sh, "   && docker restart nginx-ingress")?;
-        }
-    }
-    Ok(())
-}
-
-fn generate_nginx_swarm(
-    resolved_spec: &EnvironmentResolvedSpec,
-    ingress_dir: &Path,
-    network_name: String,
-) -> Result<()> {
-    if resolved_spec.ingress.rules.is_empty() && resolved_spec.ingress.redirects.is_empty() {
-        return Ok(());
-    }
-
-    let nginx_conf_dir = ingress_dir.join("nginx");
-    fs::create_dir_all(&nginx_conf_dir)?;
-    generate_nginx_config(&resolved_spec.ingress, &nginx_conf_dir.join("default.conf"))?;
-
-    let mut stack = File::create(ingress_dir.join("docker-compose.yaml"))?;
-    writeln!(stack, "version: '3.8'")?;
-    writeln!(stack, "services:")?;
-    writeln!(stack, "  nginx:")?;
-    writeln!(stack, "    image: {}", NGINX_IMAGE)?;
-    write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress)?;
-    write_swarm_host_ports(&mut stack, resolved_spec.ingress.tls.is_some())?;
-    writeln!(stack, "    volumes:")?;
-    writeln!(stack, "      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf")?;
-
-    if resolved_spec.ingress.tls.is_some() {
-        // We assume certs are placed in output_dir/certs -> so from ingress/docker-compose.yaml, it is ../certs
-        // Wait, the structure is output_dir/ingress/docker-compose.yaml
-        // So ../certs is output_dir/certs
-        writeln!(stack, "      - ../certs:/etc/nginx/certs")?;
-
-        if let Some(tls) = &resolved_spec.ingress.tls {
-            if tls.letsencrypt.is_some() {
-                writeln!(stack, "      - ../letsencrypt:/var/www/letsencrypt")?;
-            }
-        }
-    }
-
-    write_swarm_compose_network(&mut stack, &network_name)?;
-
-    Ok(())
-}
-
-/// Every domain the gateway answers on, in the order certbot is asked for them,
-/// with the repeats that `hosts` groups can produce removed.
-fn certificate_domains(ingress: &IngressResolvedSpec) -> Vec<&String> {
-    let mut unique: Vec<&String> = Vec::new();
-    for domain in &ingress.domains {
-        if !unique.contains(&domain) {
-            unique.push(domain);
-        }
-    }
-    unique
-}
-
-/// Directory under `certs/live` holding the certificate for `domain`.
-///
-/// certbot issues a single certificate covering every `-d`, stored under one
-/// lineage named after `--cert-name`, so with Let's Encrypt all server blocks —
-/// the redirect-only ones included — read the same files. Without it each domain
-/// is expected to bring its own certificate.
-fn nginx_cert_lineage<'a>(ingress: &'a IngressResolvedSpec, domain: &'a str) -> &'a str {
-    let uses_letsencrypt = ingress.tls.as_ref().is_some_and(|t| t.letsencrypt.is_some());
-    if !uses_letsencrypt {
-        return domain;
-    }
-    certificate_domains(ingress)
-        .first()
-        .map(|d| d.as_str())
-        .unwrap_or(domain)
-}
-
-fn generate_nginx_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<()> {
-    let mut file = File::create(path)?;
-
-    let has_tls = ingress.tls.is_some();
-
-    // conf.d files are included in the http block, so this applies to every
-    // server below and $remote_addr becomes the client behind the trusted proxies.
-    if !ingress.trusted_proxies.is_empty() {
-        for entry in &ingress.trusted_proxies {
-            writeln!(file, "set_real_ip_from {};", entry)?;
-        }
-        writeln!(file, "real_ip_header X-Forwarded-For;")?;
-        writeln!(file, "real_ip_recursive on;")?;
-        writeln!(file)?;
-    }
-
-    // The same domain can be declared under multiple host groups, producing
-    // several rules with the same domain_name. nginx treats repeated server
-    // blocks with the same server_name as a conflict and silently ignores all
-    // but the first, dropping those routes, so merge every rule's services under
-    // a single server block per domain. `domains` preserves first-seen order.
-    let mut domains: Vec<&String> = Vec::new();
-    let mut services_by_domain: HashMap<&String, Vec<&crate::resolved_spec::IngressToServiceRule>> = HashMap::new();
-    for rule in &ingress.rules {
-        if !services_by_domain.contains_key(&rule.domain_name) {
-            domains.push(&rule.domain_name);
-        }
-        services_by_domain
-            .entry(&rule.domain_name)
-            .or_default()
-            .extend(rule.services.iter());
-    }
-
-    for domain in domains {
-        let services = &services_by_domain[domain];
-
-        writeln!(file, "server {{")?;
-        writeln!(file, "    listen 80;")?;
-        writeln!(file, "    server_name {};", domain)?;
-
-        if let Some(tls) = &ingress.tls {
-            if tls.letsencrypt.is_some() {
-                writeln!(file, "    location /.well-known/acme-challenge/ {{")?;
-                writeln!(file, "        root /var/www/letsencrypt;")?;
-                writeln!(file, "    }}")?;
-            }
-        }
-
-        if has_tls {
-            writeln!(file, "    location / {{")?;
-            writeln!(file, "        return 301 https://$host$request_uri;")?;
-            writeln!(file, "    }}")?;
-            writeln!(file, "}}")?;
-
-            writeln!(file, "server {{")?;
-            writeln!(file, "    listen 443 ssl;")?;
-            writeln!(file, "    server_name {};", domain)?;
-            let lineage = nginx_cert_lineage(ingress, domain);
-            writeln!(
-                file,
-                "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;",
-                lineage
-            )?;
-            writeln!(
-                file,
-                "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;",
-                lineage
-            )?;
-
-            generate_version_location(&mut file, ingress, domain)?;
-            generate_locations(&mut file, services)?;
-
-            writeln!(file, "}}")?;
-        } else {
-            generate_version_location(&mut file, ingress, domain)?;
-            generate_locations(&mut file, services)?;
-            writeln!(file, "}}")?;
-        }
-    }
-
-    generate_nginx_redirects(&mut file, ingress)?;
-
-    Ok(())
-}
-
-/// Server blocks for domains that only bounce the client elsewhere, e.g.
-/// `somesite.com` -> `www.somesite.com`. With TLS on, the source needs its own
-/// certificate and its own :443 block, otherwise the browser hits a name
-/// mismatch before it ever sees the redirect.
-fn generate_nginx_redirects(file: &mut File, ingress: &IngressResolvedSpec) -> Result<()> {
-    let has_tls = ingress.tls.is_some();
-    let uses_letsencrypt = ingress.tls.as_ref().is_some_and(|t| t.letsencrypt.is_some());
-
-    for redirect in &ingress.redirects {
-        let target = redirect.target_url(has_tls);
-        let code = redirect.status_code();
-
-        writeln!(file, "server {{")?;
-        writeln!(file, "    listen 80;")?;
-        writeln!(file, "    server_name {};", redirect.from_domain)?;
-        if uses_letsencrypt {
-            // The ACME challenge must stay reachable over plain HTTP, or the
-            // certificate for this very domain can never be issued.
-            writeln!(file, "    location /.well-known/acme-challenge/ {{")?;
-            writeln!(file, "        root /var/www/letsencrypt;")?;
-            writeln!(file, "    }}")?;
-            writeln!(file, "    location / {{")?;
-            writeln!(file, "        return {} {}$request_uri;", code, target)?;
-            writeln!(file, "    }}")?;
-        } else {
-            writeln!(file, "    return {} {}$request_uri;", code, target)?;
-        }
-        writeln!(file, "}}")?;
-
-        if has_tls {
-            writeln!(file, "server {{")?;
-            writeln!(file, "    listen 443 ssl;")?;
-            writeln!(file, "    server_name {};", redirect.from_domain)?;
-            let lineage = nginx_cert_lineage(ingress, &redirect.from_domain);
-            writeln!(
-                file,
-                "    ssl_certificate /etc/nginx/certs/live/{}/fullchain.pem;",
-                lineage
-            )?;
-            writeln!(
-                file,
-                "    ssl_certificate_key /etc/nginx/certs/live/{}/privkey.pem;",
-                lineage
-            )?;
-            writeln!(file, "    return {} {}$request_uri;", code, target)?;
-            writeln!(file, "}}")?;
-        }
-    }
-
-    Ok(())
-}
-
-/// The version endpoint of the deployment owning `domain`. Its service belongs to
-/// that deployment's stack, which may not have been deployed yet, so the name is
-/// resolved per request through Docker's DNS: a fixed `proxy_pass` host that does
-/// not resolve would keep nginx from starting at all.
-fn generate_version_location(file: &mut File, ingress: &IngressResolvedSpec, domain: &str) -> Result<()> {
-    let Some(route) = ingress.version_routes.iter().find(|r| r.domain_name == domain) else {
-        return Ok(());
-    };
-    writeln!(file, "    location = {} {{", version_endpoint::PATH)?;
-    writeln!(file, "        resolver 127.0.0.11 valid=10s ipv6=off;")?;
-    writeln!(
-        file,
-        "        set $simpled_version {};",
-        version_endpoint::service_name(&route.deployment_name)
-    )?;
-    writeln!(file, "        proxy_pass http://$simpled_version;")?;
-    writeln!(file, "    }}")?;
-    Ok(())
-}
-
-fn generate_locations(file: &mut File, services: &[&crate::resolved_spec::IngressToServiceRule]) -> Result<()> {
-    for svc in services {
-        let prefix = &svc.prefix;
-        let location_path = if prefix.ends_with('/') {
-            prefix.clone()
-        } else {
-            format!("{}/", prefix)
-        };
-
-        writeln!(file, "    location {} {{", location_path)?;
-
-        // Per-location, so two services behind the same domain can differ.
-        if let Some(limit) = svc.body_limit {
-            writeln!(file, "        client_max_body_size {};", limit)?;
-        }
-
-        if svc.strip_prefix {
-            writeln!(file, "        proxy_pass http://{}:{}/;", svc.service_name, svc.port)?;
-        } else {
-            writeln!(file, "        proxy_pass http://{}:{};", svc.service_name, svc.port)?;
-        }
-
-        writeln!(file, "        proxy_set_header Host $host;")?;
-        writeln!(file, "        proxy_set_header X-Real-IP $remote_addr;")?;
-        writeln!(
-            file,
-            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
-        )?;
-        writeln!(file, "        proxy_set_header X-Forwarded-Proto $scheme;")?;
-        writeln!(file, "    }}")?;
-    }
-    Ok(())
-}
-
 fn generate_traefik_standalone(
     resolved_spec: &EnvironmentResolvedSpec,
     output_dir: &Path,
@@ -1257,13 +900,6 @@ fn generate_traefik_swarm(
     let upstream = resolved_spec.ingress.tls_upstream();
     let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
 
-    if letsencrypt.is_none() && !upstream {
-        return Err(anyhow!(
-            "Currently swarm traefik ingress only supports Let's Encrypt or TLS terminated in front of it: \
-             specify a letsencrypt block in gateway.tls, or set gateway.tls.upstream: true"
-        ));
-    }
-
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
     write_traefik_static_config(
         &mut static_conf,
@@ -1289,7 +925,7 @@ fn generate_traefik_swarm(
         "      - ./traefik/dynamic_conf.yml:/etc/traefik/dynamic_conf.yml"
     )?;
 
-    // Mount letsencrypt if needed. Using ../letsencrypt as in nginx
+    // Traefik's ACME store, kept next to the deployment so a redeploy keeps it.
     if letsencrypt.is_some() {
         writeln!(stack, "      - ../letsencrypt:/letsencrypt")?;
         // Make sure dir exists
@@ -1730,10 +1366,7 @@ mod tests {
     fn spec(services: Vec<ServiceResolvedSpec>) -> EnvironmentResolvedSpec {
         EnvironmentResolvedSpec {
             ports: Default::default(),
-            env_type: DeploymentEnvType::Docker(DockerSpecificSpec {
-                ingress_type: DockerIngressType::Nginx,
-                swarm_mode: true,
-            }),
+            env_type: DeploymentEnvType::Docker(DockerSpecificSpec { swarm_mode: true }),
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
                 version_document: None,
@@ -1816,26 +1449,9 @@ mod tests {
     }
 
     #[test]
-    fn nginx_caps_the_body_per_location() {
-        let ingress = ingress_with_limits(&[
-            ("api", "/api", Some(1024)),
-            ("upload", "/upload", Some(10 * 1024 * 1024)),
-            ("web", "/", None),
-        ]);
-        let conf = write_config(&ingress, false);
-
-        let api = conf.split("location /upload/").next().unwrap();
-        assert!(api.contains("client_max_body_size 1024;"), "{}", conf);
-        assert!(conf.contains("client_max_body_size 10485760;"), "{}", conf);
-        // A service without a limit keeps nginx's own default.
-        let web = conf.split("location / {").nth(1).unwrap();
-        assert!(!web.contains("client_max_body_size"), "{}", conf);
-    }
-
-    #[test]
     fn traefik_caps_the_body_with_a_buffering_middleware() {
         let ingress = ingress_with_limits(&[("upload", "/upload", Some(10 * 1024 * 1024))]);
-        let conf = write_config(&ingress, true);
+        let conf = write_config(&ingress);
 
         assert!(conf.contains("    limit-somesite-com-0-0:"), "{}", conf);
         assert!(conf.contains("      buffering:"), "{}", conf);
@@ -1847,7 +1463,7 @@ mod tests {
     fn traefik_keeps_both_middlewares_when_a_route_strips_and_caps() {
         let mut ingress = ingress_with_limits(&[("upload", "/upload", Some(2048))]);
         ingress.rules[0].services[0].strip_prefix = true;
-        let conf = write_config(&ingress, true);
+        let conf = write_config(&ingress);
 
         assert!(conf.contains("        - strip-somesite-com-0-0"), "{}", conf);
         assert!(conf.contains("        - limit-somesite-com-0-0"), "{}", conf);
@@ -1864,59 +1480,16 @@ mod tests {
         }
     }
 
-    fn write_config(ingress: &IngressResolvedSpec, traefik: bool) -> String {
+    fn write_config(ingress: &IngressResolvedSpec) -> String {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conf");
-        if traefik {
-            generate_traefik_dynamic_config(ingress, &path).unwrap();
-        } else {
-            generate_nginx_config(ingress, &path).unwrap();
-        }
+        generate_traefik_dynamic_config(ingress, &path).unwrap();
         fs::read_to_string(path).unwrap()
     }
 
     #[test]
-    fn nginx_redirects_the_bare_domain_to_the_served_one() {
-        let conf = write_config(&ingress_with_redirect(None), false);
-
-        assert!(conf.contains("server_name somesite.com;"), "{}", conf);
-        assert!(
-            conf.contains("return 301 http://www.somesite.com$request_uri;"),
-            "{}",
-            conf
-        );
-        // The redirect source carries no routes of its own.
-        assert!(!conf.contains("proxy_pass http://api:80/;"), "{}", conf);
-    }
-
-    #[test]
-    fn nginx_serves_the_redirect_over_tls_and_keeps_the_acme_path_open() {
-        let conf = write_config(&ingress_with_redirect(Some(letsencrypt_tls())), false);
-
-        // Without its own :443 block the browser hits a certificate name
-        // mismatch before it ever sees the redirect.
-        // certbot issues one certificate for every domain, so the redirect's
-        // server block reads the same lineage as the served host.
-        assert!(
-            conf.contains("ssl_certificate /etc/nginx/certs/live/www.somesite.com/fullchain.pem;"),
-            "{}",
-            conf
-        );
-        assert!(!conf.contains("live/somesite.com/"), "{}", conf);
-        assert!(
-            conf.contains("return 301 https://www.somesite.com$request_uri;"),
-            "{}",
-            conf
-        );
-        // The ACME challenge has to stay on plain HTTP or the certificate for
-        // this domain can never be issued.
-        let plain = conf.split("listen 443 ssl;").next().unwrap();
-        assert!(plain.contains("location /.well-known/acme-challenge/"), "{}", conf);
-    }
-
-    #[test]
     fn traefik_redirects_with_a_middleware_on_a_router_of_its_own() {
-        let conf = write_config(&ingress_with_redirect(Some(letsencrypt_tls())), true);
+        let conf = write_config(&ingress_with_redirect(Some(letsencrypt_tls())));
 
         assert!(conf.contains("    redirect-somesite-com:"), "{}", conf);
         assert!(
@@ -1940,34 +1513,12 @@ mod tests {
         let mut ingress = ingress_with_redirect(None);
         ingress.redirects[0].permanent = false;
 
-        assert!(write_config(&ingress, false).contains("return 302 http://www.somesite.com$request_uri;"));
-        assert!(write_config(&ingress, true).contains("        permanent: false"));
-    }
-
-    #[test]
-    fn certbot_requests_a_certificate_for_the_redirect_source() {
-        let mut spec = spec(vec![service("api", ServiceType::Public, &[])]);
-        spec.ingress = ingress_with_redirect(Some(letsencrypt_tls()));
-        // `domains` repeats when a domain is declared under several host groups.
-        spec.ingress.domains.push("www.somesite.com".to_string());
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut deploy_sh = File::create(dir.path().join("deploy.sh")).unwrap();
-        generate_nginx_standalone(&spec, dir.path(), &mut deploy_sh, DOCKER_NETWORK.to_string()).unwrap();
-
-        let certbot = fs::read_to_string(dir.path().join("certbot.sh")).unwrap();
-        assert!(certbot.contains("-d somesite.com"), "{}", certbot);
-        assert_eq!(certbot.matches("-d www.somesite.com").count(), 1, "{}", certbot);
-        // The nginx config points every server block at this one lineage.
-        assert!(certbot.contains("--cert-name www.somesite.com"), "{}", certbot);
+        assert!(write_config(&ingress).contains("        permanent: false"));
     }
 
     fn generate_swarm_to_temp(spec: &EnvironmentResolvedSpec) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let docker_spec = DockerSpecificSpec {
-            ingress_type: DockerIngressType::Nginx,
-            swarm_mode: true,
-        };
+        let docker_spec = DockerSpecificSpec { swarm_mode: true };
         generate(spec, &docker_spec, dir.path()).unwrap();
         let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
         (dir, script)
@@ -2152,10 +1703,7 @@ mkdir -p \"/var/"
             healthy(service("primary-db", ServiceType::Internal, &[])),
             service("migrate", ServiceType::Job, &["primary-db"]),
         ]);
-        let docker_spec = DockerSpecificSpec {
-            ingress_type: DockerIngressType::Nginx,
-            swarm_mode: false,
-        };
+        let docker_spec = DockerSpecificSpec { swarm_mode: false };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -2198,10 +1746,7 @@ mkdir -p \"/var/"
             name: "shop-tls_key".to_string(),
             value: SecretResolvedValue::Literal("pem".to_string()),
         }];
-        let docker_spec = DockerSpecificSpec {
-            ingress_type: DockerIngressType::Nginx,
-            swarm_mode: false,
-        };
+        let docker_spec = DockerSpecificSpec { swarm_mode: false };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -2295,10 +1840,7 @@ mkdir -p \"/var/"
                 value: SecretResolvedValue::Literal("k3y".to_string()),
             },
         ];
-        let docker_spec = DockerSpecificSpec {
-            ingress_type: DockerIngressType::Nginx,
-            swarm_mode: false,
-        };
+        let docker_spec = DockerSpecificSpec { swarm_mode: false };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -2329,10 +1871,7 @@ mkdir -p \"/var/"
             "echo it's alive && sleep 1".to_string()
         ]));
         let mut spec = spec(vec![api]);
-        let docker_spec = DockerSpecificSpec {
-            ingress_type: DockerIngressType::Nginx,
-            swarm_mode: false,
-        };
+        let docker_spec = DockerSpecificSpec { swarm_mode: false };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -2356,10 +1895,7 @@ mkdir -p \"/var/"
     fn standalone_containers_carry_the_name_traefik_targets() {
         let mut spec = spec(vec![service("api", ServiceType::Public, &[])]);
         spec.ingress = ingress_with_limits(&[("api", "/", None)]);
-        let docker_spec = DockerSpecificSpec {
-            ingress_type: DockerIngressType::Traefik,
-            swarm_mode: false,
-        };
+        let docker_spec = DockerSpecificSpec { swarm_mode: false };
         spec.env_type = DeploymentEnvType::Docker(docker_spec.clone());
 
         let dir = tempfile::tempdir().unwrap();
@@ -2467,30 +2003,6 @@ mkdir -p \"/var/"
         assert_eq!(
             parsed["entryPoints"]["web"]["http"]["redirections"]["entryPoint"]["to"].as_str(),
             Some("websecure"),
-            "{}",
-            conf
-        );
-    }
-
-    #[test]
-    fn nginx_takes_the_client_address_from_trusted_proxies() {
-        let mut ingress = ingress_with_limits(&[("api", "/api", None)]);
-        let without = write_config(&ingress, false);
-        assert!(!without.contains("real_ip"), "{}", without);
-
-        ingress.trusted_proxies = vec!["10.0.0.0/8".to_string(), "2600:9000::/28".to_string()];
-        let conf = write_config(&ingress, false);
-        let real_ip = "set_real_ip_from 10.0.0.0/8;
-set_real_ip_from 2600:9000::/28;
-real_ip_header X-Forwarded-For;
-real_ip_recursive on;
-
-";
-        // The server blocks are what they were, X-Forwarded-For still set once.
-        assert_eq!(conf.strip_prefix(real_ip), Some(without.as_str()), "{}", conf);
-        assert_eq!(
-            conf.matches("X-Forwarded-For $proxy_add_x_forwarded_for;").count(),
-            1,
             "{}",
             conf
         );

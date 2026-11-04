@@ -539,7 +539,7 @@ Notes:
 ```yaml
 gateway:
   name: my-gateway          # optional; defaults to "gateway"
-  type: nginx | traefik     # docker only; defaults to traefik
+  type: traefik             # docker only, optional; Traefik is the only Docker gateway
   hosts:
     hostname-alias: domain.com
     multi-domain-alias:
@@ -588,7 +588,7 @@ gateway:
 
 The path and query string are preserved: `somesite.com/pricing?ref=x` → `www.somesite.com/pricing?ref=x`.
 
-Redirect sources are included in the gateway's certificate, since the redirect itself has to be served over HTTPS. On Kubernetes each destination becomes its own `Ingress` carrying the ingress-nginx `permanent-redirect`/`temporal-redirect` annotation; on Docker it becomes an nginx `server` block or a Traefik `redirectRegex` middleware; locally the gateway matches the `Host` header, so a redirect can share a port with routed services.
+Redirect sources are included in the gateway's certificate, since the redirect itself has to be served over HTTPS. On Kubernetes each destination becomes its own `Ingress` carrying the ingress-nginx `permanent-redirect`/`temporal-redirect` annotation; on Docker it becomes a Traefik `redirectRegex` middleware; locally the gateway matches the `Host` header, so a redirect can share a port with routed services.
 
 A domain may not appear under both `hosts` and `redirects`, and a source may not be listed twice — both make routing ambiguous and are rejected.
 
@@ -609,7 +609,6 @@ There is nothing to configure. The gateway is shared by every deployment of an e
 
 | Target | How the path is routed |
 |---|---|
-| Docker, nginx | `location =` per server block. The service name is resolved per request through Docker's DNS, so a gateway that names a deployment not yet redeployed with this feature still starts, and answers 502 there until it is. |
 | Docker, Traefik | a `Host() && Path()` router per host |
 | Kubernetes | a separate Ingress, `<gateway>--simpled-version`, so the main Ingress's `rewrite-target` does not apply to it |
 | Local | answered by the local gateway itself, with no extra container |
@@ -635,15 +634,14 @@ deployments:
         body_limit: 500m
 ```
 
-Values use nginx notation: a plain byte count, or a number with a `k`/`m`/`g` suffix (a trailing `b` is allowed, so `2mb` reads the same as `2m`). `0` means no limit. Omitting it everywhere leaves the gateway's own default in place — 1 MB for nginx and ingress-nginx, unlimited for Traefik.
+Values use nginx's `client_max_body_size` notation: a plain byte count, or a number with a `k`/`m`/`g` suffix (a trailing `b` is allowed, so `2mb` reads the same as `2m`). `0` means no limit. Omitting it everywhere leaves the gateway's own default in place — 1 MB for ingress-nginx, unlimited for Traefik.
 
 How it is applied per target:
 
 | Target | Mechanism |
 |--------|-----------|
 | `k8s` | `nginx.ingress.kubernetes.io/proxy-body-size`. The annotation covers a whole Ingress, so routes with different limits are split into separate Ingress objects (`<gateway>--limit-<bytes>`); the primary object keeps the gateway name and owns the TLS certificate. |
-| `docker` + nginx | `client_max_body_size` inside each `location` block. |
-| `docker` + traefik | A `buffering` middleware with `maxRequestBodyBytes`. Traefik has no non-buffering size cap, so a limited route spools the request body before forwarding it. |
+| `docker` | A `buffering` middleware with `maxRequestBodyBytes`. Traefik has no non-buffering size cap, so a limited route spools the request body before forwarding it. |
 | `local` | The gateway rejects a request whose `Content-Length` exceeds the limit with `413`. A chunked request that declares no length is passed through. |
 
 #### trusted_proxies
@@ -663,8 +661,7 @@ gateway:
 
 | Target | Mechanism |
 |--------|-----------|
-| `docker` + traefik | `forwardedHeaders.trustedIPs` on the `web` entrypoint and, with TLS, on `websecure`. Without it Traefik replaces an incoming `X-Forwarded-For` with the address it was connected from. |
-| `docker` + nginx | `set_real_ip_from` per entry, `real_ip_header X-Forwarded-For` and `real_ip_recursive on` in the http scope, so `$remote_addr` (and the `X-Real-IP` sent upstream) is the client. Upstream requests already carry `X-Forwarded-For $proxy_add_x_forwarded_for`. |
+| `docker` | `forwardedHeaders.trustedIPs` on the `web` entrypoint and, with TLS, on `websecure`. Without it Traefik replaces an incoming `X-Forwarded-For` with the address it was connected from. |
 | `k8s` | Rejected. The ingress controller owns this (ingress-nginx: `proxy-real-ip-cidr` and `use-forwarded-headers` in its ConfigMap). |
 | `local` | Rejected. |
 
@@ -675,9 +672,9 @@ Under Docker Swarm the gateway publishes its ports in host mode, so it sees the 
 | Option | Description |
 |--------|-------------|
 | `disable: true` | No TLS. HTTP only. |
-| `secret: name` | Use an existing Kubernetes TLS secret. |
-| `letsencrypt` | Provision via Let's Encrypt (cert-manager). Kubernetes only. |
-| `upstream: true` | TLS is terminated in front of the gateway, by a load balancer or CDN holding the certificate. `docker` with the traefik gateway only. See [tls.upstream](#tlsupstream). |
+| `secret: name` | Use an existing Kubernetes TLS secret. Kubernetes only; rejected on `docker`. |
+| `letsencrypt` | Provision via Let's Encrypt: cert-manager on Kubernetes, Traefik's own ACME client on Docker. |
+| `upstream: true` | TLS is terminated in front of the gateway, by a load balancer or CDN holding the certificate. `docker` only. See [tls.upstream](#tlsupstream). |
 
 #### tls.upstream
 
@@ -691,7 +688,6 @@ The gateway serves plain HTTP and the load balancer in front of it holds the cer
 |-------------|--------|
 | `upstream` with `letsencrypt` or `secret` | Validation error: the gateway holds no certificate. |
 | `upstream` with `disable: true` | Validation error. |
-| `upstream` with the nginx gateway | Validation error. |
 | `upstream` on `k8s` or `local` | Validation error. |
 | `upstream` with empty `trusted_proxies` | Allowed, with a warning: Traefik then discards the `X-Forwarded-For` and `X-Forwarded-Proto` the balancer sends, so the apps see its address and `http`. |
 
@@ -701,7 +697,7 @@ About `/ping`: Traefik's built-in ping router is ``PathPrefix(`/ping`)``, which 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Rejected together with `tls.letsencrypt`: each task would run its own ACME client, and the HTTP-01 challenge would land on a random node. Allowed with `tls.upstream`, or with `tls.secret` on the nginx gateway (the swarm traefik gateway takes only `letsencrypt` or `upstream`). |
+| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Rejected together with `tls.letsencrypt`: each task would run its own ACME client, and the HTTP-01 challenge would land on a random node. Allowed with `tls.upstream` or `disable: true`. |
 | `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`. |
 
 Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the ingress stack is unchanged: a single replica placed anywhere.
@@ -1599,7 +1595,7 @@ Output directory: `docker-deploy/`
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
 | `<deployment>/<service>/` | Per-service `.env`, config and secret files |
-| `ingress/` | Traefik or nginx ingress stack |
+| `ingress/` | Traefik ingress stack |
 
 The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
 

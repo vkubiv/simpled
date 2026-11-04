@@ -656,10 +656,7 @@ mod tests {
         }
 
         fn swarm() -> DeploymentEnvType {
-            DeploymentEnvType::Docker(crate::spec::DockerSpecificSpec {
-                ingress_type: crate::spec::DockerIngressType::Nginx,
-                swarm_mode: true,
-            })
+            DeploymentEnvType::Docker(crate::spec::DockerSpecificSpec { swarm_mode: true })
         }
 
         #[test]

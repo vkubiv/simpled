@@ -75,7 +75,7 @@ fn standalone_docker_reaches_services_through_traefik() {
 
 #[test]
 fn swarm_stack_carries_replicas_and_keeps_jobs_out() {
-    let dir = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
 
     let stack = read(&out.join("prod").join("docker-compose.yaml"));
@@ -120,7 +120,7 @@ fn envspec_with_resources(env_type: &str, extra_top_level: &str, gateway_type: &
 
 #[test]
 fn swarm_stack_and_jobs_are_limited_by_their_resources() {
-    let dir = prepare(&envspec_with_resources("docker", "swarm_mode: true", "type: nginx"));
+    let dir = prepare(&envspec_with_resources("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
 
     let stack = read(&out.join("prod").join("docker-compose.yaml"));
@@ -179,7 +179,7 @@ fn standalone_docker_limits_containers_by_their_resources() {
 
 #[test]
 fn without_resources_docker_containers_are_unconstrained() {
-    let swarm = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let swarm = prepare(&envspec("docker", "swarm_mode: true", ""));
     let stack = read(
         &swarm
             .path()
@@ -202,7 +202,7 @@ fn without_resources_docker_containers_are_unconstrained() {
 
 #[test]
 fn an_unreadable_quantity_fails_before_anything_is_generated() {
-    let env = envspec_with_resources("docker", "swarm_mode: true", "type: nginx").replace("memory: 1Gi", "memory: 1GB");
+    let env = envspec_with_resources("docker", "swarm_mode: true", "").replace("memory: 1Gi", "memory: 1GB");
     let dir = tempfile::tempdir().unwrap();
     common::write_project(dir.path(), &env);
     let output = common::simpled(
@@ -263,14 +263,14 @@ fn host_mode_ports(stack: &str, service: &str) -> Vec<u64> {
 /// replace the client address with its own.
 #[test]
 fn swarm_gateway_publishes_its_ports_in_host_mode() {
-    let dir = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let stack = read(
         &dir.path()
             .join("docker-deploy")
             .join("ingress")
             .join("docker-compose.yaml"),
     );
-    assert_eq!(host_mode_ports(&stack, "nginx"), vec![80]);
+    assert_eq!(host_mode_ports(&stack, "traefik"), vec![80]);
     assert!(!stack.contains("start-first"), "{}", stack);
 
     let env = envspec(
@@ -297,7 +297,7 @@ fn swarm_gateway_publishes_its_ports_in_host_mode() {
 }
 
 #[test]
-fn trusted_proxies_reach_the_standalone_gateways() {
+fn trusted_proxies_reach_the_standalone_gateway() {
     let dir = prepare(&envspec(
         "docker",
         "",
@@ -314,18 +314,6 @@ fn trusted_proxies_reach_the_standalone_gateways() {
     );
     // Standalone publishing is untouched: no mesh in front of `docker run -p`.
     assert!(read(&out.join("deploy.sh")).contains(" -p 80:80"));
-
-    let dir = prepare(&envspec(
-        "docker",
-        "",
-        "type: nginx\n  trusted_proxies: [\"10.0.0.0/8\"]",
-    ));
-    let nginx = read(&dir.path().join("docker-deploy").join("nginx").join("default.conf"));
-    assert!(
-        nginx.starts_with("set_real_ip_from 10.0.0.0/8;\nreal_ip_header X-Forwarded-For;\nreal_ip_recursive on;\n"),
-        "{}",
-        nginx
-    );
 }
 
 #[test]
@@ -479,8 +467,12 @@ fn gateway_tls_and_mode_combinations_that_cannot_work_fail_validation() {
             "gateway global cannot be combined with tls.letsencrypt",
         ),
         (
-            upstream_envspec("docker", "swarm_mode: true", "type: nginx"),
-            "tls.upstream is only supported with the traefik gateway",
+            envspec("docker", "swarm_mode: true", "type: nginx"),
+            "gateway type nginx is no longer supported",
+        ),
+        (
+            envspec("docker", "", "").replace("    disable: true", "    secret: shop-tls"),
+            "gateway tls.secret cannot be set for Docker environment",
         ),
         (
             upstream_envspec("k8s", "", ""),
@@ -529,7 +521,7 @@ fn envspec_with_rollout(env_type: &str, extra_top_level: &str, gateway_type: &st
 
 #[test]
 fn swarm_services_take_their_update_policy_and_placement() {
-    let dir = prepare(&envspec_with_rollout("docker", "swarm_mode: true", "type: nginx"));
+    let dir = prepare(&envspec_with_rollout("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
     let stack = read(&out.join("prod").join("docker-compose.yaml"));
     let parsed: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
@@ -585,7 +577,7 @@ fn swarm_services_take_their_update_policy_and_placement() {
 
 #[test]
 fn without_update_or_placement_the_swarm_stack_has_neither() {
-    let dir = prepare(&envspec("docker", "swarm_mode: true", "type: nginx"));
+    let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
     let stack = read(&out.join("prod").join("docker-compose.yaml"));
     for key in ["update_config", "rollback_config", "placement"] {
@@ -603,7 +595,7 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
 
 #[test]
 fn update_and_placement_mistakes_fail_validation() {
-    let swarm = envspec_with_rollout("docker", "swarm_mode: true", "type: nginx");
+    let swarm = envspec_with_rollout("docker", "swarm_mode: true", "");
     let cases = [
         (
             swarm.replace("order: start-first", "order: blue-green"),
@@ -626,7 +618,7 @@ fn update_and_placement_mistakes_fail_validation() {
             "Deployment 'prod' defaults: invalid placement constraint 'node.role'",
         ),
         (
-            envspec_with_rollout("docker", "", "type: nginx"),
+            envspec_with_rollout("docker", "", ""),
             "update in deployment 'prod' defaults cannot be set for standalone Docker environment",
         ),
         (
