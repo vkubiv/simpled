@@ -1623,9 +1623,11 @@ calls to the simpled binary shipped next to it:
 
 | Step | Does |
 |------|------|
+| `./simpled step lock <deployment>` | Takes the swarm's deploy lock, waiting while another deploy holds it. `deploy.sh` releases it with `./simpled step unlock` when it exits. See [Several deployments in one env spec](#several-deployments-in-one-env-spec). |
 | `./simpled step check-nodes` | With `multi_node: false` only: stops unless exactly one node accepts tasks, and exports its ID for the `node.id` constraint. See [multi_node](#multi_node). |
 | `./simpled step sync-objects <plan>` | Creates the plan's configs and secrets that do not exist yet and exports their names. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm). |
 | `./simpled step run-job <plan> <job>` | Runs a job as a `replicated-job` service, waits until it completes or fails, prints its logs and removes the service. `JOB_TIMEOUT` (seconds, default 600) limits the wait. |
+| `./simpled step check-gateway <plan>` | Before the gateway is redeployed: refuses to replace a newer simpled's gateway, and prints how its routing changes. |
 | `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy. |
 
 A step that sets variables for the rest of the script prints `export` lines, which
@@ -1653,6 +1655,42 @@ machine, pass `--target-binary` with a simpled of the same version built for it.
 The same `rsync` of `docker-deploy/` that carries the stack files carries the
 binary, and `deploy.sh` makes it executable. The target needs nothing beyond Docker
 and, for `aws` secrets, the AWS CLI.
+
+---
+
+### Several deployments in one env spec
+
+Every deployment of an env spec is deployed on its own, into its own stack, and its
+`deploy.sh` also redeploys the shared gateway from its copy of the env spec. What
+keeps them from getting in each other's way:
+
+- **One directory per deployment on the target**, for example
+  `rsync -a docker-deploy/ host:~/deploy/shop/`. Nothing generated is then shared
+  between two deployments: each has its own `deploy.sh`, binary, plans and
+  `ingress/` copy.
+- **Objects have owners.** A deployment's configs and secrets are labelled
+  `simpled.deployment=<name>` and the gateway's `simpled.scope=environment`, and
+  pruning only touches the owner being deployed.
+- **One deploy at a time per swarm.** `./simpled step lock <deployment>` takes the
+  swarm's deploy lock, the Swarm config `simpled_deploy_lock`, before anything
+  changes, and `deploy.sh` releases it when it exits, also on failure. A second
+  deploy waits for it, up to `SIMPLED_LOCK_WAIT` seconds (default 600), then fails,
+  naming the deployment and host that hold it. When the lock is older than 30
+  minutes, the error says that deploy probably died; if nothing is deploying, clear
+  it with `./simpled step unlock --force`.
+- **The gateway is checked before it is replaced.** `./simpled step check-gateway`
+  reads the labels of the running gateway (`simpled.version`,
+  `simpled.deployment`):
+  - It stops a deploy that would replace a gateway from a newer simpled with an
+    older one. Prepare the deployment with the newer simpled, or run
+    `SIMPLED_ALLOW_DOWNGRADE=1 ./deploy.sh` to do it anyway.
+  - When the gateway's routing changes, it prints the changed lines of
+    `dynamic_conf.yml` against the one that runs, and which deployment deployed
+    that. A deploy from an older checkout of the env spec shows up as routes it
+    removes.
+
+Not handled: a deployment removed from the env spec keeps its stack running.
+The gateway stops routing to it; remove it with `docker stack rm <deployment>`.
 
 ---
 

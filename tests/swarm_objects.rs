@@ -238,3 +238,29 @@ fn target_platform_is_validated() {
         );
     }
 }
+
+/// Several deployments of one env spec share the gateway and the swarm: a deploy
+/// holds the swarm's lock for its whole run and checks the gateway it replaces.
+#[test]
+fn a_deploy_holds_the_lock_and_checks_the_gateway_it_replaces() {
+    let dir = prepare(&swarm());
+    let out = dir.path().join("docker-deploy");
+    let script = read(&out.join("deploy.sh"));
+
+    let lock = script
+        .find("lock=\"$(./simpled step lock 'prod')\"\neval \"${lock}\"\ntrap './simpled step unlock' EXIT\n")
+        .expect("the lock is taken and released on exit");
+    let check = script
+        .find("./simpled step check-gateway ingress/plan.json\ndocker stack deploy -c ingress/docker-compose.yaml")
+        .expect("the gateway is checked right before it is deployed");
+    let sync = script.find("./simpled step sync-objects ingress/plan.json").unwrap();
+    // Locked before the first change to the swarm; checked once the new
+    // gateway objects' names are known.
+    assert!(lock < sync && sync < check, "{}", script);
+
+    let ingress: serde_yaml::Value =
+        serde_yaml::from_str(&read(&out.join("ingress").join("docker-compose.yaml"))).unwrap();
+    let labels = &ingress["services"]["traefik"]["deploy"]["labels"];
+    assert_eq!(labels["simpled.version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(labels["simpled.deployment"].as_str(), Some("prod"));
+}

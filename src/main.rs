@@ -173,6 +173,18 @@ enum StepCommands {
     PruneObjects { plan: std::path::PathBuf },
     /// Runs one job of the plan to completion
     RunJob { plan: std::path::PathBuf, job: String },
+    /// Takes the swarm's deploy lock for a deployment, waiting while another
+    /// deploy holds it, and prints `export SIMPLED_LOCK_TOKEN=...`
+    Lock { deployment: String },
+    /// Releases the deploy lock this deploy took (SIMPLED_LOCK_TOKEN), or with
+    /// --force whoever's it is
+    Unlock {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Before the gateway is redeployed: refuses to replace a newer simpled's
+    /// gateway, and shows how its routing changes
+    CheckGateway { plan: std::path::PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -452,6 +464,54 @@ fn step_command(command: &StepCommands) -> Result<()> {
                 std::time::Duration::from_secs(timeout),
                 std::time::Duration::from_secs(2),
             )?;
+        }
+        StepCommands::Lock { deployment } => {
+            let wait = match std::env::var("SIMPLED_LOCK_WAIT") {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .with_context(|| format!("SIMPLED_LOCK_WAIT '{}' is not a number of seconds", value))?,
+                Err(_) => 600,
+            };
+            let host = ["HOSTNAME", "COMPUTERNAME"]
+                .iter()
+                .find_map(|v| std::env::var(v).ok().filter(|h| !h.is_empty()))
+                .or_else(|| {
+                    std::process::Command::new("hostname")
+                        .output()
+                        .ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|h| !h.is_empty())
+                })
+                .unwrap_or_else(|| "an unknown host".to_string());
+            let now = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default()
+            };
+            let token = deploy_steps::lock(
+                &docker,
+                deployment,
+                &host,
+                &now,
+                &deploy_dir.join(".simpled-lock"),
+                &deploy_steps::LockTiming {
+                    wait: std::time::Duration::from_secs(wait),
+                    poll: std::time::Duration::from_secs(5),
+                    stale_after: std::time::Duration::from_secs(30 * 60),
+                },
+            )?;
+            println!("{}", export_line("SIMPLED_LOCK_TOKEN", &token));
+        }
+        StepCommands::Unlock { force } => {
+            let token = std::env::var("SIMPLED_LOCK_TOKEN").ok();
+            deploy_steps::unlock(&docker, token.as_deref(), *force)?;
+        }
+        StepCommands::CheckGateway { plan } => {
+            let plan = read_plan(plan)?;
+            let allow_downgrade = std::env::var("SIMPLED_ALLOW_DOWNGRADE").is_ok_and(|v| v == "1");
+            let lookup = |name: &str| std::env::var(name).ok();
+            deploy_steps::check_gateway(&docker, &plan, &deploy_dir, &lookup, allow_downgrade)?;
         }
     }
     Ok(())

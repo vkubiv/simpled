@@ -604,20 +604,25 @@ from interfering with each other:
    objects are labelled `simpled.deployment=<name>`, and `prune-objects shop` touches
    only those. Environment objects (gateway files, daemon tokens, certificates) are
    labelled `simpled.scope=environment`, and only the ingress side prunes them.
-3. **No downgrades of the environment.** The ingress stack is labelled with the
-   simpled version and the env spec hash that produced it. A deploy that would
-   replace it with a lower simpled version stops, unless it is given
-   `--allow-downgrade`. This guards the daemon, whose image is pinned to the simpled
-   version. A different env spec hash is allowed, but the step prints what changed in
-   the environment plan (for example "gateway host `ops` added"), so a deploy from a
-   stale checkout shows in the log.
+3. **No downgrades of the environment.** The gateway service is labelled with the
+   simpled version and the deployment that deployed it. `step check-gateway`, right
+   before the ingress stack deploys, stops a deploy that would replace it with a
+   lower simpled version, unless `SIMPLED_ALLOW_DOWNGRADE=1` is set. This guards the
+   daemon, whose image is pinned to the simpled version. Instead of an env spec
+   hash, the step compares the gateway's routing config that runs with the one about
+   to replace it: both are content-addressed Swarm configs, and configs can be read
+   back, so it prints the changed lines. A deploy from a stale checkout shows in the
+   log as routes it removes.
 4. **One deploy at a time per swarm.** `step lock` creates the config
    `simpled_deploy_lock`, labelled with the deployment, the host and the time.
    Creating a config whose name already exists fails, and Raft keeps that consistent
    across the cluster, so it works as a cluster-wide lock. A second deploy waits up to
-   10 minutes, then fails, naming who holds the lock. A lock older than 30 minutes
-   counts as stale, and `step unlock --force` clears it. `deploy.sh` removes the lock
-   on exit through a `trap`, also when a step fails.
+   10 minutes (`SIMPLED_LOCK_WAIT`), then fails, naming who holds the lock. When that
+   lock is older than 30 minutes, the error says the deploy holding it probably
+   died, and that `step unlock --force` clears it; nothing is broken automatically.
+   The lock carries a random token, so `step unlock` only releases this deploy's
+   own lock. `deploy.sh` releases it on exit through a `trap`, also when a step
+   fails.
 
 Out of scope: removing a deployment from the env spec leaves its stack running, since
 nothing deletes it. The gateway stops routing to it. A later

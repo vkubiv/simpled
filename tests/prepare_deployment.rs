@@ -621,7 +621,9 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
         args
     );
     let ingress = read(&out.join("ingress").join("docker-compose.yaml"));
-    assert!(!ingress.contains("deploy:"), "{}", ingress);
+    for key in ["mode: global", "placement:"] {
+        assert!(!ingress.contains(key), "{}", ingress);
+    }
 }
 
 #[test]

@@ -287,6 +287,288 @@ pub fn run_job(
     ))
 }
 
+// ---------------------------------------------------------------- lock
+
+/// The Swarm config that is the cluster-wide deploy lock. Creating a config whose
+/// name exists fails, and Raft keeps that consistent across every manager.
+pub const LOCK_NAME: &str = "simpled_deploy_lock";
+
+/// Who holds the lock, from its labels.
+struct LockHolder {
+    deployment: String,
+    host: String,
+    since: u64,
+    token: String,
+}
+
+fn lock_holder(docker: &dyn Docker) -> Result<Option<LockHolder>> {
+    let output = docker.run(&["config", "inspect", LOCK_NAME, "--format", "{{json .Spec.Labels}}"])?;
+    if !output.success {
+        return Ok(None);
+    }
+    let labels: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap_or_default();
+    let label = |key: &str| labels[key].as_str().unwrap_or("unknown").to_string();
+    Ok(Some(LockHolder {
+        deployment: label("simpled.lock.deployment"),
+        host: label("simpled.lock.host"),
+        since: labels["simpled.lock.since"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        token: label("simpled.lock.token"),
+    }))
+}
+
+/// Timing of `lock`, apart so tests need not wait.
+pub struct LockTiming {
+    /// How long to wait for another deploy to release the lock.
+    pub wait: Duration,
+    pub poll: Duration,
+    /// A lock older than this is reported as probably left by a deploy that died.
+    pub stale_after: Duration,
+}
+
+/// Takes the swarm's deploy lock for `deployment`, waiting while another deploy
+/// holds it. Returns the token `unlock` needs, so a deploy only ever releases its
+/// own lock. `lock_file` is where the config's content is written first.
+pub fn lock(
+    docker: &dyn Docker,
+    deployment: &str,
+    host: &str,
+    now: &dyn Fn() -> u64,
+    lock_file: &Path,
+    timing: &LockTiming,
+) -> Result<String> {
+    let started = Instant::now();
+    let since = now();
+    let token = {
+        let seed = format!(
+            "{}:{}:{}:{:?}",
+            deployment,
+            host,
+            std::process::id(),
+            std::time::SystemTime::now()
+        );
+        object_name("t", seed.as_bytes()).trim_start_matches("t_").to_string()
+    };
+    std::fs::write(
+        lock_file,
+        format!("Deploy of {} from {} since {}\n", deployment, host, since),
+    )
+    .with_context(|| format!("Cannot write {}", lock_file.display()))?;
+    let file = lock_file.to_string_lossy();
+    let labels = [
+        format!("simpled.lock.deployment={}", deployment),
+        format!("simpled.lock.host={}", host),
+        format!("simpled.lock.since={}", since),
+        format!("simpled.lock.token={}", token),
+    ];
+
+    let mut announced = false;
+    loop {
+        let mut args = vec!["config", "create"];
+        for label in &labels {
+            args.extend(["--label", label.as_str()]);
+        }
+        args.extend([LOCK_NAME, &file]);
+        let created = docker.run(&args)?;
+        if created.success {
+            let _ = std::fs::remove_file(lock_file);
+            eprintln!("Took the deploy lock.");
+            return Ok(token);
+        }
+        if !created.stderr.contains("already exists") && !created.stderr.contains("AlreadyExists") {
+            let _ = std::fs::remove_file(lock_file);
+            bail!("Cannot take the deploy lock: {}", created.stderr.trim());
+        }
+
+        let Some(holder) = lock_holder(docker)? else {
+            // Released between the two calls; try again right away.
+            continue;
+        };
+        let age = Duration::from_secs(now().saturating_sub(holder.since));
+        if started.elapsed() >= timing.wait {
+            let _ = std::fs::remove_file(lock_file);
+            let mut message = format!(
+                "Another deploy holds the swarm's deploy lock: deployment '{}' from {}, for {} minutes. \
+                 Gave up after waiting {} minutes; SIMPLED_LOCK_WAIT (seconds) waits longer.",
+                holder.deployment,
+                holder.host,
+                age.as_secs() / 60,
+                timing.wait.as_secs() / 60
+            );
+            if age >= timing.stale_after {
+                message.push_str(&format!(
+                    "\nA deploy does not take that long, so that one probably died. If nothing is deploying, \
+                     clear the lock with: ./simpled step unlock --force (or docker config rm {})",
+                    LOCK_NAME
+                ));
+            }
+            bail!(message);
+        }
+        if !announced {
+            eprintln!(
+                "Waiting for the deploy lock, held by deployment '{}' from {} for {} minutes...",
+                holder.deployment,
+                holder.host,
+                age.as_secs() / 60
+            );
+            announced = true;
+        }
+        std::thread::sleep(timing.poll);
+    }
+}
+
+/// Releases the deploy lock if `token` is the one it was taken with, or whoever
+/// holds it with `force`. A lock someone else holds is left alone.
+pub fn unlock(docker: &dyn Docker, token: Option<&str>, force: bool) -> Result<()> {
+    let Some(holder) = lock_holder(docker)? else {
+        return Ok(());
+    };
+    if !force && token != Some(holder.token.as_str()) {
+        eprintln!(
+            "The deploy lock is held by deployment '{}' from {}, not by this deploy; left alone.",
+            holder.deployment, holder.host
+        );
+        return Ok(());
+    }
+    checked(docker, &["config", "rm", LOCK_NAME])?;
+    eprintln!("Released the deploy lock.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------- check-gateway
+
+/// The gateway service of the ingress stack.
+pub const GATEWAY_SERVICE: &str = "ingress_traefik";
+
+/// Every deployment of an env spec redeploys the shared gateway from its own copy
+/// of the env spec. Before it does, this compares what runs with what is about to
+/// replace it:
+///
+/// - a gateway from a newer simpled is not replaced by an older one, unless
+///   `allow_downgrade`, since the daemon's image is pinned to that version;
+/// - when the gateway's routing changes, the change is printed, so a deploy from
+///   a stale checkout of the env spec shows in the log.
+///
+/// `lookup` gives the names `step sync-objects` exported for the plan's objects.
+pub fn check_gateway(
+    docker: &dyn Docker,
+    plan: &Plan,
+    deploy_dir: &Path,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    allow_downgrade: bool,
+) -> Result<()> {
+    let output = docker.run(&["service", "inspect", GATEWAY_SERVICE, "--format", "{{json .Spec}}"])?;
+    if !output.success {
+        return Ok(()); // The first deploy: no gateway yet.
+    }
+    let spec: serde_json::Value =
+        serde_json::from_str(output.stdout.trim()).context("Cannot read the gateway service's spec")?;
+    let running_version = spec["Labels"]["simpled.version"].as_str().unwrap_or("");
+    let deployed_by = spec["Labels"]["simpled.deployment"]
+        .as_str()
+        .unwrap_or("an unknown deployment");
+
+    if let (Ok(running), Ok(ours)) = (
+        semver::Version::parse(running_version),
+        semver::Version::parse(&plan.simpled_version),
+    ) {
+        if running > ours {
+            let message = format!(
+                "The gateway was deployed by simpled {} (deployment '{}'), newer than this deployment's simpled {}. \
+                 Deploying would put the older gateway back. Prepare this deployment with simpled {} or later, \
+                 or run deploy.sh with SIMPLED_ALLOW_DOWNGRADE=1 to do it anyway.",
+                running, deployed_by, ours, running
+            );
+            if !allow_downgrade {
+                bail!(message);
+            }
+            eprintln!("Warning: {} SIMPLED_ALLOW_DOWNGRADE is set, continuing.", message);
+        }
+    }
+
+    let running_configs = spec["TaskTemplate"]["ContainerSpec"]["Configs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for object in plan.objects.iter().filter(|o| o.kind == ObjectKind::Config) {
+        let Some(new_name) = lookup(&object.var) else {
+            continue;
+        };
+        let prefix = format!("{}_", object.base);
+        let Some(old_name) = running_configs
+            .iter()
+            .filter_map(|c| c["ConfigName"].as_str())
+            .find(|name| name.starts_with(&prefix))
+        else {
+            continue;
+        };
+        if old_name == new_name {
+            continue;
+        }
+        let data = checked(
+            docker,
+            &["config", "inspect", old_name, "--format", "{{json .Spec.Data}}"],
+        )?;
+        let old = serde_json::from_str::<String>(data.trim())
+            .ok()
+            .and_then(|b64| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            })
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let new = std::fs::read_to_string(deploy_dir.join(&object.file)).unwrap_or_default();
+        eprintln!(
+            "The gateway's {} changes (it was last deployed by deployment '{}'):",
+            object.base.trim_start_matches("gateway_"),
+            deployed_by
+        );
+        for line in line_changes(&old, &new, 40) {
+            eprintln!("  {}", line);
+        }
+        eprintln!(
+            "Every deployment of the env spec redeploys the gateway. If this checkout of the env spec is older \
+             than the one '{}' was deployed from, these changes undo newer ones.",
+            deployed_by
+        );
+    }
+    Ok(())
+}
+
+/// Lines only in `old` (`- `) and only in `new` (`+ `), in their order, at most
+/// `limit` of them. Not a minimal diff, but enough to see which routes changed.
+fn line_changes(old: &str, new: &str, limit: usize) -> Vec<String> {
+    let count = |text: &str| {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for line in text.lines() {
+            *counts.entry(line.to_string()).or_default() += 1;
+        }
+        counts
+    };
+    let (mut in_new, mut in_old) = (count(new), count(old));
+    let mut changes = Vec::new();
+    for line in old.lines() {
+        match in_new.get_mut(line) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => changes.push(format!("- {}", line)),
+        }
+    }
+    for line in new.lines() {
+        match in_old.get_mut(line) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => changes.push(format!("+ {}", line)),
+        }
+    }
+    if changes.len() > limit {
+        let more = changes.len() - limit;
+        changes.truncate(limit);
+        changes.push(format!("... and {} more changed lines", more));
+    }
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,16 +579,23 @@ mod tests {
     /// Answers each command from a table, by its first matching prefix, and
     /// records every call.
     struct FakeDocker {
-        answers: Vec<(String, bool, String)>,
+        answers: Vec<(String, bool, String, String)>,
         calls: RefCell<Vec<String>>,
     }
 
     impl FakeDocker {
         fn new(answers: &[(&str, bool, &str)]) -> Self {
+            let answers: Vec<(&str, bool, &str, &str)> =
+                answers.iter().map(|(p, ok, out)| (*p, *ok, *out, "boom")).collect();
+            Self::with_stderr(&answers)
+        }
+
+        /// Answers that also say what a failing command prints on stderr.
+        fn with_stderr(answers: &[(&str, bool, &str, &str)]) -> Self {
             FakeDocker {
                 answers: answers
                     .iter()
-                    .map(|(p, ok, out)| (p.to_string(), *ok, out.to_string()))
+                    .map(|(p, ok, out, err)| (p.to_string(), *ok, out.to_string(), err.to_string()))
                     .collect(),
                 calls: RefCell::new(Vec::new()),
             }
@@ -321,16 +610,16 @@ mod tests {
         fn run(&self, args: &[&str]) -> Result<DockerOutput> {
             let call = args.join(" ");
             self.calls.borrow_mut().push(call.clone());
-            let (success, stdout) = self
+            let (success, stdout, stderr) = self
                 .answers
                 .iter()
-                .find(|(prefix, _, _)| call.starts_with(prefix.as_str()))
-                .map(|(_, ok, out)| (*ok, out.clone()))
-                .unwrap_or((true, String::new()));
+                .find(|(prefix, _, _, _)| call.starts_with(prefix.as_str()))
+                .map(|(_, ok, out, err)| (*ok, out.clone(), if *ok { String::new() } else { err.clone() }))
+                .unwrap_or((true, String::new(), String::new()));
             Ok(DockerOutput {
                 success,
                 stdout,
-                stderr: if success { String::new() } else { "boom".to_string() },
+                stderr,
             })
         }
     }
@@ -535,5 +824,166 @@ mod tests {
         );
         assert!(err.contains("SIMPLED_OBJECT_1 is not set"), "{}", err);
         assert!(docker.calls().is_empty());
+    }
+
+    fn timing(wait_secs: u64) -> LockTiming {
+        LockTiming {
+            wait: Duration::from_secs(wait_secs),
+            poll: Duration::ZERO,
+            stale_after: Duration::from_secs(30 * 60),
+        }
+    }
+
+    #[test]
+    fn the_lock_is_taken_with_who_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = FakeDocker::new(&[]);
+        let token = lock(&docker, "shop", "ci-7", &|| 1000, &dir.path().join("lock"), &timing(60)).unwrap();
+        let create = docker
+            .calls()
+            .into_iter()
+            .find(|c| c.starts_with("config create"))
+            .unwrap();
+        assert!(
+            create.contains(
+                "--label simpled.lock.deployment=shop --label simpled.lock.host=ci-7 --label simpled.lock.since=1000"
+            ),
+            "{}",
+            create
+        );
+        assert!(
+            create.contains(&format!("--label simpled.lock.token={} simpled_deploy_lock", token)),
+            "{}",
+            create
+        );
+        assert!(!dir.path().join("lock").exists(), "the content file is cleaned up");
+    }
+
+    #[test]
+    fn a_held_lock_fails_after_the_wait_naming_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = r#"{"simpled.lock.deployment":"blog","simpled.lock.host":"ci-3","simpled.lock.since":"100","simpled.lock.token":"x"}"#;
+        let docker = FakeDocker::with_stderr(&[
+            ("config create", false, "", "Error response from daemon: rpc error: code = AlreadyExists desc = config simpled_deploy_lock already exists"),
+            ("config inspect simpled_deploy_lock", true, holder, ""),
+        ]);
+        // Held for 10 minutes: not stale yet.
+        let err = lock(&docker, "shop", "ci-7", &|| 700, &dir.path().join("lock"), &timing(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deployment 'blog' from ci-3, for 10 minutes"), "{}", err);
+        assert!(!err.contains("probably died"), "{}", err);
+
+        // Held for an hour: probably left by a deploy that died.
+        let err = lock(&docker, "shop", "ci-7", &|| 3700, &dir.path().join("lock"), &timing(0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("probably died") && err.contains("./simpled step unlock --force"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn only_the_holder_releases_the_lock_unless_forced() {
+        let holder = r#"{"simpled.lock.deployment":"blog","simpled.lock.host":"ci-3","simpled.lock.since":"100","simpled.lock.token":"abc"}"#;
+        let docker = FakeDocker::new(&[("config inspect simpled_deploy_lock", true, holder)]);
+        unlock(&docker, Some("other"), false).unwrap();
+        assert!(!docker.calls().iter().any(|c| c.starts_with("config rm")));
+        unlock(&docker, Some("abc"), false).unwrap();
+        assert!(docker.calls().iter().any(|c| c == "config rm simpled_deploy_lock"));
+
+        let forced = FakeDocker::new(&[("config inspect simpled_deploy_lock", true, holder)]);
+        unlock(&forced, None, true).unwrap();
+        assert!(forced.calls().iter().any(|c| c == "config rm simpled_deploy_lock"));
+
+        // No lock at all: nothing to do.
+        let none = FakeDocker::new(&[("config inspect", false, "")]);
+        unlock(&none, Some("abc"), false).unwrap();
+        assert_eq!(none.calls().len(), 1);
+    }
+
+    fn gateway_plan(version: &str) -> Plan {
+        Plan {
+            simpled_version: version.to_string(),
+            owner_label: "simpled.scope=environment".to_string(),
+            objects: vec![object(
+                ObjectKind::Config,
+                "gateway_dynamic_conf.yml",
+                "ingress/traefik/dynamic_conf.yml",
+                "G_2",
+            )],
+            jobs: vec![],
+        }
+    }
+
+    fn gateway_spec(version: &str, config: &str) -> String {
+        format!(
+            r#"{{"Labels":{{"simpled.version":"{}","simpled.deployment":"blog"}},"TaskTemplate":{{"ContainerSpec":{{"Configs":[{{"ConfigName":"{}"}}]}}}}}}"#,
+            version, config
+        )
+    }
+
+    #[test]
+    fn an_older_simpled_does_not_replace_a_newer_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, &gateway_spec("2.1.0", "x"))]);
+        let err = check_gateway(&docker, &gateway_plan("2.0.0"), dir.path(), &|_: &str| None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("deployed by simpled 2.1.0 (deployment 'blog'), newer than this deployment's simpled 2.0.0"),
+            "{}",
+            err
+        );
+        assert!(check_gateway(&docker, &gateway_plan("2.0.0"), dir.path(), &|_: &str| None, true).is_ok());
+        assert!(check_gateway(&docker, &gateway_plan("2.1.0"), dir.path(), &|_: &str| None, false).is_ok());
+    }
+
+    #[test]
+    fn the_first_deploy_has_no_gateway_to_check() {
+        let docker = FakeDocker::new(&[("service inspect", false, "")]);
+        let dir = tempfile::tempdir().unwrap();
+        check_gateway(&docker, &gateway_plan("2.0.0"), dir.path(), &|_: &str| None, false).unwrap();
+    }
+
+    #[test]
+    fn a_routing_change_is_shown_against_what_runs() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ingress/traefik")).unwrap();
+        std::fs::write(
+            dir.path().join("ingress/traefik/dynamic_conf.yml"),
+            "http:\n  routers:\n    shop: a\n",
+        )
+        .unwrap();
+        let old = base64::engine::general_purpose::STANDARD.encode("http:\n  routers:\n    shop: a\n    blog: b\n");
+        let docker = FakeDocker::new(&[
+            (
+                "service inspect",
+                true,
+                &gateway_spec("2.0.0", "gateway_dynamic_conf.yml_old"),
+            ),
+            (
+                "config inspect gateway_dynamic_conf.yml_old",
+                true,
+                &format!("\"{}\"", old),
+            ),
+        ]);
+        let lookup = |v: &str| (v == "G_2").then(|| "gateway_dynamic_conf.yml_new".to_string());
+        check_gateway(&docker, &gateway_plan("2.0.0"), dir.path(), &lookup, false).unwrap();
+        assert!(docker
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("config inspect gateway_dynamic_conf.yml_old")));
+        assert_eq!(
+            line_changes(
+                "http:\n  routers:\n    shop: a\n    blog: b\n",
+                "http:\n  routers:\n    shop: a\n",
+                40
+            ),
+            vec!["-     blog: b"]
+        );
     }
 }

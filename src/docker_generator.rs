@@ -550,6 +550,19 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     )?;
     writeln!(deploy_sh, "chmod +x ./simpled")?;
     writeln!(deploy_sh)?;
+    writeln!(
+        deploy_sh,
+        "# One deploy at a time per swarm. The lock is released when this script exits,"
+    )?;
+    writeln!(deploy_sh, "# also when a step fails.")?;
+    writeln!(
+        deploy_sh,
+        "lock=\"$(./simpled step lock {})\"",
+        sh_quote(&deployment.name)
+    )?;
+    writeln!(deploy_sh, "eval \"${{lock}}\"")?;
+    writeln!(deploy_sh, "trap './simpled step unlock' EXIT")?;
+    writeln!(deploy_sh)?;
     write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
     if single_node(resolved_spec) {
         writeln!(
@@ -650,6 +663,9 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     }
     writeln!(deploy_sh)?;
 
+    // Every deployment of the env spec redeploys the shared gateway from its own
+    // copy of the env spec, so what runs is checked first.
+    writeln!(deploy_sh, "./simpled step check-gateway {}", INGRESS_PLAN)?;
     // --prune removes services that still carry the stack label but are no
     // longer in the file, e.g. after the ingress type was switched.
     writeln!(
@@ -996,7 +1012,12 @@ fn generate_traefik_swarm(
     writeln!(stack, "services:")?;
     writeln!(stack, "  traefik:")?;
     writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
-    write_swarm_ingress_deploy(&mut stack, &resolved_spec.ingress, single_node(resolved_spec))?;
+    write_swarm_ingress_deploy(
+        &mut stack,
+        &resolved_spec.ingress,
+        single_node(resolved_spec),
+        &resolved_spec.current_deployment.name,
+    )?;
     write_swarm_host_ports(&mut stack, has_tls)?;
 
     // The gateway's own files are Swarm configs, owned by the environment rather
@@ -1099,14 +1120,27 @@ fn write_traefik_trusted_ips(file: &mut File, trusted_proxies: &[String]) -> Res
     Ok(())
 }
 
-/// `deploy:` of the gateway service, written only when the env spec asks for
-/// global mode or a placement, or `multi_node: false` pins it, so the stack is
-/// otherwise what it always was.
-fn write_swarm_ingress_deploy(stack: &mut File, ingress: &IngressResolvedSpec, pin: bool) -> Result<()> {
-    if !ingress.global && ingress.placement.is_none() && !pin {
-        return Ok(());
-    }
+/// `deploy:` of the gateway service. Its labels name the simpled version and the
+/// deployment that deployed it, which `step check-gateway` reads back on the next
+/// deploy. Service labels change no task, so they restart nothing.
+fn write_swarm_ingress_deploy(
+    stack: &mut File,
+    ingress: &IngressResolvedSpec,
+    pin: bool,
+    deployment: &str,
+) -> Result<()> {
     writeln!(stack, "    deploy:")?;
+    writeln!(stack, "      labels:")?;
+    writeln!(
+        stack,
+        "        simpled.version: {}",
+        serde_json::to_string(env!("CARGO_PKG_VERSION"))?
+    )?;
+    writeln!(
+        stack,
+        "        simpled.deployment: {}",
+        serde_json::to_string(deployment)?
+    )?;
     if ingress.global {
         writeln!(stack, "      mode: global")?;
     }
