@@ -26,7 +26,8 @@ Goals:
   it the same way it routes to any service.
 - **The same API locally.** `simpled local run` serves it in-process.
 - **Fix the multi-node gaps of the Swarm target** that need something running there
-  (§7), above all Let's Encrypt with `gateway.global: true`.
+  (§7), above all Let's Encrypt with `gateway.global: true`. The gaps that need no
+  daemon are fixed by the Swarm storage changes in simpled 2.0.0 (§8).
 
 Non-goals for now: Kubernetes, multi-environment fleet views, a web UI, metrics
 storage, and alerting. The daemon reports the current state. History lives elsewhere.
@@ -99,8 +100,9 @@ effectively root on the host. Mitigations:
 - `read_only: true` root filesystem, no capabilities, and a non-root user in the
   group that owns the socket.
 
-The daemon needs write access to Docker from Phase 3 on (§7.1: configs and the state
-store), so a GET-only socket proxy would only be a stopgap and is not planned.
+The daemon needs write access to Docker from the ACME phase on (§7.1: it creates
+certificate secrets and updates the gateway service), so a GET-only socket proxy
+would only be a stopgap and is not planned.
 
 ---
 
@@ -140,7 +142,7 @@ How the tokens reach the daemon:
 
 | Target | Delivery |
 |---|---|
-| Swarm | Native Swarm secrets in the ingress stack (`secrets: simpled_read_token: file: ...`), named with a content hash because Swarm secrets are immutable. **Not** a bind mount: the daemon may run on another manager than the one that ran `deploy.sh` (§7.2). |
+| Swarm | Content-addressed Swarm secrets (§8.2). **Not** a bind mount: the daemon may run on another manager than the one that ran `deploy.sh`. |
 | Standalone | A bind mount of a file under `secrets/`, the same as deployment secrets today. |
 | Local | Read in-process. In `localenv.yaml` the tokens are optional while the gateway binds a loopback address. With `--bind 0.0.0.0` they are required, if `daemon.hosts` is set. |
 
@@ -213,7 +215,7 @@ updated.
  client ──► gateway ──── common_network ────► app services
               │
               └──── simpled_control (overlay, attachable: false) ──► daemon :8080 (API + public)
-                                                                     daemon :8081 (ACME challenges, cert feed)
+                                                                     daemon :8081 (ACME challenges)
 ```
 
 - `simpled_control` contains only the gateway and the daemon. App containers sit on
@@ -261,78 +263,65 @@ not, and those should be fixed without it.
   again. Let's Encrypt allows 5 duplicate certificates per week, so a few reschedules
   in a bad week lock the domain out.
 
-**With the daemon.** The daemon replaces Traefik as the ACME client, using the
-`instant-acme` crate:
+**With the daemon.** The daemon is the only ACME client, using the `instant-acme`
+crate. Traefik no longer runs ACME at all: it only reads PEM files.
 
 1. **Challenges.** Every gateway task, on every node, proxies
    `/.well-known/acme-challenge/*` to the daemon over `simpled_control`. It no longer
    matters which node the challenge lands on. This is what lifts the
    `global` + `letsencrypt` restriction.
-2. **Storage.** The ACME account key and the certificates must survive the daemon
-   moving to another node, without shared storage:
-   - *Swarm:* encrypted blobs in Swarm configs. Raft, the store the Swarm managers
-     replicate among themselves, holds both the configs and the key, so the state
-     survives the loss of any node. See §7.1.1 for the encryption.
-   - *Standalone:* a directory, `./daemon-state/`, mounted into the container.
-3. **Delivery to the gateways.** Traefik gets a second provider, `providers.http`,
-   polling `http://daemon:8081/traefik/tls` every 10 seconds. It returns only
-   `tls.certificates` with the PEM inline. Routes stay in the file provider, so
-   routing never depends on the daemon. Certificates are picked up without a
-   restart.
-4. **Renewal** happens 30 days before expiry, with a jittered retry. Expiry shows up
+2. **Certificates are Swarm secrets.** On issue or renewal, the daemon creates
+   `simpled_tls_<hash>` holding the certificate chain and the key, labelled
+   `simpled.tls.domains=…` and `simpled.tls.not_after=…`. Traefik loads it through
+   the file provider:
+   ```yaml
+   tls:
+     certificates:
+       - certFile: /run/secrets/simpled_tls_crt
+         keyFile:  /run/secrets/simpled_tls_key
+   ```
+   Secrets reach every node through Raft (the store the Swarm managers replicate
+   among themselves), so there is no shared storage and nothing to encrypt by hand.
+3. **Delivery.** The daemon runs a rolling `service update` of the gateway onto the
+   new secret, one task at a time, using the gateway's own `update` policy.
+   `deploy.sh` looks up the current certificate secret by label and passes it into
+   the ingress stack, so a redeploy keeps it. On the first deploy there is no secret
+   yet, so the gateway starts with Traefik's default certificate until the first
+   certificate is issued.
+4. **No state to keep.** The daemon never reads a certificate back: the domains and
+   the expiry date are in the labels, which the API returns. The ACME account is not
+   kept either. A new account on each daemon start is fine, because the rate limits
+   that matter are on certificates, not on accounts.
+5. **Renewal** happens 30 days before expiry, with a jittered retry. Expiry shows up
    in `GET /api/v1/gateway`, and `/health` reports `degraded` when a certificate is
    within 7 days of expiry.
-5. **Migration.** On its first start, the daemon imports an existing Traefik
-   `acme.json` (account and certificates) if it finds one, so upgrading does not
-   issue every certificate again.
+6. **Migration.** `simpled tls import acme.json` turns the certificates and keys in an
+   existing Traefik `acme.json`, where both are stored base64-encoded, into
+   `simpled_tls_*` secrets. Upgrading then issues nothing new.
+7. **Standalone Docker** has a single host, so the daemon writes the PEM files into a
+   directory that Traefik's file provider watches, and Traefik picks them up without
+   a restart.
 
-**Failure mode to accept.** A gateway task that *restarts* while the daemon is down
-serves Traefik's default certificate until the daemon is back. A running gateway
-keeps the certificates it last fetched. On Swarm the daemon is rescheduled within
-seconds, so this window is short and only affects restarted tasks.
+**What it costs.** Each renewal causes a rolling restart of the gateway, about every
+60 days. With host-mode ports and `stop-first`, each node drops its connections for
+the moment its task restarts. A load balancer that checks `/ping` stops sending to
+the node first. With DNS round-robin straight to the nodes, a few requests can fail
+once every two months.
 
-#### 7.1.1 Encrypting the state on Swarm
+**What it does not depend on.** Gateways never depend on the daemon at runtime. If
+the daemon is down, renewals wait, with 30 days of margin.
 
-- **The key** is 32 random bytes in the Swarm secret `simpled_state_key`. `deploy.sh`
-  creates it once and never touches it again:
-  `docker secret inspect simpled_state_key >/dev/null 2>&1 || head -c 32 /dev/urandom | docker secret create simpled_state_key -`.
-  Only the daemon service references it, so Swarm delivers it only to that task, in
-  memory, at `/run/secrets/simpled_state_key`.
-- **Each blob** is a config named `simpled_state_<kind>_<hash>`, holding
-  `version byte || 24-byte random nonce || XChaCha20-Poly1305 ciphertext`, using the
-  `chacha20poly1305` crate. The config name is the associated data, which ties each
-  ciphertext to its own name so blobs cannot be swapped. Configs are immutable, so a
-  write creates a new config, switches over to it, and deletes the old one.
-- **Why configs and not secrets:** the Docker API never returns a secret's contents,
-  so reading one means mounting it into a task, which would restart the daemon on
-  every renewal. Configs can be read back (`GET /configs/{id}`), but they are shown
-  in plaintext by `docker config inspect`, support dumps and API scrapers. Hence the
-  fixed key in a secret, and the changing data in configs encrypted under that key.
-- **The threat model:** this protects private keys from anything that can read
-  configs. It does not protect against root on a manager or access to the Docker
-  socket, because they can start a task that mounts the secret. Nothing inside Swarm
-  prevents that.
-- **Losing the key:** the state cannot be read. The daemon logs it, starts with an
-  empty store and issues the certificates again, which counts against the
-  rate limit.
-- **Rotating the key:** create `simpled_state_key_2` and mount both. The version byte
-  names the key a blob was encrypted with, and the daemon re-encrypts on its next
-  write.
-
-### 7.2 Bind-mounted files on a multi-node Swarm *(daemon: no, use Swarm configs)*
+### 7.2 Bind-mounted files on a multi-node Swarm *(daemon: no)*
 
 The generated stacks bind-mount files that exist only in the deploy directory of the
 node that ran `deploy.sh`: the gateway's `traefik.yml` and `dynamic_conf.yml`,
-and each deployment's `configs/` and `run/secrets/`. A task
-scheduled on any other node, which is every node with `global: true`, finds no bind
-source. Swarm rejects it, or, worse, the task starts against a directory that
-`mkdir -p` created empty on an earlier run.
+each deployment's `configs/` and `run/secrets/`, every named volume
+(`./volumes/<name>`) and every relative bind path. A task scheduled on any other
+node, which is every node with `global: true`, finds no bind source. Swarm rejects
+it, or, worse, the task starts against a directory that `mkdir -p` created empty on
+an earlier run.
 
-This does not need the daemon. **The fix is native Swarm `configs:` and `secrets:`
-in the stack files**, named with a content hash because they are immutable.
-`docker stack deploy` uploads them to Raft and every node gets them. It is worth
-doing before Phase 3, because the daemon's own tokens and the Traefik static config
-need it too.
+This does not need the daemon. It is fixed by the Swarm storage changes in §8.
 
 ### 7.3 "Is the deploy actually done?" for CI *(daemon: yes)*
 
@@ -357,44 +346,305 @@ the Docker API of a manager does not reach containers on other nodes:
 - Per-container CPU and memory stats from workers.
 - `docker image prune`, which today runs only on the node that ran `deploy.sh`, so
   worker disks fill up.
-- Warning when a service with a bind-mounted named volume (node-local data) gets
-  rescheduled to another node.
+- Free disk space per node, and per `node`-bound volume (§8.3).
 
 And with the manage token: restart, scale, rollback, re-running a failed job, and
 refreshing deferred `aws` secrets without a full redeploy.
 
 ---
 
-## 8. Phases
+## 8. Swarm storage (simpled 2.0.0)
+
+These are breaking changes, so they ship together as simpled 2.0.0. They do not
+depend on the daemon, and the daemon's certificates (§7.1) and tokens (§3) build on
+them.
+
+The principle: **every file a task needs either travels through Raft (configs,
+secrets), or belongs to a volume whose location the env spec declares.** Nothing
+relies on being on the node that ran `deploy.sh` without saying so.
+
+### 8.1 `multi_node`
+
+```yaml
+type: docker
+swarm_mode: true
+multi_node: true        # the default
+```
+
+- **`true`, the default:** the environment is treated as multi-node even when the
+  cluster has one node. Every rule in §8.3 and §8.4 applies, so a spec that passes
+  validation keeps working when nodes are added. You find out on a one-node cluster,
+  not after adding the second.
+- **`false`:** the environment lives on one machine. Unbound volumes and relative
+  bind paths are allowed, as in 1.x. Two safeguards keep that true:
+  1. **`deploy.sh` stops if the swarm has more than one schedulable node**, before it
+     creates or deploys anything. It counts the nodes that are `Ready` and `Active`
+     (`docker node ls --format '{{.Status}} {{.Availability}}'`). `deploy.sh` already
+     runs on a manager, so it can list nodes. A drained node does not count, because
+     it gets no tasks: a new node can join in `drain`, be prepared, and be activated
+     once the spec says `multi_node: true`. The message names the nodes and both ways
+     out:
+     ```
+     This swarm has 2 nodes that accept tasks (manager-1, worker-1), but the env spec
+     sets multi_node: false. Set multi_node: true and bind the volumes (simpled docs
+     reference --section volumes), or drain the extra nodes
+     (docker node update --availability drain worker-1).
+     ```
+  2. **Every service, job and the gateway is pinned to the node that runs
+     `deploy.sh`.** `deploy.sh` reads its own node ID with
+     `docker info --format '{{.Swarm.NodeID}}'` and passes it into the stacks as a
+     `node.id == …` constraint. The check alone runs only at deploy time, while Swarm
+     can reschedule a task onto a newly added node at any moment in between, after a
+     crash or a reboot. With one node the pin costs nothing.
+- `multi_node` is Swarm only, and is rejected anywhere else, like `gateway.global`.
+- `multi_node: false` together with `gateway.global: true` is an error: a gateway on
+  every node, but everything pinned to one node.
+
+### 8.2 Configs and secrets: content-addressed Swarm objects
+
+Every config file, file secret and gateway file (`traefik.yml`, `dynamic_conf.yml`,
+certificates) becomes a native Swarm config or secret, whatever `multi_node` says, so
+there is one mechanism in the generator.
+
+1. **Names carry a hash of the content:** `prod_db_password_3f9a1c2e`, truncated to
+   fit Swarm's 64-character limit. The same value gives the same name, so nothing
+   happens. A new value gives a new name, so it is a new object. Nothing is ever
+   modified, which is what makes Swarm's immutability painless.
+2. **`./simpled step sync-objects` creates them** (§8.5). It is idempotent: an object
+   that already exists under its hashed name is left alone. Each object is labelled
+   with its owner (`simpled.deployment=prod`, §8.6) and its spec name
+   (`simpled.secret=db_password`). The stack files reference them as
+   `external: true`. They are created by this step and not by `docker stack deploy`, because jobs run through
+   `docker service create` and need the objects to exist (`--secret source=…,target=…`),
+   and `aws` secrets exist as files only after `fetch-secrets.sh` has run on the target.
+3. **Swarm restarts only what changed.** A changed secret changes the service spec,
+   so Swarm does a rolling update of exactly the services that use it, following
+   their `update` policy.
+4. **Pruning.** After a successful deploy, every labelled object of the deployment
+   that is not current is removed, except the previous generation, so that
+   `docker service rollback` still works. `docker secret rm` refuses an object that a
+   service still uses, so the prune cannot break anything running.
+5. **Limits enforced by validation:**
+   - At most 500 KB per object. A larger config file fails with a clear message. It
+     never falls back to a bind mount without saying so.
+   - Configs accept any absolute target path. Whether secrets accept a target outside
+     `/run/secrets/` depends on the Docker version and has to be checked in a spike.
+     If it is not supported, a secret mounted elsewhere is a validation error on
+     Swarm.
+   - Mode `0444`, so a service that does not run as root can still read its secret.
+6. Env-variable secrets (`variable:`) are unchanged. They live in the service spec,
+   which already reaches every node.
+
+Standalone Docker keeps bind mounts, which are fine on a single host.
+
+### 8.3 Volumes: bound per volume in the env spec
+
+The app spec only names its volumes. In ports-and-adapters terms, the env spec is
+the adapter: it says where each volume lives in this environment.
+
+```yaml
+deployments:
+  prod:
+    volumes:
+      pg-data:
+        node: db-1                        # a Docker volume on db-1
+      uploads:
+        nfs: fs-12ab.efs.eu-west-1.amazonaws.com:/shop/uploads
+      media:
+        path: /mnt/shared/shop/media      # a host path that exists on every node
+      legacy-data:
+        node: app-1
+        path: /srv/shop/legacy            # a host directory on one node
+```
+
+| Binding | Generated | Where its services can run |
+|---|---|---|
+| `node` | A Docker named volume (local driver). Docker creates it on the node where the task lands, so a first deploy finds nothing missing. | Pinned with `node.hostname == <node>` |
+| `node` + `path` | A bind mount of that directory | Pinned to that node |
+| `path` | A bind mount of a path that must exist on every node, such as a shared mount | Anywhere |
+| `nfs` | A Docker volume with `type=nfs` driver options (`nfs: { address, path, options }` in the long form). Each node mounts it itself when a task needs it, so nodes need no `/etc/fstab` entry. | Anywhere |
+
+Exactly one of `node`, `path` (with or without `node`) or `nfs`.
+
+**A service follows its volumes**, so stateless is not a setting: a service without
+volumes runs anywhere. Validation, with `multi_node: true`:
+
+1. **An unbound volume is an error.** The error lists every unbound volume with a
+   ready-to-paste `volumes:` block.
+2. **A service mounting a pinned volume gets that node's constraint**, merged with its
+   own `placement`. Jobs get it too.
+3. **Two volumes pinned to different nodes on one service is an error**, since no
+   node can satisfy both.
+4. **A pinned volume with `update.order: start-first` is an error.** For a moment two
+   tasks would write the same directory, which is how a database gets corrupted.
+   Swarm's default `stop-first` is required.
+5. **`replicas > 1` on a pinned volume is a warning.** Every replica lands on the same
+   node and shares the directory.
+6. **A database image on `nfs` or a shared `path` is a warning:** postgres, mysql,
+   mariadb or mongo, matched by image name. NFS locking and fsync semantics are a
+   known source of corrupted databases.
+7. A binding for a volume the app spec does not declare is an error, as with any
+   unknown name.
+
+`path` and `nfs` also work on standalone Docker. `node` is Swarm only. Local runs and
+Kubernetes are unchanged.
+
+**Migrating from 1.x:** data lives in `<deploy dir>/<deployment>/volumes/<name>` on the
+node that ran `deploy.sh`. Binding the volume with `node` plus a `path` pointing at
+that directory keeps the data where it is.
+
+### 8.4 Relative bind paths
+
+`./data:/x`, whether in the app spec or in a deployment's service `volumes`, is a
+directory on whichever node ran `deploy.sh`. With `multi_node: true` it is an error on
+Swarm, and the message points to the alternatives: a config for files the service
+only reads, or a named volume bound in the env spec for anything it writes.
+Absolute host paths (`/var/run/docker.sock:/var/run/docker.sock`) stay allowed,
+because they name something that exists on every node by intent.
+
+### 8.5 Deploy steps: `deploy.sh` calls the simpled binary
+
+`deploy.sh` stays the readable outline of a deploy: its order, its phases and every
+`docker stack deploy` are visible. The steps that would otherwise be a lot of generated
+shell become calls to a simpled binary shipped next to it.
+
+```sh
+#!/bin/sh
+set -e
+cd "$(dirname "$0")"
+
+. ./fetch-secrets.sh
+./simpled step lock shop
+./simpled step check-nodes                 # only with multi_node: false
+./simpled step sync-objects                # environment objects (ingress/plan.json)
+./simpled step sync-objects shop           # this deployment's objects (shop/plan.json)
+
+docker stack deploy -c ingress/docker-compose.yaml ingress --prune --detach=false
+
+echo '== Phase 1/3: services the jobs depend on =='
+docker stack deploy -c shop/docker-compose.deps.yaml shop --with-registry-auth --detach=false
+echo '== Phase 2/3: jobs =='
+./simpled step run-job shop migrate
+echo '== Phase 3/3: the rest of the stack =='
+docker stack deploy -c shop/docker-compose.yaml shop --with-registry-auth --prune --detach=false
+
+./simpled step prune-objects shop          # keeps the previous generation for rollback
+./simpled step unlock shop
+```
+
+**What moves into steps:** `run_job` (today it builds a `docker service create` of
+about 30 lines per job and polls the result), `wait_healthy` on standalone Docker,
+creating and pruning objects (§8.2), the node check (§8.1), the node-ID pin, and later
+the lookup of the certificate secret (§7.1). `docker stack deploy` and
+`fetch-secrets.sh` stay shell.
+
+**The binary.** `prepare-deployment` puts `docker-deploy/simpled` next to
+`deploy.sh`, so the same `rsync` carries it and the version on the server is always
+the one that prepared the deployment:
+
+- When `prepare-deployment` runs on Linux on the same CPU type as the target, it
+  copies itself.
+- Otherwise it downloads that same version's release asset for the target and
+  verifies its checksum. This is what `simpled update` already does
+  (`bundle_repo/gh_release.rs`), so the code exists.
+- The target is `linux-amd64` unless the env spec sets
+  `docker.target_platform: linux-arm64`. It belongs in the env spec because the
+  platform is a property of the environment.
+
+`step` commands are hidden from the main `--help`. Each one prints what it does
+(`created prod_db_password_3f9a1c2e`, `job migrate: completed in 14s`), so the deploy
+log reads as before.
+
+**Plans.** Steps read only a plan written by `prepare-deployment`, never the env or app
+spec. Those cannot be resolved again on the server: they depend on CI environment
+variables, on files next to the spec, on `extends`, and on the downloaded bundle.
+
+| File | Holds |
+|---|---|
+| `ingress/plan.json` | The environment: gateway, daemon, environment objects, `multi_node`, the env spec hash, the simpled version |
+| `<deployment>/plan.json` | One deployment: its objects with their hashes, its jobs, constraints and phases |
+
+A plan never holds secret values, only names, hashes and file paths; the values stay
+in the secret files. It is its own struct with its own format, not a serialization of
+`EnvironmentResolvedSpec`, so refactoring the resolver does not change the file.
+
+### 8.6 Several deployments in one env spec
+
+Every deployment of an env spec is deployed on its own, into its own stack, and every
+`deploy.sh` also redeploys the ingress stack from the full env spec. What keeps them
+from interfering with each other:
+
+1. **One directory per deployment on the target**, for example
+   `rsync -a docker-deploy/ host:~/deploy/shop/`. The reference recommends this layout.
+   Nothing generated is shared between two deployments: each has its own
+   `deploy.sh`, binary, plans and `ingress/` copy.
+2. **Owners on every object, and pruning that stays within its owner.** Deployment
+   objects are labelled `simpled.deployment=<name>`, and `prune-objects shop` touches
+   only those. Environment objects (gateway files, daemon tokens, certificates) are
+   labelled `simpled.scope=environment`, and only the ingress side prunes them.
+3. **No downgrades of the environment.** The ingress stack is labelled with the
+   simpled version and the env spec hash that produced it. A deploy that would
+   replace it with a lower simpled version stops, unless it is given
+   `--allow-downgrade`. This guards the daemon, whose image is pinned to the simpled
+   version. A different env spec hash is allowed, but the step prints what changed in
+   the environment plan (for example "gateway host `ops` added"), so a deploy from a
+   stale checkout shows in the log.
+4. **One deploy at a time per swarm.** `step lock` creates the config
+   `simpled_deploy_lock`, labelled with the deployment, the host and the time.
+   Creating a config whose name already exists fails, and Raft keeps that consistent
+   across the cluster, so it works as a cluster-wide lock. A second deploy waits up to
+   10 minutes, then fails, naming who holds the lock. A lock older than 30 minutes
+   counts as stale, and `step unlock --force` clears it. `deploy.sh` removes the lock
+   on exit through a `trap`, also when a step fails.
+
+Out of scope: removing a deployment from the env spec leaves its stack running, since
+nothing deletes it. The gateway stops routing to it. A later
+`step remove-deployment` can handle that.
+
+### 8.7 What 2.0.0 breaks
+
+| 1.x spec | 2.0.0 |
+|---|---|
+| Swarm, named volumes without a binding | Error with a ready-to-paste block. Or set `multi_node: false` to keep the 1.x behavior on one node. |
+| Swarm, relative bind paths | Error. Or `multi_node: false`. |
+| Swarm, config or secret files on a shared volume | Nothing to change: they become Swarm objects automatically. |
+| Target on a different CPU type than CI (for example arm64) | Set `docker.target_platform`. |
+| `gateway.type: nginx`, `tls.secret` on Docker | Already rejected (removed before 2.0.0). |
+
+---
+
+## 9. Phases
 
 1. **Replace the sidecar.** Add the `simpled daemon` subcommand, the version route
    reading labels, the labels added in `prepare-deployment`, the image in
    `release.yml`, the daemon in the ingress stack (Swarm) and `deploy.sh`
    (standalone), and the `simpled_control` network. Remove
    `simpled-version-<deployment>`. Behavior does not change.
-2. **Status.** Public `/health`, `gateway.daemon` in the spec, tokens, the private
-   read API, logs, the local mount, `simpled status`, `simpled logs` and
-   `simpled wait`.
-   - **Prerequisite (7.2):** Swarm configs and secrets instead of bind mounts. This
-     can ship on its own, before or alongside this phase.
-3. **ACME.** The state store, challenges, delivery to Traefik, renewal,
-   import of `acme.json`, and lifting the `global` + `letsencrypt` rejection.
-4. **Manage.** Restart, scale and rollback with the manage token.
-5. **Agent mode.** A global per-node daemon for stats, prune and volume warnings.
+2. **simpled 2.0.0: Swarm storage and deploy steps (§8).** `multi_node`,
+   content-addressed configs and secrets, volume bindings, the relative-path rule,
+   `simpled step` with the shipped binary and the plans, the lock and the downgrade
+   guard. This does not depend on the daemon and can ship before phase 1, or
+   together with it.
+3. **Status.** Public `/health`, `gateway.daemon` in the spec, tokens (as Swarm
+   secrets, §8.2), the private read API, logs, the local mount, `simpled status`,
+   `simpled logs` and `simpled wait`.
+4. **ACME.** Challenges, certificates as secrets, the rolling gateway update, renewal,
+   `simpled tls import`, and lifting the `global` + `letsencrypt` rejection.
+5. **Manage.** Restart, scale and rollback with the manage token.
+6. **Agent mode.** A global per-node daemon for stats, prune and disk space.
 
 ---
 
-## 9. Open questions
+## 10. Open questions
 
 1. **Always on, or opt-in?** This draft runs the daemon in every Docker environment,
    because it replaces the version sidecar and later issues certificates. That means
    every environment now has a container with the Docker socket. The alternative is
    `gateway.daemon.enabled: false`, which brings back a static version answer with
    no health.
-2. **Traefik provider details, to confirm in a spike:** that `providers.http` on
-   v2.10 accepts PEM inline in `tls.certificates` (it should, since `certFile` is
-   file-or-content), and how it behaves when the endpoint is down at startup.
-3. **Health of excluded or zero-replica services.** These probably do not count
+2. **Secret target paths, to confirm in a spike:** whether Swarm secrets accept an
+   absolute target outside `/run/secrets/` on the Docker versions you run (§8.2).
+4. **Health of excluded or zero-replica services.** These probably do not count
    toward health, but some services are scaled to 0 on purpose.
-4. **Several deployments on one domain.** `/health` follows `/version`'s ownership
+5. **Several deployments on one domain.** `/health` follows `/version`'s ownership
    rule. A shared domain that no deployment owns answers neither.
