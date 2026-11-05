@@ -4,6 +4,7 @@ use std::path::Path;
 
 mod app_bundle;
 mod bundle_repo;
+mod client;
 mod daemon;
 mod deploy_plan;
 mod deploy_steps;
@@ -70,6 +71,58 @@ enum Commands {
     Step {
         #[command(subcommand)]
         command: StepCommands,
+    },
+
+    /// Every deployment's version, health and services, from the simpled daemon.
+    /// Reads the API's address from the env spec here (gateway.daemon.hosts)
+    /// and the token from SIMPLED_TOKEN
+    Status {
+        /// The API's base instead, e.g. https://ops.example.com/api/v1
+        #[arg(long)]
+        url: Option<String>,
+        /// Print the API's JSON answer
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// A service's log, from the simpled daemon. On Swarm, every task's lines
+    Logs {
+        deployment: String,
+        service: String,
+        /// Keep printing new lines
+        #[arg(short, long)]
+        follow: bool,
+        /// Lines from the end of each task's log, or `all` (default 200)
+        #[arg(long)]
+        tail: Option<String>,
+        /// Only lines newer than this: 30s, 10m, 2h, 1d, or Unix seconds
+        #[arg(long)]
+        since: Option<String>,
+        /// Prefix every line with its time
+        #[arg(long)]
+        timestamps: bool,
+        /// The API's base instead of the one in the env spec
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Waits until a deployment reports a version as healthy and converged, on
+    /// its primary host's public /.well-known/simpled/health. For CI, after
+    /// deploy.sh. Needs no token
+    Wait {
+        deployment: String,
+        /// The version just deployed
+        #[arg(long)]
+        version: String,
+        /// Give up after this long
+        #[arg(long, default_value = "10m")]
+        timeout: String,
+        /// Between two checks
+        #[arg(long, default_value = "5s")]
+        interval: String,
+        /// The health URL instead of the one from the env spec
+        #[arg(long)]
+        url: Option<String>,
     },
 
     /// The gateway's certificates on Docker Swarm
@@ -368,6 +421,59 @@ fn main() -> Result<()> {
         }
         Commands::Step { command } => {
             step_command(command)?;
+        }
+        Commands::Status { url, json } => {
+            let base = match url {
+                Some(url) => url.trim_end_matches('/').to_string(),
+                None => client::api_base(&spec_loader::load_env_spec(Path::new("."), None, 0)?)?,
+            };
+            client::status(&base, *json)?;
+        }
+        Commands::Logs {
+            deployment,
+            service,
+            follow,
+            tail,
+            since,
+            timestamps,
+            url,
+        } => {
+            let base = match url {
+                Some(url) => url.trim_end_matches('/').to_string(),
+                None => client::api_base(&spec_loader::load_env_spec(Path::new("."), None, 0)?)?,
+            };
+            client::logs(
+                &base,
+                &client::LogArgs {
+                    deployment,
+                    service,
+                    follow: *follow,
+                    tail: tail.as_deref(),
+                    since: since.as_deref(),
+                    timestamps: *timestamps,
+                },
+            )?;
+        }
+        Commands::Wait {
+            deployment,
+            version,
+            timeout,
+            interval,
+            url,
+        } => {
+            let url = match url {
+                Some(url) => url.clone(),
+                None => client::health_url(
+                    &spec_loader::load_env_spec(Path::new("."), Some(deployment), 0)?,
+                    deployment,
+                )?,
+            };
+            client::wait(
+                &url,
+                version,
+                client::parse_duration(timeout)?,
+                client::parse_duration(interval)?,
+            )?;
         }
         Commands::Tls {
             command: TlsCommands::Import { file },

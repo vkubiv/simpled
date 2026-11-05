@@ -138,7 +138,7 @@ pub fn log_query(params: &HashMap<String, String>, now: i64) -> Result<LogQuery,
 }
 
 /// `30s`, `10m`, `2h`, `1d`.
-fn parse_duration(value: &str) -> Option<Duration> {
+pub fn parse_duration(value: &str) -> Option<Duration> {
     let (number, unit) = value.split_at(value.len().checked_sub(1)?);
     let n: u64 = number.parse().ok()?;
     let seconds = match unit {

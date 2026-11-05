@@ -255,7 +255,15 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
             cd /opt/deployments/myapp_prod/docker-deploy && sudo ./deploy.sh
+
+      - name: Wait until the new version serves
+        working-directory: environments/prod
+        run: simpled wait myapp_prod --version ${{ inputs.version }} --timeout 10m
 ```
+
+`deploy.sh` returns once the stack has been updated. `simpled wait` then polls the
+deployment's public health until every service runs the new version and is healthy,
+so the job fails when a release never comes up rather than when someone notices.
 
 `docker-deploy/` holds a `simpled` binary that `deploy.sh` runs for its harder steps.
 On an `ubuntu-latest` runner it is a copy of the simpled that prepared the
