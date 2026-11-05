@@ -563,10 +563,10 @@ the one that prepared the deployment:
 - The target is `linux-amd64` unless the env spec sets the top-level
   `target_platform: linux-arm64` (Swarm only). It belongs in the env spec because
   the platform is a property of the environment.
-- **Open:** releases build no `simpled_linux_arm64` asset yet, so for an arm64
-  target the download fails with a message pointing to `--target-binary`. The
-  release workflow needs an `aarch64-unknown-linux-gnu` build, ideally static
-  (musl) for both Linux targets.
+- Releases from 2.0.1 on build `simpled_linux_arm64` (`aarch64-unknown-linux-gnu`,
+  natively on GitHub's arm64 runner). **Open:** both Linux binaries link glibc
+  dynamically, so a target needs a glibc no older than the runner's; static (musl)
+  builds would remove that.
 - Before acting, every step checks that its plan was written by the same simpled
   version, so files from two prepares mixed on a target fail loudly.
 
@@ -635,7 +635,7 @@ nothing deletes it. The gateway stops routing to it. A later
 | Swarm, named volumes without a binding | Error with a ready-to-paste block. Or set `multi_node: false` to keep the 1.x behavior on one node. |
 | Swarm, relative bind paths | Error. Or `multi_node: false`. |
 | Swarm, config or secret files on a shared volume | Nothing to change: they become Swarm objects automatically. |
-| Target on a different CPU type than CI (for example arm64) | Set `target_platform`, and pass `--target-binary` until releases build an arm64 binary. |
+| Target on a different CPU type than CI (for example arm64) | Set `target_platform`. 2.0.0 also needs `--target-binary`; 2.0.1 releases the arm64 binary. |
 | `gateway.type: nginx`, `tls.secret` on Docker | Rejected. Removed on main after 1.13.1, so first released in 2.0.0. |
 | Several deployments sharing one directory on the target | Each needs its own directory (§8.6). |
 
