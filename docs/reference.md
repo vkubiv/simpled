@@ -606,20 +606,46 @@ Every gateway host answers `GET /.well-known/simpled/version` with what was last
 {"application":"shop","version":"1.2.3","deployment":"prod","deployed_at":1790945826}
 ```
 
-`deployed_at` is when `prepare-deployment` ran (Unix seconds), so a redeploy of the same version is visible too. A deploy pipeline can poll the endpoint until it reports the version it just shipped. The answer says the deployment's stack was updated, not that every service in it is healthy.
+On Docker, `deployed_at` is when `deploy.sh` ran; on Kubernetes, when `prepare-deployment` ran (Unix seconds). Either way a redeploy of the same version is visible too.
 
-There is nothing to configure. The gateway is shared by every deployment of an env spec and rewritten by each of their deploys, so it cannot hold the versions itself. Instead every deployment ships one extra service, `simpled-version-<deployment>` (nginx, a few MB of memory), and the gateway routes the path on each host to the deployment that owns that host:
+On Docker the host also answers `GET /.well-known/simpled/health`, with status 200 only when the deployment is healthy, so an uptime check needs no JSON:
+
+```json
+{"status":"healthy","converged":true,"version":"1.2.3"}
+```
+
+| `status` | When |
+|---|---|
+| `down` | a service that should run has no task (Swarm) or container (standalone) running, or the deployment has no services |
+| `degraded` | a service runs fewer tasks than it should, or a container fails its healthcheck |
+| `healthy` | neither |
+
+`converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
+
+There is nothing to configure. A host belongs to a deployment:
 
 - a host only one deployment routes to belongs to that deployment;
 - a host several deployments route to belongs to the one whose `primary_host` it is, and gets no endpoint when that is none of them or more than one.
 
-| Target | How the path is routed |
+| Target | Who answers |
 |---|---|
-| Docker, Traefik | a `Host() && Path()` router per host |
-| Kubernetes | a separate Ingress, `<gateway>--simpled-version`, so the main Ingress's `rewrite-target` does not apply to it |
-| Local | answered by the local gateway itself, with no extra container |
+| Docker | the environment's daemon, `simpled daemon`, next to the gateway. Traefik routes both paths on each host to it with a `Host() && (Path() \|\| Path())` router. See [The simpled daemon](#the-simpled-daemon-docker). |
+| Kubernetes | every deployment ships `simpled-version-<deployment>` (nginx, a few MB of memory), routed by a separate Ingress, `<gateway>--simpled-version`, so the main Ingress's `rewrite-target` does not apply to it. No `health`. |
+| Local | the local gateway itself, with no extra container |
 
-The service listens on 80 inside its network and publishes no host port on Docker.
+#### The simpled daemon (Docker)
+
+The gateway is shared by every deployment of an env spec and rewritten by each of their deploys, so it cannot hold the versions itself. On Docker, one daemon per environment answers for all of them. It reads the state of the running services through the Docker API, and finds a deployment's services by the labels `prepare-deployment` puts on each of them: `simpled.deployment`, `simpled.application`, `simpled.version`, `simpled.deployed_at` and `simpled.service`. On Swarm these are service labels, so a deploy that only moves `deployed_at` restarts nothing.
+
+| | Swarm | Standalone |
+|---|---|---|
+| Runs as | service `daemon` of the `ingress` stack, on a manager node | container `simpled-daemon`, started by `deploy.sh` before the gateway |
+| Image | `ghcr.io/vkubiv/simpled:<version>`, the version that prepared the deployment; `SIMPLED_DAEMON_IMAGE=<image> ./deploy.sh` overrides it | the same |
+| Config | `ingress/daemon/daemon.json`, as a Swarm config | `daemon/daemon.json`, bind-mounted |
+| Network | `simpled_control`, an overlay network only the gateway and the daemon are on | `simpled_control`, a bridge network, the same way |
+| Docker access | `/var/run/docker.sock`. As root, since the daemon may run on another manager than the one running `deploy.sh`, whose `docker` group may have another number. Read-only filesystem, no capabilities. | `/var/run/docker.sock`, as user 65532 with the socket's group (`stat -c %g`). Read-only filesystem, no capabilities. |
+
+App containers are not on `simpled_control` and reach the daemon only through the gateway's two public routes. The Docker socket is effectively root on the host: the daemon only reads through it.
 
 #### body_limit
 
@@ -1596,6 +1622,7 @@ Output directory: `docker-deploy/<deployment-name>/`
 | `envs/<service>.env` | Per-service environment variable files |
 | `configs/` | Configuration files |
 | `secrets/` | Secret files |
+| `traefik/`, `daemon/daemon.json` | The gateway's files and the [simpled daemon](#the-simpled-daemon-docker)'s config |
 
 ### Docker Swarm (`type: docker`, `swarm_mode: true`)
 
@@ -1611,7 +1638,7 @@ Output directory: `docker-deploy/`
 | `<deployment>/<service>/` | Per-service `.env` file, read by `docker stack deploy` on the machine that runs it |
 | `<deployment>/configs/`, `<deployment>/secrets/` | The files the deployment's Swarm configs and secrets are created from. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm) |
 | `<deployment>/volumes/<name>/` | Only for unbound volumes, which `multi_node: false` allows |
-| `ingress/` | Traefik ingress stack. Its `traefik/` files are uploaded as Swarm configs too |
+| `ingress/` | The gateway's stack: Traefik and the [simpled daemon](#the-simpled-daemon-docker). Its `traefik/` files and `daemon/daemon.json` are uploaded as Swarm configs too |
 
 The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
 

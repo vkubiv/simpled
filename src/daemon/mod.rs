@@ -27,6 +27,59 @@ pub struct Owner {
     pub deployment: String,
 }
 
+/// Where the daemon listens, inside its container.
+pub const PORT: u16 = 8080;
+/// The network only the gateway and the daemon are on: app containers cannot
+/// reach the daemon except through the gateway's routes.
+pub const CONTROL_NETWORK: &str = "simpled_control";
+/// The name the gateway reaches the daemon by: its Swarm service name in the
+/// `ingress` stack, and a network alias of the standalone container.
+pub const HOST: &str = "ingress_daemon";
+/// Overrides the image, for a private registry or a local test build.
+pub const IMAGE_VAR: &str = "SIMPLED_DAEMON_IMAGE";
+/// Where the generated stack mounts `daemon.json`.
+pub const CONFIG_PATH: &str = "/etc/simpled/daemon.json";
+
+/// The image of this simpled version, which the gateway's stack pins.
+pub fn image() -> String {
+    format!("ghcr.io/vkubiv/simpled:{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `${SIMPLED_DAEMON_IMAGE:-<image>}`, read by `docker stack deploy` and the shell alike.
+pub fn image_reference() -> String {
+    format!("${{{}:-{}}}", IMAGE_VAR, image())
+}
+
+/// The daemon's config for an environment: which deployment answers on each domain.
+pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: source::Mode) -> Config {
+    Config {
+        simpled_version: env!("CARGO_PKG_VERSION").to_string(),
+        mode,
+        owners: spec
+            .ingress
+            .version_routes
+            .iter()
+            .map(|r| Owner {
+                domain: r.domain_name.clone(),
+                deployment: r.deployment_name.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Writes `daemon.json` into `dir`.
+pub fn write_config(dir: &Path, config: &Config) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("daemon.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(config)?
+            + "
+",
+    )
+    .with_context(|| format!("Cannot write {}", path.display()))
+}
+
 pub fn run(config: &Path, listen: &str) -> Result<()> {
     let text = std::fs::read_to_string(config).with_context(|| format!("Cannot read {}", config.display()))?;
     let config: Config =

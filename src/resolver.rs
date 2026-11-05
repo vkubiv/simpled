@@ -58,8 +58,10 @@ pub fn resolve(
         &app_spec.version.to_string(),
         &deployment.name,
     );
+    // Kubernetes only. On Docker the environment's daemon answers for every
+    // deployment from its services' labels; locally the local gateway does.
     let is_local = env_spec.env_type == DeploymentEnvType::Local;
-    if !is_local {
+    if env_spec.env_type == DeploymentEnvType::K8S {
         resolved_services.push(crate::version_endpoint::service(
             &deployment.name,
             &version_document,

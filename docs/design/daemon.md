@@ -94,8 +94,8 @@ How it is built (`Dockerfile`, `release.yml`):
 - CI builds both binaries and images without pushing, so a change that breaks them
   fails a PR.
 - The image runs as user 65532. The socket is `root:docker` (or `root:root` on Docker
-  Desktop) with mode 660, so the generated stack adds the socket's group to the
-  daemon's container. Tested: as 65532 with `--read-only --cap-drop ALL` and that
+  Desktop) with mode 660, so standalone `deploy.sh` adds the socket's group to the
+  daemon's container. The Swarm stack runs it as root instead (see Docker access). Tested: as 65532 with `--read-only --cap-drop ALL` and that
   group added, the daemon reads the socket. It stops on SIGTERM in about half a
   second.
 - **The ghcr package is private when it is first pushed.** It has to be made public
@@ -115,8 +115,11 @@ effectively root on the host. Mitigations:
 - The daemon only acts on objects it owns: anything labelled `simpled.*`, the
   `ingress` stack, and `simpled_*` configs and secrets. It refuses everything else
   even with the manage token.
-- `read_only: true` root filesystem, no capabilities, and a non-root user in the
-  group that owns the socket.
+- `read_only: true` root filesystem and no capabilities. On standalone Docker, a
+  non-root user in the group that owns the socket, looked up by `deploy.sh` on the
+  host that runs both. On Swarm, root: the daemon runs on any manager, and their
+  `docker` groups need not have the same number. With the socket, root in the
+  container gives nothing the socket does not already give.
 
 The daemon needs write access to Docker from the ACME phase on (§7.1: it creates
 certificate secrets and updates the gateway service), so a GET-only socket proxy

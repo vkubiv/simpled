@@ -620,10 +620,15 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
         "{:?}",
         args
     );
-    let ingress = read(&out.join("ingress").join("docker-compose.yaml"));
-    for key in ["mode: global", "placement:"] {
-        assert!(!ingress.contains(key), "{}", ingress);
-    }
+    // The gateway service; the daemon next to it is always placed on a manager.
+    let ingress: serde_yaml::Value =
+        serde_yaml::from_str(&read(&out.join("ingress").join("docker-compose.yaml"))).unwrap();
+    let gateway = &ingress["services"]["traefik"]["deploy"];
+    assert!(
+        gateway["mode"].is_null() && gateway["placement"].is_null(),
+        "{:?}",
+        gateway
+    );
 }
 
 #[test]
