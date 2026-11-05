@@ -705,7 +705,7 @@ Under Docker Swarm the gateway publishes its ports in host mode, so it sees the 
 |--------|-------------|
 | `disable: true` | No TLS. HTTP only. |
 | `secret: name` | Use an existing Kubernetes TLS secret. Kubernetes only; rejected on `docker`. |
-| `letsencrypt` | Provision via Let's Encrypt: cert-manager on Kubernetes, Traefik's own ACME client on Docker. |
+| `letsencrypt` | Provision via Let's Encrypt: cert-manager on Kubernetes, the [simpled daemon](#certificates-on-docker-swarm) on Docker Swarm, Traefik's own ACME client on standalone Docker. `server` sets another ACME directory, such as Let's Encrypt's staging one. |
 | `upstream: true` | TLS is terminated in front of the gateway, by a load balancer or CDN holding the certificate. `docker` only. See [tls.upstream](#tlsupstream). |
 
 #### tls.upstream
@@ -1765,10 +1765,34 @@ Swarm objects cannot be changed, so each one is named after its content:
 A config file or secret larger than 500 KB, Swarm's limit for one object, fails
 `prepare-deployment`.
 
-Still a bind mount of the deploy directory: Traefik's Let's Encrypt store
-(`letsencrypt/`). The directory exists only on the manager that runs `deploy.sh`, so
-on a swarm of several nodes pin the gateway there with
-[`gateway.placement`](#global-and-placement-swarm).
+#### Certificates on Docker Swarm
+
+With `tls.letsencrypt`, the [simpled daemon](#the-simpled-daemon-docker) is the
+gateway's ACME client, and every domain's certificate is a Swarm secret, which every
+node has. Traefik runs no ACME and keeps no `acme.json`: it reads each domain's
+certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
+
+1. **First deploy.** `./simpled step tls-secrets` finds no certificate for a domain
+   and creates a self-signed placeholder, so the gateway can start. Browsers warn
+   until the real certificate is there, usually within a minute.
+2. **Issuing.** The daemon requests one certificate per domain, so a domain whose
+   DNS does not point at the gateway yet fails alone. It answers Let's Encrypt's
+   HTTP-01 challenge itself: every gateway task, on every node, routes
+   `/.well-known/acme-challenge/` on port 80 to it, ahead of the redirect to HTTPS.
+3. **Rolling out.** Each certificate becomes a secret `tls_<domain>_<hash>`, labelled
+   `simpled.tls.domain`, `simpled.tls.issuer=acme` and `simpled.tls.not_after`. One
+   rolling update of the gateway, with its own update policy, moves it onto all the
+   certificates issued in that round.
+4. **Redeploys** keep the current certificate: `step tls-secrets` picks the issued one
+   that lasts longest, so the stack does not change and the gateway does not restart.
+5. **Renewal.** The daemon checks every hour and renews a certificate 30 days before
+   it expires. A failed request is retried after an hour, doubling up to a day. Once
+   a domain has an issued certificate, its placeholder and all but the two newest
+   certificates are removed.
+
+The daemon keeps no state: each start creates a new ACME account, and what it
+needs to know about a certificate is in its labels. If the daemon is down, the
+gateway keeps serving; renewals wait, with 30 days of margin.
 
 ---
 

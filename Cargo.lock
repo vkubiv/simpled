@@ -1963,6 +1963,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "x509-parser",
 ]
 
 [[package]]

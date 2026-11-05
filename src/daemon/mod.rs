@@ -3,6 +3,7 @@
 //! gateway host from the labels of the running services
 //! (`docs/design/daemon.md`).
 
+pub mod acme;
 pub mod http;
 pub mod model;
 pub mod source;
@@ -19,6 +20,9 @@ pub struct Config {
     pub mode: source::Mode,
     /// Which deployment answers on each domain.
     pub owners: Vec<Owner>,
+    /// Swarm with `tls.letsencrypt`: the daemon issues the gateway's certificates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme: Option<acme::AcmeConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +68,22 @@ pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: so
                 deployment: r.deployment_name.clone(),
             })
             .collect(),
+        acme: match mode {
+            source::Mode::Swarm => spec
+                .ingress
+                .tls
+                .as_ref()
+                .and_then(|t| t.letsencrypt.as_ref())
+                .map(|le| acme::AcmeConfig {
+                    directory: le.server.clone(),
+                    email: le.email.clone(),
+                    domains: crate::gateway_tls::domains(&spec.ingress),
+                    ca_file: None,
+                })
+                .filter(|a| !a.domains.is_empty()),
+            // One host: Traefik is its own ACME client there.
+            source::Mode::Standalone => None,
+        },
     }
 }
 
@@ -94,7 +114,18 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
+        let challenges = acme::Challenges::default();
+        if let Some(acme_config) = config.acme.clone() {
+            let docker = source::connect_docker()?;
+            eprintln!(
+                "Issuing the gateway's certificates for {} domain(s) from {}",
+                acme_config.domains.len(),
+                acme_config.directory
+            );
+            tokio::spawn(acme::run(acme_config, docker, challenges.clone()));
+        }
         let app = Arc::new(http::App {
+            challenges,
             owners: config
                 .owners
                 .iter()

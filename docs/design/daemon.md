@@ -273,8 +273,9 @@ not, and those should be fixed without it.
 
 ### 7.1 Let's Encrypt with more than one gateway node *(daemon: yes)*
 
-**Today.** The Swarm Traefik gateway is its own ACME client and stores
-`/letsencrypt/acme.json` in a bind-mounted directory of the node it runs on. Hence:
+**Before the daemon** (simpled 2.0.x). The Swarm Traefik gateway was its own ACME
+client and stored `/letsencrypt/acme.json` in a bind-mounted directory of the node it
+ran on. Hence:
 
 - `global: true` and `tls.letsencrypt` are rejected together: each task would run its
   own ACME client, and an HTTP-01 challenge lands on whichever node the balancer
@@ -286,6 +287,22 @@ not, and those should be fixed without it.
 
 **With the daemon.** The daemon is the only ACME client, using the `instant-acme`
 crate. Traefik no longer runs ACME at all: it only reads PEM files.
+
+As built (steps 5a and 5b), it differs from the plan below in three places:
+
+- **One certificate, and one secret, per domain.** A domain whose DNS is not ready
+  fails alone instead of blocking a certificate for every name. The PEM holds the
+  chain and the key, and Traefik uses it as both `certFile` and `keyFile`, at
+  `/run/secrets/simpled_tls/<domain>.pem`.
+- **A self-signed placeholder instead of Traefik's default certificate.**
+  `step tls-secrets` creates one for a domain with no certificate, so the ingress
+  stack always mounts one secret per domain, and a redeploy looks up which.
+- **The HTTPS redirect has priority 1.** Traefik's entry-point redirect normally
+  outranks every router; at 1, the challenge router on `web` is reached first.
+
+Tested against Pebble, Let's Encrypt's test server: two domains issued through real
+HTTP-01 validation through Traefik, one rolling restart of the gateway, and a
+redeploy that kept both certificates and restarted nothing.
 
 1. **Challenges.** Every gateway task, on every node, proxies
    `/.well-known/acme-challenge/*` to the daemon over `simpled_control`. It no longer
