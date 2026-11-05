@@ -42,3 +42,39 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+
+  # The release builds the daemon image from static binaries; this builds both
+  # (without pushing) so a PR that breaks them fails here, not in a release.
+  daemon-image:
+    name: Daemon image (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build binary
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/simpled dist/simpled_linux_${{ matrix.arch }}
+          file dist/simpled_linux_${{ matrix.arch }} | grep -q 'static'
+      - name: Build image and run it
+        run: |
+          docker build --platform linux/${{ matrix.arch }} -f Dockerfile -t simpled-daemon:ci dist
+          docker run --rm --entrypoint /simpled simpled-daemon:ci --version

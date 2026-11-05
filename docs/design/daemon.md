@@ -83,6 +83,24 @@ amd64 and arm64. `prepare-deployment` pins the tag to its own version, so the
 generator and the daemon always agree on labels and routes. `gateway.daemon.image`
 overrides it for private registries.
 
+How it is built (`Dockerfile`, `release.yml`):
+
+- The `daemon-binary` jobs build `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` natively, on the amd64 and arm64 runners, and check
+  that the result is static.
+- The `daemon-image` job puts both into one multi-platform image. The Dockerfile only
+  copies files (the binary for `TARGETARCH`, and Alpine's CA bundle), so the build
+  needs no emulation. The GitHub release is created only after the image is pushed.
+- CI builds both binaries and images without pushing, so a change that breaks them
+  fails a PR.
+- The image runs as user 65532. The socket is `root:docker` (or `root:root` on Docker
+  Desktop) with mode 660, so the generated stack adds the socket's group to the
+  daemon's container. Tested: as 65532 with `--read-only --cap-drop ALL` and that
+  group added, the daemon reads the socket. It stops on SIGTERM in about half a
+  second.
+- **The ghcr package is private when it is first pushed.** It has to be made public
+  once in the package settings, or deploy targets cannot pull it.
+
 ### Docker access
 
 The daemon talks to `/var/run/docker.sock` through `bollard`, which also handles the
