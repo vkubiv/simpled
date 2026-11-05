@@ -149,31 +149,24 @@ fn a_config_file_over_the_swarm_limit_fails() {
 
 /// Nothing time-dependent is left in a Swarm service's spec, so a deploy restarts
 /// only the services whose image, environment, configs or secrets changed. The
-/// gateway still carries `DEPLOY_DATE` and restarts on every deploy.
+/// gateway too: a routing change renames its config, which restarts it.
 #[test]
 fn preparing_twice_gives_the_same_stack_file() {
     let first = prepare(&swarm());
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let second = prepare(&swarm());
-    let stack = |dir: &tempfile::TempDir| {
-        read(
-            &dir.path()
-                .join("docker-deploy")
-                .join("prod")
-                .join("docker-compose.yaml"),
-        )
-    };
-
-    assert_eq!(stack(&first), stack(&second));
-    assert!(!stack(&first).contains("DEPLOY_DATE"), "{}", stack(&first));
-    let ingress = read(
-        &first
-            .path()
-            .join("docker-deploy")
-            .join("ingress")
-            .join("docker-compose.yaml"),
-    );
-    assert!(ingress.contains("DEPLOY_DATE="), "{}", ingress);
+    for stack_dir in ["prod", "ingress"] {
+        let stack = |dir: &tempfile::TempDir| {
+            read(
+                &dir.path()
+                    .join("docker-deploy")
+                    .join(stack_dir)
+                    .join("docker-compose.yaml"),
+            )
+        };
+        assert_eq!(stack(&first), stack(&second));
+        assert!(!stack(&first).contains("DEPLOY_DATE"), "{}", stack(&first));
+    }
 }
 
 #[test]
