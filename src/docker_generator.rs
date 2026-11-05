@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOCKER_NETWORK: &str = "common_network";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
@@ -1192,13 +1191,9 @@ fn write_swarm_host_ports(stack: &mut File, has_tls: bool) -> Result<()> {
     Ok(())
 }
 
+/// No DEPLOY_DATE here: the gateway restarts when its configs or image change,
+/// not on every deploy of every deployment that shares it.
 fn write_swarm_compose_network(stack: &mut File, network_name: &str) -> Result<()> {
-    let deploy_date = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    writeln!(stack, "    environment:")?;
-    writeln!(stack, "      - DEPLOY_DATE={}", deploy_date)?;
     writeln!(stack, "    networks:")?;
     writeln!(stack, "      default:")?;
     writeln!(stack, "networks:")?;
