@@ -83,6 +83,15 @@ fn the_swarm_gateway_mounts_one_certificate_secret_per_domain() {
         "{}",
         script
     );
+    // A 2.0.x acme.json next to deploy.sh is imported first, once.
+    let import = script
+        .find(
+            "if [ -f letsencrypt/acme.json ]; then
+  ./simpled step tls-import ingress/plan.json letsencrypt/acme.json
+fi",
+        )
+        .expect(&script);
+    assert!(import < step, "{}", script);
 }
 
 #[test]
@@ -92,6 +101,21 @@ fn standalone_keeps_traefiks_own_acme_client() {
     let traefik = read(&out.join("traefik").join("traefik.yml"));
     assert!(traefik.contains("certificatesResolvers"), "{}", traefik);
     assert!(!traefik.contains("priority"), "{}", traefik);
+    assert!(!traefik.contains("caServer"), "{}", traefik);
+
+    // Another ACME directory reaches Traefik too.
+    let staging = letsencrypt(&envspec("docker", "", "")).replace(
+        "      email: ops@example.com",
+        "      email: ops@example.com
+      server: https://acme-staging-v02.api.letsencrypt.org/directory",
+    );
+    let dir = prepare(&staging);
+    let traefik = read(&dir.path().join("docker-deploy").join("traefik").join("traefik.yml"));
+    assert!(
+        traefik.contains("caServer: \"https://acme-staging-v02.api.letsencrypt.org/directory\""),
+        "{}",
+        traefik
+    );
     assert!(!read(&out.join("deploy.sh")).contains("tls-secrets"));
     let daemon = read(&out.join("daemon").join("daemon.json"));
     assert!(!daemon.contains("acme"), "{}", daemon);

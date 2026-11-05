@@ -1589,6 +1589,21 @@ Options:
 The generated file is a plain Markdown document; adapt it freely, or pipe `--stdout`
 into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
 
+### `simpled tls import`
+
+Turns the certificates in a Traefik `acme.json` into the Swarm gateway's certificate
+secrets, so the [daemon](#certificates-on-docker-swarm) does not request them again.
+Run it on a swarm manager, with the Docker CLI on `PATH`.
+
+```
+simpled tls import <FILE>
+```
+
+Each name a certificate covers becomes its own secret, labelled like the ones the
+daemon issues. Expired certificates and wildcard names are skipped, and a certificate
+imported before is not created twice. `deploy.sh` does the same on its own for a 2.0.x
+`letsencrypt/acme.json` next to it.
+
 ---
 
 ## Generated output
@@ -1793,6 +1808,14 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
 The daemon keeps no state: each start creates a new ACME account, and what it
 needs to know about a certificate is in its labels. If the daemon is down, the
 gateway keeps serving; renewals wait, with 30 days of margin.
+
+**Upgrading from 2.0.x.** The 2.0.x gateway kept Traefik's certificates in
+`letsencrypt/acme.json` next to `deploy.sh`. When `deploy.sh` finds that file, it
+imports the certificates of the gateway's domains into secrets before anything else,
+then renames the file `acme.json.imported`. The gateway starts with the certificates
+it already had, and the daemon requests nothing until they are 30 days from expiry.
+Expired certificates and wildcard names are not imported. To import a file kept
+elsewhere, run [`simpled tls import`](#simpled-tls-import) on a swarm manager first.
 
 ---
 
