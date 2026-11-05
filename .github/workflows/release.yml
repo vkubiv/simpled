@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: write
-  # The daemon image goes to ghcr.io/vkubiv/simpled.
+  # The controller image goes to ghcr.io/vkubiv/simpled.
   packages: write
 
 jobs:
@@ -194,9 +194,9 @@ jobs:
           name: ${{ matrix.asset_name }}.tar.gz
           path: dist/${{ matrix.asset_name }}.tar.gz
 
-  # The daemon image's binaries: static (musl), so they run on an empty base.
-  daemon-binary:
-    name: Build daemon ${{ matrix.arch }}
+  # The controller image's binaries: static (musl), so they run on an empty base.
+  controller-binary:
+    name: Build controller ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -226,21 +226,21 @@ jobs:
           file dist/simpled_linux_${{ matrix.arch }} | grep -q 'static' || { echo "::error::not a static binary"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
-          name: daemon_linux_${{ matrix.arch }}
+          name: controller_linux_${{ matrix.arch }}
           path: dist/simpled_linux_${{ matrix.arch }}
 
   # ghcr.io/vkubiv/simpled:<version>, which prepare-deployment pins the
-  # gateway's daemon to. Built before the release is published, so a version
+  # gateway's controller to. Built before the release is published, so a version
   # never points at an image that is missing.
-  daemon-image:
-    name: Daemon image
-    needs: [get-version, daemon-binary]
+  controller-image:
+    name: Controller image
+    needs: [get-version, controller-binary]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: daemon_linux_*
+          pattern: controller_linux_*
           path: dist
           merge-multiple: true
       - run: chmod +x dist/simpled_linux_*
@@ -268,7 +268,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [get-version, build, daemon-image]
+    needs: [get-version, build, controller-image]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

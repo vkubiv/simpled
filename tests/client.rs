@@ -1,4 +1,4 @@
-//! `simpled status`, `logs` and `wait` find the daemon from the env spec. The
+//! `simpled status`, `logs` and `wait` find the controller from the env spec. The
 //! domains here do not resolve, so the errors show which URL was used.
 
 mod common;
@@ -7,16 +7,16 @@ use common::{envspec, simpled, write_project};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
 
-fn project(daemon: bool) -> tempfile::TempDir {
-    let gateway = if daemon {
+fn project(controller: bool) -> tempfile::TempDir {
+    let top = if controller {
         format!(
-            "daemon:\n    hosts:\n      web:\n        prefix: /_simpled\n    read_token: \"{}\"",
+            "swarm_mode: true\ncontroller:\n  hosts:\n    web:\n      prefix: /_simpled\n  read_token: \"{}\"",
             TOKEN
         )
     } else {
-        String::new()
+        "swarm_mode: true".to_string()
     };
-    let env = envspec("docker", "swarm_mode: true", &gateway).replace("shop.example.com", "shop.simpled-test.invalid");
+    let env = envspec("docker", &top, "").replace("shop.example.com", "shop.simpled-test.invalid");
     let dir = tempfile::tempdir().unwrap();
     write_project(dir.path(), &env);
     dir
@@ -67,11 +67,11 @@ fn status_finds_the_api_under_its_prefix() {
 }
 
 #[test]
-fn without_daemon_hosts_status_says_how_to_route_the_api() {
+fn without_controller_hosts_status_says_how_to_route_the_api() {
     let dir = project(false);
     let (ok, stderr) = run(&dir, &["status"], &[("SIMPLED_TOKEN", TOKEN)]);
     assert!(!ok);
-    assert!(stderr.contains("set gateway.daemon.hosts"), "{}", stderr);
+    assert!(stderr.contains("set controller.hosts"), "{}", stderr);
 }
 
 #[test]

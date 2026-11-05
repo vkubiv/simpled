@@ -18,7 +18,7 @@ const LEGACY_ACME_JSON: &str = "letsencrypt/acme.json";
 /// Let's Encrypt's production directory, the default of `letsencrypt.server`.
 const LETSENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// The Traefik service every domain's version and health routes go to.
-const TRAEFIK_DAEMON_SERVICE: &str = "simpled-daemon";
+const TRAEFIK_CONTROLLER_SERVICE: &str = "simpled-controller";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
 // would change the ingress underneath a deployment that touched nothing else.
 // Traefik stays on v2 because v3 changes the configuration format.
@@ -134,7 +134,8 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
             fetch_script.write_to_file(secret, &format!("secrets/{}", secret.name));
         }
     }
-    let daemon_tokens = crate::daemon::write_token_files(resolved_spec, output_dir, "daemon", &mut fetch_script)?;
+    let controller_tokens =
+        crate::controller::write_token_files(resolved_spec, output_dir, "controller", &mut fetch_script)?;
     if !fetch_script.is_empty() {
         fetch_script.write(
             &output_dir.join(secret_fetch::SCRIPT_NAME),
@@ -245,9 +246,9 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
 
         write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
 
-        if crate::daemon::model::labels::is_reported(deployment, service) {
-            for (key, value) in crate::daemon::model::labels::for_service(deployment, &service.full_name) {
-                if key == crate::daemon::model::labels::DEPLOYED_AT {
+        if crate::controller::model::labels::is_reported(deployment, service) {
+            for (key, value) in crate::controller::model::labels::for_service(deployment, &service.full_name) {
+                if key == crate::controller::model::labels::DEPLOYED_AT {
                     // Double quotes, so the shell expands the deploy time.
                     write!(deploy_sh, " --label \"{}={}\"", key, value)?;
                 } else {
@@ -341,7 +342,13 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
 
     // Ingress Container
     if !resolved_spec.ingress.rules.is_empty() {
-        generate_traefik_standalone(resolved_spec, output_dir, &mut deploy_sh, network_name, &daemon_tokens)?;
+        generate_traefik_standalone(
+            resolved_spec,
+            output_dir,
+            &mut deploy_sh,
+            network_name,
+            &controller_tokens,
+        )?;
     }
 
     Ok(())
@@ -431,8 +438,8 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         prepared.insert(service.full_name.clone(), docker_service);
     }
 
-    let daemon_tokens =
-        crate::daemon::write_token_files(resolved_spec, output_dir, "ingress/daemon", &mut fetch_script)?;
+    let controller_tokens =
+        crate::controller::write_token_files(resolved_spec, output_dir, "ingress/controller", &mut fetch_script)?;
     if !fetch_script.is_empty() {
         fetch_script.write(
             &output_dir.join(secret_fetch::SCRIPT_NAME),
@@ -502,7 +509,8 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     let ingress_dir = output_dir.join("ingress");
     fs::create_dir_all(&ingress_dir)?;
 
-    let gateway_objects = generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone(), &daemon_tokens)?;
+    let gateway_objects =
+        generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone(), &controller_tokens)?;
 
     // 5. Plans, which the deploy steps read.
     let plan_jobs = jobs
@@ -969,7 +977,7 @@ fn generate_traefik_standalone(
     output_dir: &Path,
     deploy_sh: &mut File,
     network_name: String,
-    daemon_tokens: &[&str],
+    controller_tokens: &[&str],
 ) -> Result<()> {
     let traefik_dir = output_dir.join("traefik");
     fs::create_dir_all(&traefik_dir)?;
@@ -989,7 +997,7 @@ fn generate_traefik_standalone(
     // Standalone keeps Traefik as its own ACME client, on its single host.
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"), &[])?;
 
-    write_standalone_daemon(resolved_spec, output_dir, deploy_sh, daemon_tokens)?;
+    write_standalone_controller(resolved_spec, output_dir, deploy_sh, controller_tokens)?;
 
     writeln!(deploy_sh, "echo 'Starting Traefik ingress...'")?;
     writeln!(deploy_sh, "docker rm -f traefik-ingress || true")?;
@@ -1018,38 +1026,38 @@ fn generate_traefik_standalone(
 
     write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
     writeln!(deploy_sh, " {}", TRAEFIK_IMAGE)?;
-    // `docker run` takes one network; the daemon's is joined after the start.
+    // `docker run` takes one network; the controller's is joined after the start.
     writeln!(
         deploy_sh,
         "docker network connect {} traefik-ingress",
-        crate::daemon::CONTROL_NETWORK
+        crate::controller::CONTROL_NETWORK
     )?;
 
     Ok(())
 }
 
-/// The daemon's container, before the gateway that routes to it. Not root: on
+/// The controller's container, before the gateway that routes to it. Not root: on
 /// standalone Docker it runs on the host that runs deploy.sh, so the group that
 /// owns the socket is looked up here and added.
-fn write_standalone_daemon(
+fn write_standalone_controller(
     resolved_spec: &EnvironmentResolvedSpec,
     output_dir: &Path,
     deploy_sh: &mut File,
     tokens: &[&str],
 ) -> Result<()> {
-    crate::daemon::write_config(
-        &output_dir.join("daemon"),
-        &crate::daemon::config_for(resolved_spec, crate::daemon::source::Mode::Standalone),
+    crate::controller::write_config(
+        &output_dir.join("controller"),
+        &crate::controller::config_for(resolved_spec, crate::controller::source::Mode::Standalone),
     )?;
-    let network = crate::daemon::CONTROL_NETWORK;
-    writeln!(deploy_sh, "echo 'Starting the simpled daemon...'")?;
+    let network = crate::controller::CONTROL_NETWORK;
+    writeln!(deploy_sh, "echo 'Starting the simpled controller...'")?;
     writeln!(deploy_sh, "docker network create {} || true", network)?;
-    writeln!(deploy_sh, "docker rm -f simpled-daemon || true")?;
+    writeln!(deploy_sh, "docker rm -f simpled-controller || true")?;
     writeln!(
         deploy_sh,
-        "docker run -d --name simpled-daemon --network {} --network-alias {} --restart unless-stopped \\",
+        "docker run -d --name simpled-controller --network {} --network-alias {} --restart unless-stopped \\",
         network,
-        crate::daemon::HOST
+        crate::controller::HOST
     )?;
     writeln!(
         deploy_sh,
@@ -1057,18 +1065,18 @@ fn write_standalone_daemon(
     )?;
     writeln!(
         deploy_sh,
-        "  -v /var/run/docker.sock:/var/run/docker.sock -v $(pwd)/daemon/daemon.json:{}:ro \\",
-        crate::daemon::CONFIG_PATH
+        "  -v /var/run/docker.sock:/var/run/docker.sock -v $(pwd)/controller/controller.json:{}:ro \\",
+        crate::controller::CONFIG_PATH
     )?;
     for token in tokens {
         writeln!(
             deploy_sh,
             "  -v $(pwd)/{}:{}:ro \\",
-            crate::daemon::token_file("daemon", token),
-            crate::daemon::token_path(token)
+            crate::controller::token_file("controller", token),
+            crate::controller::token_path(token)
         )?;
     }
-    writeln!(deploy_sh, "  \"{}\"", crate::daemon::image_reference())?;
+    writeln!(deploy_sh, "  \"{}\"", crate::controller::image_reference())?;
     Ok(())
 }
 
@@ -1079,7 +1087,7 @@ fn write_deployed_at(deploy_sh: &mut File) -> Result<()> {
     writeln!(
         deploy_sh,
         "export {}=\"$(date +%s)\"",
-        crate::daemon::model::labels::DEPLOYED_AT_VAR
+        crate::controller::model::labels::DEPLOYED_AT_VAR
     )?;
     Ok(())
 }
@@ -1089,7 +1097,7 @@ fn generate_traefik_swarm(
     resolved_spec: &EnvironmentResolvedSpec,
     ingress_dir: &Path,
     network_name: String,
-    daemon_tokens: &[&str],
+    controller_tokens: &[&str],
 ) -> Result<SwarmObjects> {
     let traefik_dir = ingress_dir.join("traefik");
     fs::create_dir_all(&traefik_dir)?;
@@ -1098,7 +1106,7 @@ fn generate_traefik_swarm(
     let has_tls = resolved_spec.ingress.terminates_tls();
     let upstream = resolved_spec.ingress.tls_upstream();
     // Traefik runs no ACME on Swarm: it reads each domain's certificate from a
-    // Swarm secret, which the daemon issues and renews.
+    // Swarm secret, which the controller issues and renews.
     let cert_domains = crate::gateway_tls::domains(&resolved_spec.ingress);
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
@@ -1150,7 +1158,7 @@ fn generate_traefik_swarm(
 
     // One certificate secret per domain. Which one is current is looked up by
     // `step tls-secrets` when deploy.sh runs, so a redeploy keeps the one the
-    // daemon last rolled out.
+    // controller last rolled out.
     if !cert_domains.is_empty() {
         writeln!(stack, "    secrets:")?;
         for (i, domain) in cert_domains.iter().enumerate() {
@@ -1161,17 +1169,17 @@ fn generate_traefik_swarm(
     }
     writeln!(stack, "    networks:")?;
     writeln!(stack, "      default:")?;
-    writeln!(stack, "      {}:", crate::daemon::CONTROL_NETWORK)?;
+    writeln!(stack, "      {}:", crate::controller::CONTROL_NETWORK)?;
 
-    write_swarm_daemon(&mut stack, resolved_spec, ingress_dir, &mut objects, daemon_tokens)?;
+    write_swarm_controller(&mut stack, resolved_spec, ingress_dir, &mut objects, controller_tokens)?;
 
     writeln!(stack, "networks:")?;
     writeln!(stack, "  default:")?;
     writeln!(stack, "    external: true")?;
     writeln!(stack, "    name: {}", network_name)?;
     // Created by the stack. Not attachable, so only these two services join it.
-    writeln!(stack, "  {}:", crate::daemon::CONTROL_NETWORK)?;
-    writeln!(stack, "    name: {}", crate::daemon::CONTROL_NETWORK)?;
+    writeln!(stack, "  {}:", crate::controller::CONTROL_NETWORK)?;
+    writeln!(stack, "    name: {}", crate::controller::CONTROL_NETWORK)?;
     writeln!(stack, "    driver: overlay")?;
 
     writeln!(stack, "configs:")?;
@@ -1229,7 +1237,7 @@ fn write_traefik_static_config(
         writeln!(file, "        entryPoint:")?;
         writeln!(file, "          to: websecure")?;
         writeln!(file, "          scheme: https")?;
-        // Without Traefik's own ACME (Swarm, where the daemon issues the
+        // Without Traefik's own ACME (Swarm, where the controller issues the
         // certificates): below every router on `web`, so the challenge route is
         // answered over plain HTTP instead of redirected. Traefik's default is
         // above every router.
@@ -1359,34 +1367,34 @@ fn write_swarm_host_ports(stack: &mut File, has_tls: bool) -> Result<()> {
 
 /// No DEPLOY_DATE here: the gateway restarts when its configs or image change,
 /// not on every deploy of every deployment that shares it.
-/// The `daemon` service of the ingress stack, next to the gateway. It reads the
+/// The `controller` service of the ingress stack, next to the gateway. It reads the
 /// swarm through the Docker socket, so it runs on a manager. As root, because it
 /// may land on a manager other than the one running deploy.sh, whose `docker`
 /// group need not have the same number; with the socket it could act as root
 /// anyway. Its filesystem is read-only and it has no capabilities.
-fn write_swarm_daemon(
+fn write_swarm_controller(
     stack: &mut File,
     resolved_spec: &EnvironmentResolvedSpec,
     ingress_dir: &Path,
     objects: &mut SwarmObjects,
     tokens: &[&str],
 ) -> Result<()> {
-    crate::daemon::write_config(
-        &ingress_dir.join("daemon"),
-        &crate::daemon::config_for(resolved_spec, crate::daemon::source::Mode::Swarm),
+    crate::controller::write_config(
+        &ingress_dir.join("controller"),
+        &crate::controller::config_for(resolved_spec, crate::controller::source::Mode::Swarm),
     )?;
     let config = objects.add(
         ObjectKind::Config,
-        "gateway_daemon.json",
-        "ingress/daemon/daemon.json",
+        "gateway_controller.json",
+        "ingress/controller/controller.json",
         "SIMPLED_GATEWAY_OBJECT_",
     );
 
-    writeln!(stack, "  daemon:")?;
+    writeln!(stack, "  controller:")?;
     writeln!(
         stack,
         "    image: {}",
-        serde_json::to_string(&crate::daemon::image_reference())?
+        serde_json::to_string(&crate::controller::image_reference())?
     )?;
     writeln!(stack, "    user: \"0:0\"")?;
     writeln!(stack, "    read_only: true")?;
@@ -1396,26 +1404,26 @@ fn write_swarm_daemon(
     writeln!(stack, "      - /var/run/docker.sock:/var/run/docker.sock")?;
     writeln!(stack, "    configs:")?;
     writeln!(stack, "      - source: {}", config.base)?;
-    writeln!(stack, "        target: {}", crate::daemon::CONFIG_PATH)?;
+    writeln!(stack, "        target: {}", crate::controller::CONFIG_PATH)?;
     writeln!(stack, "        mode: 0444")?;
     // The private API's tokens: content-addressed gateway secrets, so every
-    // manager the daemon may run on has them.
+    // manager the controller may run on has them.
     if !tokens.is_empty() {
         writeln!(stack, "    secrets:")?;
         for token in tokens {
             let secret = objects.add(
                 ObjectKind::Secret,
-                &format!("gateway_daemon_{}", token),
-                &crate::daemon::token_file("ingress/daemon", token),
+                &format!("gateway_controller_{}", token),
+                &crate::controller::token_file("ingress/controller", token),
                 "SIMPLED_GATEWAY_OBJECT_",
             );
             writeln!(stack, "      - source: {}", secret.base)?;
-            writeln!(stack, "        target: {}", crate::daemon::token_path(token))?;
+            writeln!(stack, "        target: {}", crate::controller::token_path(token))?;
             writeln!(stack, "        mode: 0400")?;
         }
     }
     writeln!(stack, "    networks:")?;
-    writeln!(stack, "      {}:", crate::daemon::CONTROL_NETWORK)?;
+    writeln!(stack, "      {}:", crate::controller::CONTROL_NETWORK)?;
     writeln!(stack, "    deploy:")?;
     writeln!(stack, "      placement:")?;
     writeln!(stack, "        constraints:")?;
@@ -1495,10 +1503,11 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
         writeln!(file, "        permanent: {}", redirect.permanent)?;
     }
 
-    // The daemon's private API: the prefix is stripped, so the daemon always
+    // The controller's private API: the prefix is stripped, so the controller always
     // sees `/api/v1/...`.
-    let daemon_routes: &[(String, String)] = ingress.daemon.as_ref().map(|d| d.routes.as_slice()).unwrap_or(&[]);
-    for (i, (_, prefix)) in daemon_routes.iter().enumerate() {
+    let controller_routes: &[(String, String)] =
+        ingress.controller.as_ref().map(|d| d.routes.as_slice()).unwrap_or(&[]);
+    for (i, (_, prefix)) in controller_routes.iter().enumerate() {
         if prefix == "/" {
             continue;
         }
@@ -1506,7 +1515,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
             writeln!(file, "  middlewares:")?;
             middlewares_written = true;
         }
-        writeln!(file, "    strip-simpled-daemon-{}:", i)?;
+        writeln!(file, "    strip-simpled-controller-{}:", i)?;
         writeln!(file, "      stripPrefix:")?;
         writeln!(file, "        prefixes:")?;
         writeln!(
@@ -1517,8 +1526,8 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
     }
 
     writeln!(file, "  routers:")?;
-    for (i, (domain, prefix)) in daemon_routes.iter().enumerate() {
-        writeln!(file, "    simpled-daemon-api-{}:", i)?;
+    for (i, (domain, prefix)) in controller_routes.iter().enumerate() {
+        writeln!(file, "    simpled-controller-api-{}:", i)?;
         let rule = if prefix == "/" {
             format!("Host(`{}`)", domain)
         } else {
@@ -1526,10 +1535,10 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
             format!("Host(`{}`) && PathPrefix(`{}/`)", domain, prefix.trim_end_matches('/'))
         };
         writeln!(file, "      rule: {}", serde_json::to_string(&rule)?)?;
-        writeln!(file, "      service: {}", TRAEFIK_DAEMON_SERVICE)?;
+        writeln!(file, "      service: {}", TRAEFIK_CONTROLLER_SERVICE)?;
         if prefix != "/" {
             writeln!(file, "      middlewares:")?;
-            writeln!(file, "        - strip-simpled-daemon-{}", i)?;
+            writeln!(file, "        - strip-simpled-controller-{}", i)?;
         }
         writeln!(file, "      entryPoints:")?;
         if has_tls {
@@ -1592,10 +1601,10 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
             file,
             "      rule: \"Host(`{}`) && (Path(`{}`) || Path(`{}`))\"",
             route.domain_name,
-            crate::daemon::http::VERSION_PATH,
-            crate::daemon::http::HEALTH_PATH
+            crate::controller::http::VERSION_PATH,
+            crate::controller::http::HEALTH_PATH
         )?;
-        writeln!(file, "      service: {}", TRAEFIK_DAEMON_SERVICE)?;
+        writeln!(file, "      service: {}", TRAEFIK_CONTROLLER_SERVICE)?;
         if has_tls {
             writeln!(file, "      entryPoints:")?;
             writeln!(file, "        - websecure")?;
@@ -1625,16 +1634,16 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
         writeln!(file, "        - {}", name)?;
     }
 
-    // HTTP-01 challenges, on every domain over plain HTTP: the daemon is the
+    // HTTP-01 challenges, on every domain over plain HTTP: the controller is the
     // ACME client, and every gateway task routes them to it.
     if !cert_domains.is_empty() {
         writeln!(file, "    simpled-acme-challenge:")?;
         writeln!(
             file,
             "      rule: \"PathPrefix(`{}`)\"",
-            crate::daemon::acme::CHALLENGE_PREFIX
+            crate::controller::acme::CHALLENGE_PREFIX
         )?;
-        writeln!(file, "      service: {}", TRAEFIK_DAEMON_SERVICE)?;
+        writeln!(file, "      service: {}", TRAEFIK_CONTROLLER_SERVICE)?;
         writeln!(file, "      entryPoints:")?;
         writeln!(file, "        - web")?;
     }
@@ -1654,17 +1663,17 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
         }
     }
 
-    // The daemon answers for every deployment, by the request's Host, so one
+    // The controller answers for every deployment, by the request's Host, so one
     // service serves every domain's routes.
-    if !ingress.version_routes.is_empty() || !cert_domains.is_empty() || !daemon_routes.is_empty() {
-        writeln!(file, "    {}:", TRAEFIK_DAEMON_SERVICE)?;
+    if !ingress.version_routes.is_empty() || !cert_domains.is_empty() || !controller_routes.is_empty() {
+        writeln!(file, "    {}:", TRAEFIK_CONTROLLER_SERVICE)?;
         writeln!(file, "      loadBalancer:")?;
         writeln!(file, "        servers:")?;
         writeln!(
             file,
             "          - url: \"http://{}:{}/\"",
-            crate::daemon::HOST,
-            crate::daemon::PORT
+            crate::controller::HOST,
+            crate::controller::PORT
         )?;
     }
 
@@ -1823,7 +1832,7 @@ mod tests {
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
                 version_document: None,
-                daemon: None,
+                controller: None,
                 trusted_proxies: Vec::new(),
                 global: false,
                 placement: None,
@@ -1851,7 +1860,7 @@ mod tests {
         IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
-            daemon: None,
+            controller: None,
             trusted_proxies: Vec::new(),
             global: false,
             placement: None,
@@ -1881,7 +1890,7 @@ mod tests {
         IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
-            daemon: None,
+            controller: None,
             trusted_proxies: Vec::new(),
             global: false,
             placement: None,

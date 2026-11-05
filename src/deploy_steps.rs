@@ -192,7 +192,7 @@ struct TlsSecret {
 
 /// The secret each of the gateway's domains is served with: the issued
 /// certificate that lasts longest, or else the newest placeholder. A domain
-/// with neither gets a self-signed placeholder, which the daemon replaces once
+/// with neither gets a self-signed placeholder, which the controller replaces once
 /// it has issued the real one. Exports the names for the ingress stack.
 pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, String)>> {
     use crate::gateway_tls::{labels, ISSUER_ACME, ISSUER_SELF_SIGNED, OWNER_LABEL};
@@ -263,7 +263,7 @@ pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, Stri
                     );
                 }
                 eprintln!(
-                    "Created a self-signed placeholder for {}, until the daemon has issued its certificate",
+                    "Created a self-signed placeholder for {}, until the controller has issued its certificate",
                     tls.domain
                 );
                 name
@@ -288,7 +288,7 @@ pub struct ImportReport {
 /// Turns the certificates in Traefik's `acme.json` (simpled 2.0.x kept it in
 /// `letsencrypt/`) into the gateway's certificate secrets, so an upgrade issues
 /// nothing new. Each name a certificate covers gets its own secret, like the
-/// ones the daemon issues. `only` restricts the import to these domains.
+/// ones the controller issues. `only` restricts the import to these domains.
 /// Importing twice creates nothing new: the names are content-addressed.
 pub fn import_acme_json(
     docker: &dyn Docker,
@@ -336,7 +336,7 @@ pub fn import_acme_json(
                 key.trim_end()
             ) + "
 ";
-            let expires = crate::daemon::acme::not_after(&chain)?;
+            let expires = crate::controller::acme::not_after(&chain)?;
             for name in names {
                 if name.starts_with("*.") {
                     report
@@ -688,7 +688,7 @@ pub const GATEWAY_SERVICE: &str = "ingress_traefik";
 /// replace it:
 ///
 /// - a gateway from a newer simpled is not replaced by an older one, unless
-///   `allow_downgrade`, since the daemon's image is pinned to that version;
+///   `allow_downgrade`, since the controller's image is pinned to that version;
 /// - when the gateway's routing changes, the change is printed, so a deploy from
 ///   a stale checkout of the env spec shows in the log.
 ///
@@ -1106,7 +1106,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let holder = r#"{"simpled.lock.deployment":"blog","simpled.lock.host":"ci-3","simpled.lock.since":"100","simpled.lock.token":"x"}"#;
         let docker = FakeDocker::with_stderr(&[
-            ("config create", false, "", "Error response from daemon: rpc error: code = AlreadyExists desc = config simpled_deploy_lock already exists"),
+            ("config create", false, "", "Error response from controller: rpc error: code = AlreadyExists desc = config simpled_deploy_lock already exists"),
             ("config inspect simpled_deploy_lock", true, holder, ""),
         ]);
         // Held for 10 minutes: not stale yet.

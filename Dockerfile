@@ -1,5 +1,5 @@
-# The simpled daemon image, ghcr.io/vkubiv/simpled:<version>
-# (docs/design/daemon.md). The same simpled binary as the release tarballs,
+# The simpled controller image, ghcr.io/vkubiv/simpled:<version>
+# (docs/design/controller.md). The same simpled binary as the release tarballs,
 # built static against musl, on an empty base.
 #
 # The build context holds only the binaries: simpled_linux_amd64 and
@@ -8,7 +8,7 @@
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 -t <tag> dist/
 
-# Only the CA bundle comes from here, for the daemon's outbound HTTPS (ACME).
+# Only the CA bundle comes from here, for the controller's outbound HTTPS (ACME).
 FROM --platform=$BUILDPLATFORM alpine:3.20 AS certs
 
 FROM scratch
@@ -18,5 +18,5 @@ COPY simpled_linux_${TARGETARCH} /simpled
 # Not root. The generated stack adds the group that owns the Docker socket.
 USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/simpled", "daemon"]
-CMD ["--config", "/etc/simpled/daemon.json"]
+ENTRYPOINT ["/simpled", "controller"]
+CMD ["--config", "/etc/simpled/controller.json"]

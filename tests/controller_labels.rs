@@ -1,4 +1,4 @@
-//! The labels the simpled daemon reads: every long-running service of a
+//! The labels the simpled controller reads: every long-running service of a
 //! deployment carries its deployment, application, version, deploy time and
 //! spec name, on Swarm and on standalone Docker.
 
@@ -40,7 +40,7 @@ fn swarm_services_carry_the_labels_as_service_labels() {
         .find("export SIMPLED_DEPLOYED_AT=\"$(date +%s)\"")
         .expect(&script);
     assert!(set < script.find("docker stack deploy").unwrap(), "{}", script);
-    // The job is not a service the daemon reports on.
+    // The job is not a service the controller reports on.
     let plan = read(&out.join("prod").join("plan.json"));
     assert!(!plan.contains("simpled.service"), "{}", plan);
 }

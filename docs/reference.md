@@ -620,7 +620,7 @@ On Docker the host also answers `GET /.well-known/simpled/health`, with status 2
 | `degraded` | a service runs fewer tasks than it should, or a container fails its healthcheck |
 | `healthy` | neither |
 
-On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`. Right after the first deploy, that lasts until the daemon has issued the certificates, usually under a minute.
+On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
 
 `converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped, which [`simpled wait`](#simpled-wait) does. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
 
@@ -631,51 +631,52 @@ There is nothing to configure. A host belongs to a deployment:
 
 | Target | Who answers |
 |---|---|
-| Docker | the environment's daemon, `simpled daemon`, next to the gateway. Traefik routes both paths on each host to it with a `Host() && (Path() \|\| Path())` router. See [The simpled daemon](#the-simpled-daemon-docker). |
+| Docker | the environment's controller, `simpled controller`, next to the gateway. Traefik routes both paths on each host to it with a `Host() && (Path() \|\| Path())` router. See [The simpled controller](#the-simpled-controller-docker). |
 | Kubernetes | every deployment ships `simpled-version-<deployment>` (nginx, a few MB of memory), routed by a separate Ingress, `<gateway>--simpled-version`, so the main Ingress's `rewrite-target` does not apply to it. No `health`. |
 | Local | the local gateway itself, with no extra container |
 
-#### The simpled daemon (Docker)
+#### The simpled controller (Docker)
 
-The gateway is shared by every deployment of an env spec and rewritten by each of their deploys, so it cannot hold the versions itself. On Docker, one daemon per environment answers for all of them. It reads the state of the running services through the Docker API, and finds a deployment's services by the labels `prepare-deployment` puts on each of them: `simpled.deployment`, `simpled.application`, `simpled.version`, `simpled.deployed_at` and `simpled.service`. On Swarm these are service labels, so a deploy that only moves `deployed_at` restarts nothing.
+The gateway is shared by every deployment of an env spec and rewritten by each of their deploys, so it cannot hold the versions itself. On Docker, one controller per environment answers for all of them. It reads the state of the running services through the Docker API, and finds a deployment's services by the labels `prepare-deployment` puts on each of them: `simpled.deployment`, `simpled.application`, `simpled.version`, `simpled.deployed_at` and `simpled.service`. On Swarm these are service labels, so a deploy that only moves `deployed_at` restarts nothing.
 
 | | Swarm | Standalone |
 |---|---|---|
-| Runs as | service `daemon` of the `ingress` stack, on a manager node | container `simpled-daemon`, started by `deploy.sh` before the gateway |
-| Image | `ghcr.io/vkubiv/simpled:<version>`, the version that prepared the deployment; `SIMPLED_DAEMON_IMAGE=<image> ./deploy.sh` overrides it | the same |
-| Config | `ingress/daemon/daemon.json`, as a Swarm config | `daemon/daemon.json`, bind-mounted |
-| Network | `simpled_control`, an overlay network only the gateway and the daemon are on | `simpled_control`, a bridge network, the same way |
-| Docker access | `/var/run/docker.sock`. As root, since the daemon may run on another manager than the one running `deploy.sh`, whose `docker` group may have another number. Read-only filesystem, no capabilities. | `/var/run/docker.sock`, as user 65532 with the socket's group (`stat -c %g`). Read-only filesystem, no capabilities. |
+| Runs as | service `controller` of the `ingress` stack, on a manager node | container `simpled-controller`, started by `deploy.sh` before the gateway |
+| Image | `ghcr.io/vkubiv/simpled:<version>`, the version that prepared the deployment; `SIMPLED_CONTROLLER_IMAGE=<image> ./deploy.sh` overrides it | the same |
+| Config | `ingress/controller/controller.json`, as a Swarm config | `controller/controller.json`, bind-mounted |
+| Network | `simpled_control`, an overlay network only the gateway and the controller are on | `simpled_control`, a bridge network, the same way |
+| Docker access | `/var/run/docker.sock`. As root, since the controller may run on another manager than the one running `deploy.sh`, whose `docker` group may have another number. Read-only filesystem, no capabilities. | `/var/run/docker.sock`, as user 65532 with the socket's group (`stat -c %g`). Read-only filesystem, no capabilities. |
 
-App containers are not on `simpled_control` and reach the daemon only through the gateway's routes. The Docker socket is effectively root on the host. On Swarm with `tls.letsencrypt` the daemon also writes through it: it creates the certificate secrets and updates the gateway service.
+App containers are not on `simpled_control` and reach the controller only through the gateway's routes. The Docker socket is effectively root on the host. On Swarm with `tls.letsencrypt` the controller also writes through it: it creates the certificate secrets and updates the gateway service.
 
-#### daemon (private API)
+#### controller (private API)
 
-The daemon also has a private API, which reports every deployment's services. It is off until `gateway.daemon` routes it and gives it a token:
+The controller also has a private API, which reports every deployment's services. It is off until the env spec's top-level `controller` routes it and gives it a token. The block sits beside `gateway`, not under it: the controller belongs to the environment, and its `hosts` name aliases from `gateway.hosts`.
 
 ```yaml
 gateway:
   hosts:
     web: shop.example.com
     ops: ops.example.com
-  daemon:
-    hosts:
-      ops:
-        prefix: /                 # or e.g.  web: { prefix: /_simpled }
-    read_token:
-      aws: prod/simpled/tokens    # any source a deployment secret takes
-      jq: .read
-    manage_token:
-      env: SIMPLED_MANAGE_TOKEN
+
+controller:
+  hosts:
+    ops:
+      prefix: /                 # or e.g.  web: { prefix: /_simpled }
+  read_token:
+    aws: prod/simpled/tokens    # any source a deployment secret takes
+    jq: .read
+  manage_token:
+    env: SIMPLED_MANAGE_TOKEN
 ```
 
 | Field | Description |
 |-------|-------------|
-| `hosts` | Host alias to `{ prefix }`: where the API is served. The gateway strips the prefix, so `/_simpled/api/v1/status` reaches the daemon as `/api/v1/status`. A prefix that a service already has on the same domain fails validation. |
+| `hosts` | Host alias to `{ prefix }`: where the API is served. The gateway strips the prefix, so `/_simpled/api/v1/status` reaches the controller as `/api/v1/status`. A prefix that a service already has on the same domain fails validation. |
 | `read_token` | Reads state. Every source a deployment secret takes (`env`, `file`, `aws`, `json_env`, …); an `aws` token is fetched on the deploy target by `fetch-secrets.sh`. At least 32 characters, for example `openssl rand -hex 32`. |
 | `manage_token` | Everything the read token can, and the write routes when they come. |
 
-Without `hosts` the API is not routed; without a token its routes do not exist. Docker only. The tokens reach the daemon as gateway Swarm secrets on Swarm, so every manager has them, and as files under `daemon/` on standalone Docker; `daemon.json` only says where they are.
+Without `hosts` the API is not routed; without a token its routes do not exist. Docker only. The tokens reach the controller as gateway Swarm secrets on Swarm, so every manager has them, and as files under `controller/` on standalone Docker; `controller.json` only says where they are.
 
 **The read token is a credential**, not a viewer password: what the API returns, and the logs it will serve, can be as sensitive as the secrets that leak into them.
 
@@ -684,13 +685,13 @@ Every request needs `Authorization: Bearer <token>`. A missing or wrong token ge
 | Route | Returns |
 |---|---|
 | `GET /api/v1/status` | Every deployment: its version document, its health (as `/health`), and its services with desired and running counts. |
-| `GET /api/v1/deployments/{deployment}/services` | Per service: name, image, version, desired, running, unhealthy and whether an update is in progress. A deployment the daemon does not know is a 404. |
+| `GET /api/v1/deployments/{deployment}/services` | Per service: name, image, version, desired, running, unhealthy and whether an update is in progress. A deployment the controller does not know is a 404. |
 | `GET /api/v1/deployments/{deployment}/services/{service}/tasks` | Swarm: the service's last 20 tasks, newest first, each with its node, state, desired state, since when, exit code and error, which say why a service does not converge. Standalone: its containers with state, status and health. |
 | `GET /api/v1/deployments/{deployment}/services/{service}/logs` | The service's log as `text/plain`, streamed; on Swarm aggregated across nodes. `tail=200` (default; `all`, at most 10000; on Swarm Docker applies it to each task), `since=10m` (`30s`, `2h`, `1d`, or Unix seconds), `follow=1` to keep streaming, `timestamps=1`. |
 | `GET /api/v1/gateway` | The gateway's tasks per node, or its container; with Let's Encrypt on Swarm, each domain's certificate: `issuer` (`acme`, `self-signed` or `none`) and `expires_at` (Unix seconds). |
 | `GET /api/v1/nodes` | Swarm: every node's hostname, role, availability, state, address, labels and whether it leads. A 404 on standalone Docker. |
 
-`{deployment}` and `{service}` are the names from the specs (`prod`, `api`), not Swarm's. A name the daemon does not own is a 404 either way, so names cannot be probed.
+`{deployment}` and `{service}` are the names from the specs (`prod`, `api`), not Swarm's. A name the controller does not own is a 404 either way, so names cannot be probed.
 
 ```bash
 curl -H "Authorization: Bearer $SIMPLED_TOKEN" https://ops.example.com/api/v1/status
@@ -754,7 +755,7 @@ Under Docker Swarm the gateway publishes its ports in host mode, so it sees the 
 |--------|-------------|
 | `disable: true` | No TLS. HTTP only. |
 | `secret: name` | Use an existing Kubernetes TLS secret. Kubernetes only; rejected on `docker`. |
-| `letsencrypt` | Provision via Let's Encrypt: cert-manager on Kubernetes, the [simpled daemon](#certificates-on-docker-swarm) on Docker Swarm, Traefik's own ACME client on standalone Docker. `server` sets another ACME directory, such as Let's Encrypt's staging one. |
+| `letsencrypt` | Provision via Let's Encrypt: cert-manager on Kubernetes, the [simpled controller](#certificates-on-docker-swarm) on Docker Swarm, Traefik's own ACME client on standalone Docker. `server` sets another ACME directory, such as Let's Encrypt's staging one. |
 | `upstream: true` | TLS is terminated in front of the gateway, by a load balancer or CDN holding the certificate. `docker` only. See [tls.upstream](#tlsupstream). |
 
 #### tls.upstream
@@ -778,7 +779,7 @@ About `/ping`: Traefik's built-in ping router is ``PathPrefix(`/ping`)``, which 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled daemon](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
+| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled controller](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
 | `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`. |
 
 Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the ingress stack is unchanged: a single replica placed anywhere.
@@ -1641,8 +1642,8 @@ into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
 ### `simpled status`
 
 Every deployment's version, health and services, from the
-[daemon's private API](#daemon-private-api). Run it next to the env spec: the API's
-address comes from `gateway.daemon.hosts`, the token from `SIMPLED_TOKEN` (the read
+[controller's private API](#controller-private-api). Run it next to the env spec: the API's
+address comes from `controller.hosts`, the token from `SIMPLED_TOKEN` (the read
 or the manage token).
 
 ```
@@ -1663,7 +1664,7 @@ blog  blog 0.9.0  degraded, updating
 
 ### `simpled logs`
 
-A service's log, from the daemon: on Swarm, the lines of every task, read from the
+A service's log, from the controller: on Swarm, the lines of every task, read from the
 manager. Same address and token as `simpled status`.
 
 ```
@@ -1689,7 +1690,7 @@ simpled wait <DEPLOYMENT> --version <VERSION> [--timeout 10m] [--interval 5s] [-
 ### `simpled tls import`
 
 Turns the certificates in a Traefik `acme.json` into the Swarm gateway's certificate
-secrets, so the [daemon](#certificates-on-docker-swarm) does not request them again.
+secrets, so the [controller](#certificates-on-docker-swarm) does not request them again.
 Run it on a swarm manager, with the Docker CLI on `PATH`.
 
 ```
@@ -1697,7 +1698,7 @@ simpled tls import <FILE>
 ```
 
 Each name a certificate covers becomes its own secret, labelled like the ones the
-daemon issues. Expired certificates and wildcard names are skipped, and a certificate
+controller issues. Expired certificates and wildcard names are skipped, and a certificate
 imported before is not created twice. `deploy.sh` does the same on its own for a 2.0.x
 `letsencrypt/acme.json` next to it.
 
@@ -1734,7 +1735,7 @@ Output directory: `docker-deploy/<deployment-name>/`
 | `envs/<service>.env` | Per-service environment variable files |
 | `configs/` | Configuration files |
 | `secrets/` | Secret files |
-| `traefik/`, `daemon/daemon.json` | The gateway's files and the [simpled daemon](#the-simpled-daemon-docker)'s config |
+| `traefik/`, `controller/controller.json` | The gateway's files and the [simpled controller](#the-simpled-controller-docker)'s config |
 
 ### Docker Swarm (`type: docker`, `swarm_mode: true`)
 
@@ -1750,7 +1751,7 @@ Output directory: `docker-deploy/`
 | `<deployment>/<service>/` | Per-service `.env` file, read by `docker stack deploy` on the machine that runs it |
 | `<deployment>/configs/`, `<deployment>/secrets/` | The files the deployment's Swarm configs and secrets are created from. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm) |
 | `<deployment>/volumes/<name>/` | Only for unbound volumes, which `multi_node: false` allows |
-| `ingress/` | The gateway's stack: Traefik and the [simpled daemon](#the-simpled-daemon-docker). Its `traefik/` files and `daemon/daemon.json` are uploaded as Swarm configs too |
+| `ingress/` | The gateway's stack: Traefik and the [simpled controller](#the-simpled-controller-docker). Its `traefik/` files and `controller/controller.json` are uploaded as Swarm configs too |
 
 The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
 
@@ -1879,7 +1880,7 @@ A config file or secret larger than 500 KB, Swarm's limit for one object, fails
 
 #### Certificates on Docker Swarm
 
-With `tls.letsencrypt`, the [simpled daemon](#the-simpled-daemon-docker) is the
+With `tls.letsencrypt`, the [simpled controller](#the-simpled-controller-docker) is the
 gateway's ACME client, and every domain's certificate is a Swarm secret, which every
 node has. Traefik runs no ACME and keeps no `acme.json`: it reads each domain's
 certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
@@ -1887,7 +1888,7 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
 1. **First deploy.** `./simpled step tls-secrets` finds no certificate for a domain
    and creates a self-signed placeholder, so the gateway can start. Browsers warn
    until the real certificate is there, usually within a minute.
-2. **Issuing.** The daemon requests one certificate per domain, so a domain whose
+2. **Issuing.** The controller requests one certificate per domain, so a domain whose
    DNS does not point at the gateway yet fails alone. It answers Let's Encrypt's
    HTTP-01 challenge itself: every gateway task, on every node, routes
    `/.well-known/acme-challenge/` on port 80 to it, ahead of the redirect to HTTPS.
@@ -1897,20 +1898,20 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
    certificates issued in that round.
 4. **Redeploys** keep the current certificate: `step tls-secrets` picks the issued one
    that lasts longest, so the stack does not change and the gateway does not restart.
-5. **Renewal.** The daemon checks every hour and renews a certificate 30 days before
+5. **Renewal.** The controller checks every hour and renews a certificate 30 days before
    it expires. A failed request is retried after an hour, doubling up to a day. Once
    a domain has an issued certificate, its placeholder and all but the two newest
    certificates are removed.
 
-The daemon keeps no state: each start creates a new ACME account, and what it
-needs to know about a certificate is in its labels. If the daemon is down, the
+The controller keeps no state: each start creates a new ACME account, and what it
+needs to know about a certificate is in its labels. If the controller is down, the
 gateway keeps serving; renewals wait, with 30 days of margin.
 
 **Upgrading from 2.0.x.** The 2.0.x gateway kept Traefik's certificates in
 `letsencrypt/acme.json` next to `deploy.sh`. When `deploy.sh` finds that file, it
 imports the certificates of the gateway's domains into secrets before anything else,
 then renames the file `acme.json.imported`. The gateway starts with the certificates
-it already had, and the daemon requests nothing until they are 30 days from expiry.
+it already had, and the controller requests nothing until they are 30 days from expiry.
 Expired certificates and wildcard names are not imported. To import a file kept
 elsewhere, run [`simpled tls import`](#simpled-tls-import) on a swarm manager first.
 

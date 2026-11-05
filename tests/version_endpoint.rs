@@ -1,5 +1,5 @@
 //! `/.well-known/simpled/version` and `/health` on every gateway host. On Docker
-//! the environment's daemon answers them, next to the gateway; on Kubernetes
+//! the environment's controller answers them, next to the gateway; on Kubernetes
 //! every deployment ships a tiny nginx service that answers with its version.
 
 mod common;
@@ -10,7 +10,7 @@ const PATH: &str = "/.well-known/simpled/version";
 const HEALTH: &str = "/.well-known/simpled/health";
 
 #[test]
-fn the_swarm_gateway_stack_runs_the_daemon_and_no_deployment_ships_a_sidecar() {
+fn the_swarm_gateway_stack_runs_the_controller_and_no_deployment_ships_a_sidecar() {
     let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
 
@@ -19,12 +19,12 @@ fn the_swarm_gateway_stack_runs_the_daemon_and_no_deployment_ships_a_sidecar() {
 
     let ingress_text = read(&out.join("ingress").join("docker-compose.yaml"));
     let ingress: serde_yaml::Value = serde_yaml::from_str(&ingress_text).unwrap();
-    let daemon = &ingress["services"]["daemon"];
+    let controller = &ingress["services"]["controller"];
     assert_eq!(
-        daemon["image"].as_str(),
+        controller["image"].as_str(),
         Some(
             format!(
-                "${{SIMPLED_DAEMON_IMAGE:-ghcr.io/vkubiv/simpled:{}}}",
+                "${{SIMPLED_CONTROLLER_IMAGE:-ghcr.io/vkubiv/simpled:{}}}",
                 env!("CARGO_PKG_VERSION")
             )
             .as_str()
@@ -33,25 +33,25 @@ fn the_swarm_gateway_stack_runs_the_daemon_and_no_deployment_ships_a_sidecar() {
         ingress_text
     );
     assert_eq!(
-        daemon["volumes"][0].as_str(),
+        controller["volumes"][0].as_str(),
         Some("/var/run/docker.sock:/var/run/docker.sock")
     );
-    assert_eq!(daemon["read_only"].as_bool(), Some(true));
-    assert_eq!(daemon["cap_drop"][0].as_str(), Some("ALL"));
+    assert_eq!(controller["read_only"].as_bool(), Some(true));
+    assert_eq!(controller["cap_drop"][0].as_str(), Some("ALL"));
     assert_eq!(
-        daemon["deploy"]["placement"]["constraints"][0].as_str(),
+        controller["deploy"]["placement"]["constraints"][0].as_str(),
         Some("node.role == manager")
     );
     assert_eq!(
-        daemon["configs"][0]["target"].as_str(),
-        Some("/etc/simpled/daemon.json")
+        controller["configs"][0]["target"].as_str(),
+        Some("/etc/simpled/controller.json")
     );
     assert_eq!(
-        ingress["configs"]["gateway_daemon.json"]["name"].as_str(),
+        ingress["configs"]["gateway_controller.json"]["name"].as_str(),
         Some("${SIMPLED_GATEWAY_OBJECT_3}")
     );
 
-    // Only the gateway and the daemon are on the control network.
+    // Only the gateway and the controller are on the control network.
     let networks = |service: &str| -> Vec<String> {
         ingress["services"][service]["networks"]
             .as_mapping()
@@ -60,7 +60,7 @@ fn the_swarm_gateway_stack_runs_the_daemon_and_no_deployment_ships_a_sidecar() {
             .map(|k| k.as_str().unwrap().to_string())
             .collect()
     };
-    assert_eq!(networks("daemon"), vec!["simpled_control"]);
+    assert_eq!(networks("controller"), vec!["simpled_control"]);
     assert_eq!(networks("traefik"), vec!["default", "simpled_control"]);
     assert_eq!(
         ingress["networks"]["simpled_control"]["driver"].as_str(),
@@ -68,7 +68,7 @@ fn the_swarm_gateway_stack_runs_the_daemon_and_no_deployment_ships_a_sidecar() {
     );
 
     let config: serde_json::Value =
-        serde_json::from_str(&read(&out.join("ingress").join("daemon").join("daemon.json"))).unwrap();
+        serde_json::from_str(&read(&out.join("ingress").join("controller").join("controller.json"))).unwrap();
     assert_eq!(config["mode"], "swarm");
     assert_eq!(
         config["owners"],
@@ -77,7 +77,7 @@ fn the_swarm_gateway_stack_runs_the_daemon_and_no_deployment_ships_a_sidecar() {
 }
 
 #[test]
-fn traefik_routes_version_and_health_to_the_daemon() {
+fn traefik_routes_version_and_health_to_the_controller() {
     let dir = prepare(&envspec("docker", "", "type: traefik"));
     let out = dir.path().join("docker-deploy");
 
@@ -90,20 +90,20 @@ fn traefik_routes_version_and_health_to_the_daemon() {
         "{}",
         traefik
     );
-    assert_eq!(router["service"].as_str(), Some("simpled-daemon"));
+    assert_eq!(router["service"].as_str(), Some("simpled-controller"));
     assert_eq!(
-        parsed["http"]["services"]["simpled-daemon"]["loadBalancer"]["servers"][0]["url"].as_str(),
-        Some("http://ingress_daemon:8080/"),
+        parsed["http"]["services"]["simpled-controller"]["loadBalancer"]["servers"][0]["url"].as_str(),
+        Some("http://ingress_controller:8080/"),
         "{}",
         traefik
     );
 
-    // Standalone: the daemon's container, as non-root with the socket's group,
+    // Standalone: the controller's container, as non-root with the socket's group,
     // and the gateway joins its network.
     let script = read(&out.join("deploy.sh"));
     assert!(!script.contains("simpled-version-prod"), "{}", script);
-    let daemon = script
-        .find("docker run -d --name simpled-daemon --network simpled_control --network-alias ingress_daemon")
+    let controller = script
+        .find("docker run -d --name simpled-controller --network simpled_control --network-alias ingress_controller")
         .expect(&script);
     assert!(
         script.contains("--group-add \"$(stat -c %g /var/run/docker.sock)\""),
@@ -111,7 +111,7 @@ fn traefik_routes_version_and_health_to_the_daemon() {
         script
     );
     assert!(
-        daemon < script.find("docker run -d --name traefik-ingress").unwrap(),
+        controller < script.find("docker run -d --name traefik-ingress").unwrap(),
         "{}",
         script
     );
@@ -120,7 +120,8 @@ fn traefik_routes_version_and_health_to_the_daemon() {
         "{}",
         script
     );
-    let config: serde_json::Value = serde_json::from_str(&read(&out.join("daemon").join("daemon.json"))).unwrap();
+    let config: serde_json::Value =
+        serde_json::from_str(&read(&out.join("controller").join("controller.json"))).unwrap();
     assert_eq!(config["mode"], "standalone");
 }
 

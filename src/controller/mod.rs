@@ -1,7 +1,7 @@
-//! `simpled daemon`: the environment's control-plane service, next to the
+//! `simpled controller`: the environment's control-plane service, next to the
 //! gateway. It answers `/.well-known/simpled/version` and `/health` on every
 //! gateway host from the labels of the running services
-//! (`docs/design/daemon.md`).
+//! (`docs/design/controller.md`).
 
 pub mod acme;
 pub mod api;
@@ -15,17 +15,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Written by `prepare-deployment` and mounted into the daemon as a config.
+/// Written by `prepare-deployment` and mounted into the controller as a config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub simpled_version: String,
     pub mode: source::Mode,
     /// Which deployment answers on each domain.
     pub owners: Vec<Owner>,
-    /// `gateway.daemon` with a token: the private API.
+    /// `controller` with a token: the private API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
-    /// Swarm with `tls.letsencrypt`: the daemon issues the gateway's certificates.
+    /// Swarm with `tls.letsencrypt`: the controller issues the gateway's certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme: Option<acme::AcmeConfig>,
 }
@@ -36,7 +36,7 @@ pub struct Owner {
     pub deployment: String,
 }
 
-/// The private API's tokens, as files the daemon reads at start.
+/// The private API's tokens, as files the controller reads at start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,17 +45,17 @@ pub struct ApiConfig {
     pub manage_token_file: Option<String>,
 }
 
-/// Where a token is mounted into the daemon's container.
+/// Where a token is mounted into the controller's container.
 pub fn token_path(token: &str) -> String {
-    format!("/run/secrets/simpled_daemon_{}", token)
+    format!("/run/secrets/simpled_controller_{}", token)
 }
 
-/// Where the daemon looks for a token file, relative to the deploy directory.
+/// Where the controller looks for a token file, relative to the deploy directory.
 pub fn token_file(dir: &str, token: &str) -> String {
     format!("{}/{}", dir, token)
 }
 
-/// Writes the daemon's token files under `dir`, relative to `output_dir`: a
+/// Writes the controller's token files under `dir`, relative to `output_dir`: a
 /// token read when the deployment was prepared now, an `aws` one by the fetch
 /// script on the deploy target. Returns the tokens that are set.
 pub fn write_token_files(
@@ -64,11 +64,11 @@ pub fn write_token_files(
     dir: &str,
     fetch_script: &mut crate::secret_fetch::FetchScript,
 ) -> Result<Vec<&'static str>> {
-    let Some(daemon) = &spec.ingress.daemon else {
+    let Some(controller) = &spec.ingress.controller else {
         return Ok(vec![]);
     };
     let mut tokens = Vec::new();
-    for (name, token) in daemon.tokens() {
+    for (name, token) in controller.tokens() {
         let relative = token_file(dir, name);
         match token.deferred() {
             Some(reference) => {
@@ -89,30 +89,30 @@ pub fn write_token_files(
     Ok(tokens)
 }
 
-/// Where the daemon listens, inside its container.
+/// Where the controller listens, inside its container.
 pub const PORT: u16 = 8080;
-/// The network only the gateway and the daemon are on: app containers cannot
-/// reach the daemon except through the gateway's routes.
+/// The network only the gateway and the controller are on: app containers cannot
+/// reach the controller except through the gateway's routes.
 pub const CONTROL_NETWORK: &str = "simpled_control";
-/// The name the gateway reaches the daemon by: its Swarm service name in the
+/// The name the gateway reaches the controller by: its Swarm service name in the
 /// `ingress` stack, and a network alias of the standalone container.
-pub const HOST: &str = "ingress_daemon";
+pub const HOST: &str = "ingress_controller";
 /// Overrides the image, for a private registry or a local test build.
-pub const IMAGE_VAR: &str = "SIMPLED_DAEMON_IMAGE";
-/// Where the generated stack mounts `daemon.json`.
-pub const CONFIG_PATH: &str = "/etc/simpled/daemon.json";
+pub const IMAGE_VAR: &str = "SIMPLED_CONTROLLER_IMAGE";
+/// Where the generated stack mounts `controller.json`.
+pub const CONFIG_PATH: &str = "/etc/simpled/controller.json";
 
 /// The image of this simpled version, which the gateway's stack pins.
 pub fn image() -> String {
     format!("ghcr.io/vkubiv/simpled:{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// `${SIMPLED_DAEMON_IMAGE:-<image>}`, read by `docker stack deploy` and the shell alike.
+/// `${SIMPLED_CONTROLLER_IMAGE:-<image>}`, read by `docker stack deploy` and the shell alike.
 pub fn image_reference() -> String {
     format!("${{{}:-{}}}", IMAGE_VAR, image())
 }
 
-/// The daemon's config for an environment: which deployment answers on each domain.
+/// The controller's config for an environment: which deployment answers on each domain.
 pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: source::Mode) -> Config {
     Config {
         simpled_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -126,7 +126,7 @@ pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: so
                 deployment: r.deployment_name.clone(),
             })
             .collect(),
-        api: spec.ingress.daemon.as_ref().and_then(|d| {
+        api: spec.ingress.controller.as_ref().and_then(|d| {
             let path =
                 |t: &Option<crate::resolved_spec::SecretResolvedSpec>, name: &str| t.as_ref().map(|_| token_path(name));
             let api = ApiConfig {
@@ -154,10 +154,10 @@ pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: so
     }
 }
 
-/// Writes `daemon.json` into `dir`.
+/// Writes `controller.json` into `dir`.
 pub fn write_config(dir: &Path, config: &Config) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join("daemon.json");
+    let path = dir.join("controller.json");
     std::fs::write(
         &path,
         serde_json::to_string_pretty(config)?
@@ -170,10 +170,10 @@ pub fn write_config(dir: &Path, config: &Config) -> Result<()> {
 pub fn run(config: &Path, listen: &str) -> Result<()> {
     let text = std::fs::read_to_string(config).with_context(|| format!("Cannot read {}", config.display()))?;
     let config: Config =
-        serde_json::from_str(&text).with_context(|| format!("{} is not a daemon config", config.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("{} is not a controller config", config.display()))?;
     if config.simpled_version != env!("CARGO_PKG_VERSION") {
         eprintln!(
-            "Warning: the config was written by simpled {}, this daemon is {}",
+            "Warning: the config was written by simpled {}, this controller is {}",
             config.simpled_version,
             env!("CARGO_PKG_VERSION")
         );
@@ -234,7 +234,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
             .await
             .with_context(|| format!("Cannot listen on {}", listen))?;
         eprintln!(
-            "simpled daemon {} listening on {}, answering for {} domain(s)",
+            "simpled controller {} listening on {}, answering for {} domain(s)",
             env!("CARGO_PKG_VERSION"),
             listen,
             app.owners.len()
@@ -242,7 +242,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
         axum::serve(listener, http::router(app))
             .with_graceful_shutdown(shutdown())
             .await
-            .context("The daemon's server failed")
+            .context("The controller's server failed")
     })
 }
 

@@ -1,9 +1,9 @@
-# Design: simpled daemon
+# Design: simpled controller
 
 Status: draft · Targets: Docker (standalone and Swarm) and local. Kubernetes is out of scope for now.
 The Docker gateway is Traefik only; the nginx gateway has been removed.
 
-`simpled daemon` is a small control-plane service, built from the same binary as the
+`simpled controller` is a small control-plane service, built from the same binary as the
 CLI, that runs next to the gateway of an environment. Phase 1 reports state. A later
 phase also changes state. It replaces the per-deployment nginx sidecar
 (`simpled-version-<deployment>`) that answers `/.well-known/simpled/version` today.
@@ -27,34 +27,34 @@ Goals:
 - **The same API locally.** `simpled local run` serves it in-process.
 - **Fix the multi-node gaps of the Swarm target** that need something running there
   (§7), above all Let's Encrypt with `gateway.global: true`. The gaps that need no
-  daemon are fixed by the Swarm storage changes in simpled 2.0.0 (§8).
+  controller are fixed by the Swarm storage changes in simpled 2.0.0 (§8).
 
 Non-goals for now: Kubernetes, multi-environment fleet views, a web UI, metrics
-storage, and alerting. The daemon reports the current state. History lives elsewhere.
+storage, and alerting. The controller reports the current state. History lives elsewhere.
 
 ---
 
-## 2. Where it runs: one daemon per environment, in the ingress stack
+## 2. Where it runs: one controller per environment, in the ingress stack
 
-In the first sketch the daemon was per deployment, like the nginx sidecar. **That
-does not hold once the daemon manages certificates.** The gateway belongs to the
+In the first sketch the controller was per deployment, like the nginx sidecar. **That
+does not hold once the controller manages certificates.** The gateway belongs to the
 environment, since it serves every deployment of the env spec, so the component that
 issues its certificates must also belong to the environment. Two per-deployment
-daemons would each run an ACME client for the same domains.
+controllers would each run an ACME client for the same domains.
 
 So:
 
 | Target | How it runs |
 |---|---|
-| Swarm | Service `daemon` in the `ingress` stack, next to `traefik`. `replicas: 1`, constraint `node.role == manager`. |
-| Standalone Docker | `docker run -d --name simpled-daemon` in `deploy.sh`, right before the gateway, the same way the gateway is started today. |
+| Swarm | Service `controller` in the `ingress` stack, next to `traefik`. `replicas: 1`, constraint `node.role == manager`. |
+| Standalone Docker | `docker run -d --name simpled-controller` in `deploy.sh`, right before the gateway, the same way the gateway is started today. |
 | Local | No container. The local gateway (`local_ingress.rs`) serves the routes in-process. |
 
 The ingress stack is already rewritten by every deployment's `deploy.sh` from the
-full env spec, so the daemon gets the same lifecycle and the same caveat as the
+full env spec, so the controller gets the same lifecycle and the same caveat as the
 gateway: the last deploy writes its configuration.
 
-**The version document now comes from labels.** An env-level daemon cannot hold a
+**The version document now comes from labels.** An env-level controller cannot hold a
 static document for each deployment, because deploying one deployment would
 overwrite the others. That is the reason the sidecar exists today. Instead, every
 service in a deployment's stack gets labels when it is prepared:
@@ -67,7 +67,7 @@ simpled.deployed_at=1790945826
 simpled.service=api          # the name from the spec, not the swarm name
 ```
 
-The daemon reads them through the Docker API. This is more accurate than today: the
+The controller reads them through the Docker API. This is more accurate than today: the
 endpoint reports what is actually running, and it can tell when two versions are
 running at once during a rollout. The JSON shape of `/version` stays the same.
 
@@ -77,51 +77,51 @@ deployment a domain answers for, and `health` uses it too.
 
 ### Image
 
-The daemon ships as `ghcr.io/vkubiv/simpled:<version>`: the static musl build of the
+The controller ships as `ghcr.io/vkubiv/simpled:<version>`: the static musl build of the
 same binary on `scratch`, with CA certificates for ACME. `release.yml` builds it for
 amd64 and arm64. `prepare-deployment` pins the tag to its own version, so the
-generator and the daemon always agree on labels and routes. `gateway.daemon.image`
+generator and the controller always agree on labels and routes. `controller.image`
 overrides it for private registries.
 
 How it is built (`Dockerfile`, `release.yml`):
 
-- The `daemon-binary` jobs build `x86_64-unknown-linux-musl` and
+- The `controller-binary` jobs build `x86_64-unknown-linux-musl` and
   `aarch64-unknown-linux-musl` natively, on the amd64 and arm64 runners, and check
   that the result is static.
-- The `daemon-image` job puts both into one multi-platform image. The Dockerfile only
+- The `controller-image` job puts both into one multi-platform image. The Dockerfile only
   copies files (the binary for `TARGETARCH`, and Alpine's CA bundle), so the build
   needs no emulation. The GitHub release is created only after the image is pushed.
 - CI builds both binaries and images without pushing, so a change that breaks them
   fails a PR.
 - The image runs as user 65532. The socket is `root:docker` (or `root:root` on Docker
   Desktop) with mode 660, so standalone `deploy.sh` adds the socket's group to the
-  daemon's container. The Swarm stack runs it as root instead (see Docker access). Tested: as 65532 with `--read-only --cap-drop ALL` and that
-  group added, the daemon reads the socket. It stops on SIGTERM in about half a
+  controller's container. The Swarm stack runs it as root instead (see Docker access). Tested: as 65532 with `--read-only --cap-drop ALL` and that
+  group added, the controller reads the socket. It stops on SIGTERM in about half a
   second.
 - **The ghcr package is private when it is first pushed.** It has to be made public
   once in the package settings, or deploy targets cannot pull it.
 
 ### Docker access
 
-The daemon talks to `/var/run/docker.sock` through `bollard`, which also handles the
+The controller talks to `/var/run/docker.sock` through `bollard`, which also handles the
 Windows named pipe for local runs. **This is the one real change in security
 posture.** Until now, no generated container had the socket, and the socket is
 effectively root on the host. Mitigations:
 
-- The daemon is reachable only from the gateway, on its own network (§5), never from
+- The controller is reachable only from the gateway, on its own network (§5), never from
   app containers.
 - The public routes take no input beyond the Host header. Every other route needs a
   token, and with no tokens configured, those routes do not exist.
-- The daemon only acts on objects it owns: anything labelled `simpled.*`, the
+- The controller only acts on objects it owns: anything labelled `simpled.*`, the
   `ingress` stack, and `simpled_*` configs and secrets. It refuses everything else
   even with the manage token.
 - `read_only: true` root filesystem and no capabilities. On standalone Docker, a
   non-root user in the group that owns the socket, looked up by `deploy.sh` on the
-  host that runs both. On Swarm, root: the daemon runs on any manager, and their
+  host that runs both. On Swarm, root: the controller runs on any manager, and their
   `docker` groups need not have the same number. With the socket, root in the
   container gives nothing the socket does not already give.
 
-The daemon needs write access to Docker from the ACME phase on (§7.1: it creates
+The controller needs write access to Docker from the ACME phase on (§7.1: it creates
 certificate secrets and updates the gateway service), so a GET-only socket proxy
 would only be a stopgap and is not planned.
 
@@ -134,38 +134,41 @@ gateway:
   hosts:
     web: shop.example.com
     ops: ops.example.com
-  daemon:                       # optional block; the daemon runs regardless
-    hosts:                      # where the private API is routed, like a service
-      ops: { prefix: / }        # or e.g.  web: { prefix: /_simpled }
-    read_token:                 # a secret source, same shapes as deployment secrets
-      aws: prod/simpled/tokens
-      jq: .read
-    manage_token:
-      env: SIMPLED_MANAGE_TOKEN
-    image: registry.example.com/simpled:1.14.0   # optional override
+
+controller:                     # optional block; the controller runs regardless
+  hosts:                        # where the private API is routed, by gateway host alias
+    ops: { prefix: / }          # or e.g.  web: { prefix: /_simpled }
+  read_token:                   # a secret source, same shapes as deployment secrets
+    aws: prod/simpled/tokens
+    jq: .read
+  manage_token:
+    env: SIMPLED_MANAGE_TOKEN
 ```
 
-- `daemon.hosts` uses the same shape and validation as a service's `hosts`
+- `controller.hosts` uses the same shape and validation as a service's `hosts`
   (`prefix`, `prefixes`, `strip` and `body_limit`, with `strip` defaulting to true). A
   path that collides with an app route on the same domain fails validation with the
   usual error.
-- **Without `daemon.hosts`, the private API is not routed**, even when tokens are
+- **Without `controller.hosts`, the private API is not routed**, even when tokens are
   set. Without `read_token`, the read routes do not exist. Without `manage_token`,
   the manage routes do not exist. Every combination is valid. Setting a token without
   `hosts` gets a warning, because the token would be unusable.
 - Tokens use every secret source a deployment secret accepts (`env`, `file`, `aws`,
   `json_env`, ...), resolved by the same code. `aws` is deferred to
   `fetch-secrets.sh` as usual. Validation requires at least 32 characters.
-- The block sits on `gateway` and not on a deployment, because the daemon belongs to
-  the environment (§2).
+- The block sits at the top level, beside `gateway` and not on a deployment: the
+  controller belongs to the environment (§2), and it is more than the gateway's
+  helper. Its `hosts` name aliases from `gateway.hosts`.
+- As built (step 6a), a host takes only `prefix`, which the gateway strips; there is
+  no `image` field yet, `SIMPLED_CONTROLLER_IMAGE` on `deploy.sh` overrides the image.
 
-How the tokens reach the daemon:
+How the tokens reach the controller:
 
 | Target | Delivery |
 |---|---|
-| Swarm | Content-addressed Swarm secrets (§8.2). **Not** a bind mount: the daemon may run on another manager than the one that ran `deploy.sh`. |
+| Swarm | Content-addressed Swarm secrets (§8.2). **Not** a bind mount: the controller may run on another manager than the one that ran `deploy.sh`. |
 | Standalone | A bind mount of a file under `secrets/`, the same as deployment secrets today. |
-| Local | Read in-process. In `localenv.yaml` the tokens are optional while the gateway binds a loopback address. With `--bind 0.0.0.0` they are required, if `daemon.hosts` is set. |
+| Local | Read in-process. In `localenv.yaml` the tokens are optional while the gateway binds a loopback address. With `--bind 0.0.0.0` they are required, if `controller.hosts` is set. |
 
 ---
 
@@ -191,7 +194,7 @@ Health is computed for the deployment that owns the host:
 `converged` closes the gap the reference states today: *"the answer says the
 deployment's stack was updated, not that every service in it is healthy."*
 
-### Private, under `daemon.hosts`, with `Authorization: Bearer <token>`
+### Private, under `controller.hosts`, with `Authorization: Bearer <token>`
 
 | Route | Token | Returns |
 |---|---|---|
@@ -209,7 +212,7 @@ deployment's stack was updated, not that every service in it is healthy."*
 Rules:
 
 - `{d}` and `{s}` are the names from the env spec (`prod`, `api`), not Swarm names.
-  A name the daemon does not own is a 404, not a 403, so names cannot be probed.
+  A name the controller does not own is a 404, not a 403, so names cannot be probed.
 - A wrong or missing token gets 401 and a token without enough rights gets 403.
   Tokens are compared in constant time. Failed attempts are rate-limited per client
   IP, using the real client IP that the gateway already forwards (`trusted_proxies`).
@@ -221,7 +224,7 @@ Rules:
 ### CLI client
 
 `simpled status` and `simpled logs <deployment> <service> [-f]` find the URL from
-the env spec (`daemon.hosts`) and the token from `SIMPLED_TOKEN`. For CI there is
+the env spec (`controller.hosts`) and the token from `SIMPLED_TOKEN`. For CI there is
 `simpled wait --version 1.2.3 --timeout 10m`, which polls `/health` on the
 deployment's primary host until it reports `converged` and `healthy` at that version.
 Today the docs suggest polling `/version` for this, which only proves the stack was
@@ -235,15 +238,15 @@ updated.
             :80/:443 (host mode, every node with global: true)
  client ──► gateway ──── common_network ────► app services
               │
-              └──── simpled_control (overlay, attachable: false) ──► daemon :8080 (API + public)
-                                                                     daemon :8081 (ACME challenges)
+              └──── simpled_control (overlay, attachable: false) ──► controller :8080 (API + public)
+                                                                     controller :8081 (ACME challenges)
 ```
 
-- `simpled_control` contains only the gateway and the daemon. App containers sit on
-  `common_network` and cannot reach the daemon except through gateway routes.
+- `simpled_control` contains only the gateway and the controller. App containers sit on
+  `common_network` and cannot reach the controller except through gateway routes.
 - The gateway routes `/.well-known/simpled/{version,health}` on each owned host, the
-  `daemon.hosts` paths, and, from Phase 3, `/.well-known/acme-challenge/` on every
-  domain to the daemon.
+  `controller.hosts` paths, and, from Phase 3, `/.well-known/acme-challenge/` on every
+  domain to the controller.
 - Standalone Docker uses a bridge network named `simpled_control`, with the same
   layout.
 
@@ -252,13 +255,13 @@ updated.
 ## 6. Locally
 
 `simpled local run` and `simpled test e2e` already run the gateway in-process
-(`local_ingress.rs`, axum). The daemon's router becomes a library module
-(`src/daemon/`) that both the `daemon` subcommand and the local gateway mount:
+(`local_ingress.rs`, axum). The controller's router becomes a library module
+(`src/controller/`) that both the `controller` subcommand and the local gateway mount:
 
 - `version` and `health` are added on every local port (`version` is already there).
   Health reads the compose project's containers through the local Docker API, so the
   local stack is filtered by `com.docker.compose.project`, not by Swarm labels.
-- The private API is mounted under `daemon.hosts` when `localenv.yaml` sets it, with
+- The private API is mounted under `controller.hosts` when `localenv.yaml` sets it, with
   the auth relaxation described in §3.
 - No ACME locally.
 
@@ -268,12 +271,12 @@ updated.
 
 ## 7. Problems it can solve
 
-Each problem is followed by whether the daemon is actually the right fix. Some are
+Each problem is followed by whether the controller is actually the right fix. Some are
 not, and those should be fixed without it.
 
-### 7.1 Let's Encrypt with more than one gateway node *(daemon: yes)*
+### 7.1 Let's Encrypt with more than one gateway node *(controller: yes)*
 
-**Before the daemon** (simpled 2.0.x). The Swarm Traefik gateway was its own ACME
+**Before the controller** (simpled 2.0.x). The Swarm Traefik gateway was its own ACME
 client and stored `/letsencrypt/acme.json` in a bind-mounted directory of the node it
 ran on. Hence:
 
@@ -285,7 +288,7 @@ ran on. Hence:
   again. Let's Encrypt allows 5 duplicate certificates per week, so a few reschedules
   in a bad week lock the domain out.
 
-**With the daemon.** The daemon is the only ACME client, using the `instant-acme`
+**With the controller.** The controller is the only ACME client, using the `instant-acme`
 crate. Traefik no longer runs ACME at all: it only reads PEM files.
 
 As built (steps 5a and 5b), it differs from the plan below in three places:
@@ -309,10 +312,10 @@ HTTP-01 validation through Traefik, one rolling restart of the gateway, and a
 redeploy that kept both certificates and restarted nothing.
 
 1. **Challenges.** Every gateway task, on every node, proxies
-   `/.well-known/acme-challenge/*` to the daemon over `simpled_control`. It no longer
+   `/.well-known/acme-challenge/*` to the controller over `simpled_control`. It no longer
    matters which node the challenge lands on. This is what lifts the
    `global` + `letsencrypt` restriction.
-2. **Certificates are Swarm secrets.** On issue or renewal, the daemon creates
+2. **Certificates are Swarm secrets.** On issue or renewal, the controller creates
    `simpled_tls_<hash>` holding the certificate chain and the key, labelled
    `simpled.tls.domains=…` and `simpled.tls.not_after=…`. Traefik loads it through
    the file provider:
@@ -324,15 +327,15 @@ redeploy that kept both certificates and restarted nothing.
    ```
    Secrets reach every node through Raft (the store the Swarm managers replicate
    among themselves), so there is no shared storage and nothing to encrypt by hand.
-3. **Delivery.** The daemon runs a rolling `service update` of the gateway onto the
+3. **Delivery.** The controller runs a rolling `service update` of the gateway onto the
    new secret, one task at a time, using the gateway's own `update` policy.
    `deploy.sh` looks up the current certificate secret by label and passes it into
    the ingress stack, so a redeploy keeps it. On the first deploy there is no secret
    yet, so the gateway starts with Traefik's default certificate until the first
    certificate is issued.
-4. **No state to keep.** The daemon never reads a certificate back: the domains and
+4. **No state to keep.** The controller never reads a certificate back: the domains and
    the expiry date are in the labels, which the API returns. The ACME account is not
-   kept either. A new account on each daemon start is fine, because the rate limits
+   kept either. A new account on each controller start is fine, because the rate limits
    that matter are on certificates, not on accounts.
 5. **Renewal** happens 30 days before expiry, with a jittered retry. Expiry shows up
    in `GET /api/v1/gateway`, and `/health` reports `degraded` when a certificate is
@@ -340,7 +343,7 @@ redeploy that kept both certificates and restarted nothing.
 6. **Migration.** `simpled tls import acme.json` turns the certificates and keys in an
    existing Traefik `acme.json`, where both are stored base64-encoded, into
    `simpled_tls_*` secrets. Upgrading then issues nothing new.
-7. **Standalone Docker** has a single host, so the daemon writes the PEM files into a
+7. **Standalone Docker** has a single host, so the controller writes the PEM files into a
    directory that Traefik's file provider watches, and Traefik picks them up without
    a restart.
 
@@ -350,10 +353,10 @@ the moment its task restarts. A load balancer that checks `/ping` stops sending 
 the node first. With DNS round-robin straight to the nodes, a few requests can fail
 once every two months.
 
-**What it does not depend on.** Gateways never depend on the daemon at runtime. If
-the daemon is down, renewals wait, with 30 days of margin.
+**What it does not depend on.** Gateways never depend on the controller at runtime. If
+the controller is down, renewals wait, with 30 days of margin.
 
-### 7.2 Bind-mounted files on a multi-node Swarm *(daemon: no)*
+### 7.2 Bind-mounted files on a multi-node Swarm *(controller: no)*
 
 The generated stacks bind-mount files that exist only in the deploy directory of the
 node that ran `deploy.sh`: the gateway's `traefik.yml` and `dynamic_conf.yml`,
@@ -363,9 +366,9 @@ node, which is every node with `global: true`, finds no bind source. Swarm rejec
 it, or, worse, the task starts against a directory that `mkdir -p` created empty on
 an earlier run.
 
-This does not need the daemon. It is fixed by the Swarm storage changes in §8.
+This does not need the controller. It is fixed by the Swarm storage changes in §8.
 
-### 7.3 "Is the deploy actually done?" for CI *(daemon: yes)*
+### 7.3 "Is the deploy actually done?" for CI *(controller: yes)*
 
 `deploy.sh` waits with `--detach=false`, but only the pipeline that ran it knows the
 result. Anything else, such as a second pipeline, a smoke test or a status page, can
@@ -373,7 +376,7 @@ only poll `/version`. `/health` with `converged`, together with `simpled wait`, 
 them a real signal that also survives regressions after the deploy, such as a crash
 loop an hour later.
 
-### 7.4 Logs and state without SSH *(daemon: yes)*
+### 7.4 Logs and state without SSH *(controller: yes)*
 
 Today, finding out why `api` is restarting means SSH to a manager, then
 `docker service ps --no-trunc` and `docker service logs`. The read token and
@@ -382,7 +385,7 @@ have SSH.
 
 ### 7.5 Later, not now
 
-These all need the daemon on every node (`mode: global`, an "agent" role), because
+These all need the controller on every node (`mode: global`, an "agent" role), because
 the Docker API of a manager does not reach containers on other nodes:
 
 - Per-container CPU and memory stats from workers.
@@ -398,7 +401,7 @@ refreshing deferred `aws` secrets without a full redeploy.
 ## 8. Swarm storage (simpled 2.0.0)
 
 These are breaking changes, so they ship together as simpled 2.0.0. They do not
-depend on the daemon, and the daemon's certificates (§7.1) and tokens (§3) build on
+depend on the controller, and the controller's certificates (§7.1) and tokens (§3) build on
 them.
 
 The principle: **every file a task needs either travels through Raft (configs,
@@ -622,7 +625,7 @@ variables, on files next to the spec, on `extends`, and on the downloaded bundle
 
 | File | Holds |
 |---|---|
-| `ingress/plan.json` | The environment: gateway, daemon, environment objects, `multi_node`, the env spec hash, the simpled version |
+| `ingress/plan.json` | The environment: gateway, controller, environment objects, `multi_node`, the env spec hash, the simpled version |
 | `<deployment>/plan.json` | One deployment: its objects with their hashes, its jobs, constraints and phases |
 
 A plan holds no more than the stack file does. File secrets appear only as paths, and
@@ -644,13 +647,13 @@ from interfering with each other:
    `deploy.sh`, binary, plans and `ingress/` copy.
 2. **Owners on every object, and pruning that stays within its owner.** Deployment
    objects are labelled `simpled.deployment=<name>`, and `prune-objects shop` touches
-   only those. Environment objects (gateway files, daemon tokens, certificates) are
+   only those. Environment objects (gateway files, controller tokens, certificates) are
    labelled `simpled.scope=environment`, and only the ingress side prunes them.
 3. **No downgrades of the environment.** The gateway service is labelled with the
    simpled version and the deployment that deployed it. `step check-gateway`, right
    before the ingress stack deploys, stops a deploy that would replace it with a
    lower simpled version, unless `SIMPLED_ALLOW_DOWNGRADE=1` is set. This guards the
-   daemon, whose image is pinned to the simpled version. Instead of an env spec
+   controller, whose image is pinned to the simpled version. Instead of an env spec
    hash, the step compares the gateway's routing config that runs with the one about
    to replace it: both are content-addressed Swarm configs, and configs can be read
    back, so it prints the changed lines. A deploy from a stale checkout shows in the
@@ -688,32 +691,32 @@ and the release notes are `docs/releases/2.0.0.md`.
 
 ## 9. Phases
 
-1. **Replace the sidecar.** Add the `simpled daemon` subcommand, the version route
+1. **Replace the sidecar.** Add the `simpled controller` subcommand, the version route
    reading labels, the labels added in `prepare-deployment`, the image in
-   `release.yml`, the daemon in the ingress stack (Swarm) and `deploy.sh`
+   `release.yml`, the controller in the ingress stack (Swarm) and `deploy.sh`
    (standalone), and the `simpled_control` network. Remove
    `simpled-version-<deployment>`. Behavior does not change.
 2. **simpled 2.0.0: Swarm storage and deploy steps (§8).** `multi_node`,
    content-addressed configs and secrets, volume bindings, the relative-path rule,
    `simpled step` with the shipped binary and the plans, the lock and the downgrade
-   guard. This does not depend on the daemon and can ship before phase 1, or
+   guard. This does not depend on the controller and can ship before phase 1, or
    together with it.
-3. **Status.** Public `/health`, `gateway.daemon` in the spec, tokens (as Swarm
+3. **Status.** Public `/health`, the top-level `controller` in the spec, tokens (as Swarm
    secrets, §8.2), the private read API, logs, the local mount, `simpled status`,
    `simpled logs` and `simpled wait`.
 4. **ACME.** Challenges, certificates as secrets, the rolling gateway update, renewal,
    `simpled tls import`, and lifting the `global` + `letsencrypt` rejection.
 5. **Manage.** Restart, scale and rollback with the manage token.
-6. **Agent mode.** A global per-node daemon for stats, prune and disk space.
+6. **Agent mode.** A global per-node controller for stats, prune and disk space.
 
 ---
 
 ## 10. Open questions
 
-1. **Always on, or opt-in?** This draft runs the daemon in every Docker environment,
+1. **Always on, or opt-in?** This draft runs the controller in every Docker environment,
    because it replaces the version sidecar and later issues certificates. That means
    every environment now has a container with the Docker socket. The alternative is
-   `gateway.daemon.enabled: false`, which brings back a static version answer with
+   `controller.enabled: false`, which brings back a static version answer with
    no health.
 2. ~~**Secret target paths.**~~ Resolved: absolute targets work for secrets too
    (§8.2).

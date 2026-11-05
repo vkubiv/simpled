@@ -615,7 +615,7 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
         "{:?}",
         args
     );
-    // The gateway service; the daemon next to it is always placed on a manager.
+    // The gateway service; the controller next to it is always placed on a manager.
     let ingress: serde_yaml::Value =
         serde_yaml::from_str(&read(&out.join("ingress").join("docker-compose.yaml"))).unwrap();
     let gateway = &ingress["services"]["traefik"]["deploy"];

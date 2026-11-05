@@ -1,10 +1,10 @@
-//! What the daemon answers, computed from the state of a deployment's services.
+//! What the controller answers, computed from the state of a deployment's services.
 //! Pure functions, so the rules are tested without Docker.
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
-/// Labels `prepare-deployment` puts on every service of a deployment. The daemon
+/// Labels `prepare-deployment` puts on every service of a deployment. The controller
 /// finds a deployment's services by them and reads its version from them.
 pub mod labels {
     pub const DEPLOYMENT: &str = "simpled.deployment";
@@ -39,7 +39,7 @@ pub mod labels {
         .collect()
     }
 
-    /// A deployment's services the daemon reports on: the long-running ones.
+    /// A deployment's services the controller reports on: the long-running ones.
     /// Jobs finish, and the nginx version sidecar is not part of the app.
     pub fn is_reported(
         deployment: &crate::resolved_spec::DeploymentResolvedSpec,

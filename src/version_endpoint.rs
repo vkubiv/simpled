@@ -5,8 +5,8 @@
 //! each of their deploys, so it cannot hold the version itself — deploying one
 //! deployment would overwrite the others'. On Kubernetes each deployment gets a
 //! tiny nginx service of its own that answers with its document, and the
-//! ingress routes the path to the right one. On Docker the environment's daemon
-//! answers instead, from the labels of the running services (`crate::daemon`).
+//! ingress routes the path to the right one. On Docker the environment's controller
+//! answers instead, from the labels of the running services (`crate::controller`).
 //! Locally there is one deployment, and the local gateway answers directly.
 
 use crate::resolved_spec::{ServiceResolvedSpec, VersionRoute};

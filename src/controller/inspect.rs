@@ -42,7 +42,7 @@ pub fn task_json(task: &Task, nodes: &HashMap<String, String>) -> Value {
 /// A service's tasks, newest first, at most `MAX_TASKS`.
 pub fn tasks_json(tasks: &[Task], nodes: &HashMap<String, String>) -> Vec<Value> {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
-    // Swarm's timestamps are RFC 3339 in UTC with a fixed width per daemon, so
+    // Swarm's timestamps are RFC 3339 in UTC with a fixed width per controller, so
     // they order as text.
     sorted.sort_by(|a, b| {
         let at = |t: &Task| t.status.as_ref().and_then(|s| s.timestamp.clone()).unwrap_or_default();

@@ -31,19 +31,19 @@ pub struct IngressResolvedSpec {
     pub global: bool,
     /// Swarm only: where the gateway task(s) may run.
     pub placement: Option<Placement>,
-    /// Docker only: the daemon's private API.
-    pub daemon: Option<DaemonResolvedSpec>,
+    /// Docker only: the controller's private API.
+    pub controller: Option<ControllerResolvedSpec>,
 }
 
 #[derive(Debug, Clone)]
-pub struct DaemonResolvedSpec {
+pub struct ControllerResolvedSpec {
     /// Domain and path prefix the private API is served under.
     pub routes: Vec<(String, String)>,
     pub read_token: Option<SecretResolvedSpec>,
     pub manage_token: Option<SecretResolvedSpec>,
 }
 
-impl DaemonResolvedSpec {
+impl ControllerResolvedSpec {
     pub fn tokens(&self) -> impl Iterator<Item = (&'static str, &SecretResolvedSpec)> {
         [("read_token", &self.read_token), ("manage_token", &self.manage_token)]
             .into_iter()
