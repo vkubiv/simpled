@@ -620,6 +620,8 @@ On Docker the host also answers `GET /.well-known/simpled/health`, with status 2
 | `degraded` | a service runs fewer tasks than it should, or a container fails its healthcheck |
 | `healthy` | neither |
 
+On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`. Right after the first deploy, that lasts until the daemon has issued the certificates, usually under a minute.
+
 `converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
 
 There is nothing to configure. A host belongs to a deployment:
@@ -729,7 +731,7 @@ About `/ping`: Traefik's built-in ping router is ``PathPrefix(`/ping`)``, which 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Rejected together with `tls.letsencrypt`: each task would run its own ACME client, and the HTTP-01 challenge would land on a random node. Allowed with `tls.upstream` or `disable: true`. |
+| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled daemon](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
 | `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`. |
 
 Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the ingress stack is unchanged: a single replica placed anywhere.

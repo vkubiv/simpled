@@ -300,6 +300,10 @@ As built (steps 5a and 5b), it differs from the plan below in three places:
 - **The HTTPS redirect has priority 1.** Traefik's entry-point redirect normally
   outranks every router; at 1, the challenge router on `web` is reached first.
 
+Step 5d lifted the `global` + `letsencrypt` rejection, and `/health` reports `tls`
+(`valid`, `expiring` within 7 days, or `self-signed`), which degrades a healthy
+deployment. The placeholder counts too: browsers warn while it is served.
+
 Tested against Pebble, Let's Encrypt's test server: two domains issued through real
 HTTP-01 validation through Traefik, one rolling restart of the gateway, and a
 redeploy that kept both certificates and restarted nothing.

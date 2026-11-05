@@ -843,12 +843,9 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         .as_ref()
         .map(|p| convert_placement(p, "gateway"))
         .transpose()?;
-    if global && tls.as_ref().is_some_and(|t| t.letsencrypt.is_some()) {
-        return Err(anyhow!(
-            "gateway global cannot be combined with tls.letsencrypt: every gateway task would run its own ACME client \
-             and the HTTP-01 challenge would reach a random node. Terminate TLS upstream (tls.upstream) instead"
-        ));
-    }
+    // `global` with `tls.letsencrypt` is fine: `global` is Swarm-only, and there
+    // the daemon is the only ACME client, which every gateway task forwards the
+    // HTTP-01 challenges to, whichever node they reach.
     if global && placement.as_ref().is_some_and(|p| !p.spread.is_empty()) {
         return Err(anyhow!(
             "gateway placement.preferences cannot be combined with global: a global service runs one task on every eligible node"
