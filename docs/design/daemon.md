@@ -636,7 +636,11 @@ nothing deletes it. The gateway stops routing to it. A later
 | Swarm, relative bind paths | Error. Or `multi_node: false`. |
 | Swarm, config or secret files on a shared volume | Nothing to change: they become Swarm objects automatically. |
 | Target on a different CPU type than CI (for example arm64) | Set `target_platform`, and pass `--target-binary` until releases build an arm64 binary. |
-| `gateway.type: nginx`, `tls.secret` on Docker | Already rejected (removed before 2.0.0). |
+| `gateway.type: nginx`, `tls.secret` on Docker | Rejected. Removed on main after 1.13.1, so first released in 2.0.0. |
+| Several deployments sharing one directory on the target | Each needs its own directory (§8.6). |
+
+The user-facing version of this table is "Upgrading to 2.0.0" in `docs/reference.md`,
+and the release notes are `docs/releases/2.0.0.md`.
 
 ---
 
