@@ -184,6 +184,112 @@ pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/deployments/{deployment}/services", get(services))
+        .route("/api/v1/deployments/{deployment}/services/{service}/tasks", get(tasks))
+        .route("/api/v1/deployments/{deployment}/services/{service}/logs", get(logs))
+        .route("/api/v1/gateway", get(gateway))
+        .route("/api/v1/nodes", get(nodes))
+}
+
+fn unavailable(what: &str, e: anyhow::Error) -> Response {
+    eprintln!("api: {}: {:#}", what, e);
+    error(StatusCode::SERVICE_UNAVAILABLE, "cannot read the state from Docker")
+}
+
+/// A service's tasks on Swarm: node, state, since, exit code and error, newest
+/// first. Its containers on standalone Docker.
+async fn tasks(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path((deployment, service)): Path<(String, String)>,
+) -> Response {
+    if let Err(denied) = guard(&app, &headers) {
+        return denied.into_response();
+    }
+    match app.source.tasks(&deployment, &service).await {
+        Ok(Some(body)) => json_ok(body),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => unavailable("tasks", e),
+    }
+}
+
+/// A service's log as `text/plain`, streamed: on Swarm, the service's log
+/// aggregated across nodes. `?tail=200&since=10m&follow=1&timestamps=1`.
+async fn logs(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path((deployment, service)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(denied) = guard(&app, &headers) {
+        return denied.into_response();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let query = match super::inspect::log_query(&params, now) {
+        Ok(q) => q,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({ "error": message }).to_string(),
+            )
+                .into_response()
+        }
+    };
+    match app.source.logs(&deployment, &service, query).await {
+        Ok(Some(stream)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => unavailable("logs", e),
+    }
+}
+
+/// The gateway's tasks per node, and, where the daemon issues them, the
+/// certificates of its domains with their expiry.
+async fn gateway(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(denied) = guard(&app, &headers) {
+        return denied.into_response();
+    }
+    let mut body = match app.source.gateway().await {
+        Ok(body) => body,
+        Err(e) => return unavailable("gateway", e),
+    };
+    if let Some(certs) = &app.certs {
+        let mut list = Vec::new();
+        for domain in &certs.domains {
+            let (issuer, expires_at) = match certs.source.current(domain).await {
+                Ok(Some((true, not_after))) => ("acme", Some(not_after)),
+                Ok(Some((false, _))) => ("self-signed", None),
+                Ok(None) => ("none", None),
+                Err(e) => return unavailable("certificates", e),
+            };
+            list.push(json!({ "domain": domain, "issuer": issuer, "expires_at": expires_at }));
+        }
+        body["certificates"] = json!(list);
+    }
+    json_ok(body)
+}
+
+/// The swarm's nodes: role, availability, state and labels. 404 on standalone
+/// Docker, which has none.
+async fn nodes(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(denied) = guard(&app, &headers) {
+        return denied.into_response();
+    }
+    match app.source.nodes().await {
+        Ok(Some(body)) => json_ok(body),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not a swarm"),
+        Err(e) => unavailable("nodes", e),
+    }
 }
 
 fn guard(app: &App, headers: &HeaderMap) -> Result<(), Denied> {

@@ -20,6 +20,8 @@ pub struct Certs {
     pub source: Box<dyn super::source::CertSource>,
     /// Deployment to the domains it owns that have a certificate.
     pub domains_of: HashMap<String, Vec<String>>,
+    /// Every domain the gateway holds a certificate for.
+    pub domains: Vec<String>,
 }
 
 pub struct App {
@@ -311,6 +313,7 @@ mod tests {
                 certs: Some(Certs {
                     source: Box::new(FakeCerts(current)),
                     domains_of: HashMap::from([("prod".to_string(), vec!["shop.example.com".to_string()])]),
+                    domains: vec!["shop.example.com".to_string()],
                 }),
             });
             run(async move {
@@ -392,5 +395,82 @@ mod tests {
 
     fn api_service() -> ServiceState {
         api(2)
+    }
+
+    /// A source with one service, `prod`/`api`, that has a log.
+    struct WithLogs;
+
+    impl Source for WithLogs {
+        fn services<'a>(&'a self, _d: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn logs<'a>(
+            &'a self,
+            deployment: &'a str,
+            service: &'a str,
+            query: super::super::inspect::LogQuery,
+        ) -> BoxFuture<'a, Result<Option<super::super::source::LogStream>>> {
+            let known = deployment == "prod" && service == "api";
+            Box::pin(async move {
+                if !known {
+                    return Ok(None);
+                }
+                let line = format!("tail={:?}\n", query.tail);
+                let stream: super::super::source::LogStream = Box::pin(futures_util::stream::iter(vec![
+                    Ok(axum::body::Bytes::from("started\n")),
+                    Ok(axum::body::Bytes::from(line)),
+                ]));
+                Ok(Some(stream))
+            })
+        }
+    }
+
+    #[test]
+    fn logs_stream_as_text_and_unknown_names_are_not_found() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
+        let call = |path: &'static str| {
+            let app = Arc::new(App {
+                owners: HashMap::new(),
+                source: Box::new(WithLogs),
+                challenges: Default::default(),
+                certs: None,
+                api: super::super::api::Api::new(Some(TOKEN.to_string()), None),
+            });
+            run(async move {
+                let request = Request::get(path)
+                    .header("authorization", format!("Bearer {}", TOKEN))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = router(app).oneshot(request).await.unwrap();
+                let status = response.status();
+                let kind = response
+                    .headers()
+                    .get("content-type")
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default();
+                let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+                (status, kind, String::from_utf8(body.to_vec()).unwrap())
+            })
+        };
+        let (status, kind, body) = call("/api/v1/deployments/prod/services/api/logs?tail=5");
+        assert_eq!(status, StatusCode::OK);
+        assert!(kind.starts_with("text/plain"), "{}", kind);
+        assert_eq!(body, "started\ntail=Some(5)\n");
+        assert_eq!(
+            call("/api/v1/deployments/prod/services/other/logs").0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call("/api/v1/deployments/prod/services/api/logs?tail=lots").0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call("/api/v1/deployments/prod/services/api/tasks").0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(call("/api/v1/nodes").0, StatusCode::NOT_FOUND);
     }
 }
