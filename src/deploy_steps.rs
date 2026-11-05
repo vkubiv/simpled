@@ -28,6 +28,11 @@ pub struct DockerOutput {
 /// without a Docker daemon.
 pub trait Docker {
     fn run(&self, args: &[&str]) -> Result<DockerOutput>;
+
+    /// `run` with `input` on stdin, for content that should not touch the disk.
+    fn run_input(&self, args: &[&str], _input: &[u8]) -> Result<DockerOutput> {
+        self.run(args)
+    }
 }
 
 pub struct DockerCli;
@@ -38,6 +43,24 @@ impl Docker for DockerCli {
             .args(args)
             .output()
             .context("Failed to run docker. Is the Docker CLI installed and on PATH?")?;
+        Ok(DockerOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_input(&self, args: &[&str], input: &[u8]) -> Result<DockerOutput> {
+        use std::io::Write;
+        let mut child = Command::new("docker")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to run docker. Is the Docker CLI installed and on PATH?")?;
+        child.stdin.take().context("docker has no stdin")?.write_all(input)?;
+        let output = child.wait_with_output()?;
         Ok(DockerOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -152,6 +175,101 @@ pub fn sync_objects(docker: &dyn Docker, plan: &Plan, deploy_dir: &Path) -> Resu
             eprintln!("Created {} {}", kind, name);
         }
         exports.push((object.var.clone(), name));
+    }
+    Ok(exports)
+}
+
+// ---------------------------------------------------------------- tls-secrets
+
+/// A certificate secret of a domain, as its labels describe it.
+#[derive(Debug, Clone, PartialEq)]
+struct TlsSecret {
+    name: String,
+    acme: bool,
+    not_after: u64,
+    created: String,
+}
+
+/// The secret each of the gateway's domains is served with: the issued
+/// certificate that lasts longest, or else the newest placeholder. A domain
+/// with neither gets a self-signed placeholder, which the daemon replaces once
+/// it has issued the real one. Exports the names for the ingress stack.
+pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, String)>> {
+    use crate::gateway_tls::{labels, ISSUER_ACME, ISSUER_SELF_SIGNED, OWNER_LABEL};
+    let mut exports = Vec::new();
+    for tls in &plan.tls {
+        let ids = checked(
+            docker,
+            &[
+                "secret",
+                "ls",
+                "-q",
+                "--filter",
+                &format!("label={}={}", labels::DOMAIN, tls.domain),
+            ],
+        )?;
+        let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let mut found = Vec::new();
+        if !ids.is_empty() {
+            let format = format!(
+                "{{{{.Spec.Name}}}}|{{{{index .Spec.Labels \"{}\"}}}}|{{{{index .Spec.Labels \"{}\"}}}}|{{{{.CreatedAt.UTC.Format \"2006-01-02T15:04:05.000000000Z\"}}}}",
+                labels::ISSUER,
+                labels::NOT_AFTER
+            );
+            let mut args = vec!["secret", "inspect", "--format", format.as_str()];
+            args.extend(ids.iter().copied());
+            for line in checked(docker, &args)?.lines() {
+                let parts: Vec<&str> = line.trim().split('|').collect();
+                if let [name, issuer, not_after, created] = parts.as_slice() {
+                    found.push(TlsSecret {
+                        name: name.to_string(),
+                        acme: *issuer == ISSUER_ACME,
+                        not_after: not_after.parse().unwrap_or_default(),
+                        created: created.to_string(),
+                    });
+                }
+            }
+        }
+        let best = found
+            .into_iter()
+            .max_by(|a, b| (a.acme, a.not_after, &a.created).cmp(&(b.acme, b.not_after, &b.created)));
+        let name = match best {
+            Some(secret) => secret.name,
+            None => {
+                let pem = crate::gateway_tls::self_signed(&tls.domain)?;
+                let name = object_name(&crate::gateway_tls::secret_base(&tls.domain), pem.as_bytes());
+                let output = docker.run_input(
+                    &[
+                        "secret",
+                        "create",
+                        "--label",
+                        OWNER_LABEL,
+                        "--label",
+                        &format!("{}={}", labels::DOMAIN, tls.domain),
+                        "--label",
+                        &format!("{}={}", labels::ISSUER, ISSUER_SELF_SIGNED),
+                        "--label",
+                        &format!("{}=0", labels::NOT_AFTER),
+                        &name,
+                        "-",
+                    ],
+                    pem.as_bytes(),
+                )?;
+                if !output.success {
+                    bail!(
+                        "Cannot create the placeholder certificate of {}: {}",
+                        tls.domain,
+                        output.stderr.trim()
+                    );
+                }
+                eprintln!(
+                    "Created a self-signed placeholder for {}, until the daemon has issued its certificate",
+                    tls.domain
+                );
+                name
+            }
+        };
+        exports.push((tls.var.clone(), name));
     }
     Ok(exports)
 }
@@ -641,6 +759,7 @@ mod tests {
             owner_label: "simpled.deployment=prod".to_string(),
             objects,
             jobs: vec![],
+            tls: vec![],
         }
     }
 
@@ -930,6 +1049,7 @@ mod tests {
                 "G_2",
             )],
             jobs: vec![],
+            tls: vec![],
         }
     }
 
@@ -999,6 +1119,63 @@ mod tests {
                 40
             ),
             vec!["-     blog: b"]
+        );
+    }
+
+    fn tls_plan() -> Plan {
+        Plan {
+            simpled_version: "2.0.0".to_string(),
+            owner_label: "simpled.scope=environment".to_string(),
+            objects: vec![],
+            jobs: vec![],
+            tls: vec![crate::deploy_plan::PlanTls {
+                domain: "shop.example.com".to_string(),
+                var: "SIMPLED_TLS_1".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn an_issued_certificate_wins_over_a_newer_placeholder() {
+        let docker = FakeDocker::new(&[
+            (
+                "secret ls -q --filter label=simpled.tls.domain=shop.example.com",
+                true,
+                "a
+b
+c
+",
+            ),
+            (
+                "secret inspect",
+                true,
+                "tls_shop.example.com_111|acme|1800000000|2026-11-01T00:00:00.000000000Z
+                 tls_shop.example.com_222|acme|1790000000|2026-11-02T00:00:00.000000000Z
+                 tls_shop.example.com_333|self-signed|0|2026-11-03T00:00:00.000000000Z
+",
+            ),
+        ]);
+        assert_eq!(
+            tls_secrets(&docker, &tls_plan()).unwrap(),
+            vec![("SIMPLED_TLS_1".to_string(), "tls_shop.example.com_111".to_string())]
+        );
+        assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("secret create")));
+    }
+
+    #[test]
+    fn a_domain_without_a_certificate_gets_a_labelled_placeholder() {
+        let docker = FakeDocker::new(&[("secret ls", true, "")]);
+        let exports = tls_secrets(&docker, &tls_plan()).unwrap();
+        let name = &exports[0].1;
+        assert!(name.starts_with("tls_shop.example.com_"), "{}", name);
+        let calls = docker.calls.borrow();
+        let create = calls.iter().find(|c| c.starts_with("secret create")).unwrap();
+        assert_eq!(
+            create,
+            &format!(
+                "secret create --label simpled.scope=environment --label simpled.tls.domain=shop.example.com --label simpled.tls.issuer=self-signed --label simpled.tls.not_after=0 {} -",
+                name
+            )
         );
     }
 }

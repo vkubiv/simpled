@@ -135,7 +135,7 @@ impl SwarmObjects {
 /// Swarm accepts letters, digits, `-`, `_` and `.`, starting and ending with a
 /// letter or digit. Anything else becomes `_`, and a base too long for the hash to
 /// fit is cut.
-fn object_base(name: &str) -> String {
+pub(crate) fn object_base(name: &str) -> String {
     let mut base: String = name
         .chars()
         .map(|c| {
