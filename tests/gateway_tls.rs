@@ -129,3 +129,24 @@ fn without_letsencrypt_there_are_no_certificate_secrets() {
     assert!(!stack.contains("tls_1"), "{}", stack);
     assert!(!read(&out.join("deploy.sh")).contains("tls-secrets"));
 }
+
+/// The daemon is the only ACME client, so a gateway task on every node is fine:
+/// each forwards the challenges to it, and each mounts the same secrets.
+#[test]
+fn a_global_gateway_can_use_letsencrypt_on_swarm() {
+    let env = letsencrypt(&envspec("docker", "swarm_mode: true", "global: true"));
+    let dir = prepare(&env);
+    let text = read(
+        &dir.path()
+            .join("docker-deploy")
+            .join("ingress")
+            .join("docker-compose.yaml"),
+    );
+    let stack: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let traefik = &stack["services"]["traefik"];
+    assert_eq!(traefik["deploy"]["mode"].as_str(), Some("global"), "{}", text);
+    assert_eq!(
+        traefik["secrets"][0]["target"].as_str(),
+        Some("/run/secrets/simpled_tls/shop.example.com.pem")
+    );
+}

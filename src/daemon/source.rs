@@ -19,6 +19,22 @@ pub trait Source: Send + Sync {
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>>;
 }
 
+/// The gateway's certificates, for `/health`.
+pub trait CertSource: Send + Sync {
+    /// A domain's current certificate: whether it was issued, and its expiry.
+    /// `None` when the domain has none.
+    fn current<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, Result<Option<(bool, u64)>>>;
+}
+
+impl CertSource for Docker {
+    fn current<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, Result<Option<(bool, u64)>>> {
+        Box::pin(async move {
+            let secrets = super::acme::domain_secrets(self, domain).await?;
+            Ok(super::acme::current(&secrets).map(|c| (c.acme, c.not_after)))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {

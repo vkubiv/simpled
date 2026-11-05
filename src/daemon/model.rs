@@ -81,6 +81,46 @@ pub struct Health {
     /// at the deployment's latest version.
     pub converged: bool,
     pub version: Option<String>,
+    /// Swarm with `tls.letsencrypt`: the worst certificate of the deployment's
+    /// domains. Anything but `valid` makes a healthy deployment `degraded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Tls>,
+}
+
+/// The state of a domain's certificate, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tls {
+    Valid,
+    /// Issued, but within 7 days of expiry: renewal, which starts at 30 days,
+    /// has kept failing.
+    Expiring,
+    /// The placeholder, or no certificate at all: browsers warn.
+    SelfSigned,
+}
+
+const EXPIRING_WITHIN_SECONDS: u64 = 7 * 24 * 3600;
+
+/// One domain's certificate state, from its current secret.
+pub fn tls_state(current: Option<(bool, u64)>, now: u64) -> Tls {
+    match current {
+        Some((true, not_after)) if not_after > now + EXPIRING_WITHIN_SECONDS => Tls::Valid,
+        Some((true, _)) => Tls::Expiring,
+        _ => Tls::SelfSigned,
+    }
+}
+
+/// Adds the certificates' state to a deployment's health: the worst one, which
+/// degrades a healthy deployment. A deployment that is down stays down.
+pub fn with_tls(mut health: Health, states: &[Tls]) -> Health {
+    let Some(worst) = states.iter().copied().max() else {
+        return health;
+    };
+    if worst != Tls::Valid && health.status == Status::Healthy {
+        health.status = Status::Degraded;
+    }
+    health.tls = Some(worst);
+    health
 }
 
 /// The services of the last deploy: the one with the newest `deployed_at`.
@@ -109,6 +149,7 @@ pub fn health(services: &[ServiceState]) -> Health {
             status: Status::Down,
             converged: false,
             version: None,
+            tls: None,
         };
     };
     let status = if services.iter().any(|s| s.desired > 0 && s.running == 0) {
@@ -123,6 +164,7 @@ pub fn health(services: &[ServiceState]) -> Health {
         status,
         converged,
         version: Some(latest.version.clone()),
+        tls: None,
     }
 }
 
@@ -151,7 +193,8 @@ mod tests {
             Health {
                 status: Status::Healthy,
                 converged: true,
-                version: Some("1.2.3".to_string())
+                version: Some("1.2.3".to_string()),
+                tls: None,
             }
         );
     }
@@ -183,7 +226,8 @@ mod tests {
             Health {
                 status: Status::Down,
                 converged: false,
-                version: None
+                version: None,
+                tls: None,
             }
         );
         assert_eq!(version_document("prod", &[]), None);
@@ -210,6 +254,31 @@ mod tests {
         assert_eq!(
             version_document("prod", &[old, new]),
             Some(json!({"application": "shop", "version": "1.3.0", "deployment": "prod", "deployed_at": 200}))
+        );
+    }
+
+    #[test]
+    fn a_certificate_close_to_expiry_or_a_placeholder_degrades_a_healthy_deployment() {
+        const NOW: u64 = 1_800_000_000;
+        const DAY: u64 = 24 * 3600;
+        assert_eq!(tls_state(Some((true, NOW + 20 * DAY)), NOW), Tls::Valid);
+        assert_eq!(tls_state(Some((true, NOW + 6 * DAY)), NOW), Tls::Expiring);
+        assert_eq!(tls_state(Some((false, 0)), NOW), Tls::SelfSigned);
+        assert_eq!(tls_state(None, NOW), Tls::SelfSigned);
+
+        let healthy = health(&[service("api", "1.2.3", 1, 1)]);
+        let valid = with_tls(healthy.clone(), &[Tls::Valid, Tls::Valid]);
+        assert_eq!((valid.status, valid.tls), (Status::Healthy, Some(Tls::Valid)));
+        let expiring = with_tls(healthy.clone(), &[Tls::Valid, Tls::Expiring]);
+        assert_eq!((expiring.status, expiring.tls), (Status::Degraded, Some(Tls::Expiring)));
+        // Without certificates to report, nothing changes.
+        assert_eq!(with_tls(healthy.clone(), &[]), healthy);
+        // Down stays down.
+        let down = with_tls(health(&[service("api", "1.2.3", 1, 0)]), &[Tls::SelfSigned]);
+        assert_eq!(down.status, Status::Down);
+        assert_eq!(
+            serde_json::to_value(&down).unwrap()["tls"],
+            serde_json::json!("self-signed")
         );
     }
 }

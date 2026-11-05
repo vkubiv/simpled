@@ -15,7 +15,15 @@ use std::sync::Arc;
 pub const VERSION_PATH: &str = crate::version_endpoint::PATH;
 pub const HEALTH_PATH: &str = "/.well-known/simpled/health";
 
+/// The certificates the daemon issues, which a deployment's health reports on.
+pub struct Certs {
+    pub source: Box<dyn super::source::CertSource>,
+    /// Deployment to the domains it owns that have a certificate.
+    pub domains_of: HashMap<String, Vec<String>>,
+}
+
 pub struct App {
+    pub certs: Option<Certs>,
     /// Answers to pending ACME challenges, which the ACME task fills in.
     pub challenges: super::acme::Challenges,
     /// Domain (lower case) to the deployment that answers for it, as
@@ -114,8 +122,26 @@ async fn health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 status: Status::Down,
                 converged: false,
                 version: None,
+                tls: None,
             }
         }
+    };
+    let health = match &app.certs {
+        Some(certs) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let mut states = Vec::new();
+            for domain in certs.domains_of.get(deployment).into_iter().flatten() {
+                match certs.source.current(domain).await {
+                    Ok(current) => states.push(model::tls_state(current, now)),
+                    Err(e) => eprintln!("health for {}: certificate of {}: {:#}", deployment, domain, e),
+                }
+            }
+            model::with_tls(health, &states)
+        }
+        None => health,
     };
     let status = if health.status == Status::Healthy {
         StatusCode::OK
@@ -165,6 +191,7 @@ mod tests {
             ]),
             source: Box::new(Fake(services)),
             challenges: Default::default(),
+            certs: None,
         });
         let response = router(app)
             .oneshot(Request::get(path).header("host", host).body(Body::empty()).unwrap())
@@ -221,6 +248,7 @@ mod tests {
             owners: HashMap::new(),
             source: Box::new(Fake(vec![])),
             challenges: Default::default(),
+            certs: None,
         });
         app.challenges
             .write()
@@ -248,5 +276,55 @@ mod tests {
             (StatusCode::OK, "tok.thumb".to_string())
         );
         assert_eq!(ask("/.well-known/acme-challenge/other").0, StatusCode::NOT_FOUND);
+    }
+
+    struct FakeCerts(Option<(bool, u64)>);
+
+    impl super::super::source::CertSource for FakeCerts {
+        fn current<'a>(&'a self, _domain: &'a str) -> BoxFuture<'a, Result<Option<(bool, u64)>>> {
+            let current = self.0;
+            Box::pin(async move { Ok(current) })
+        }
+    }
+
+    #[test]
+    fn health_reports_the_certificates_of_the_deployments_domains() {
+        let ask = |current: Option<(bool, u64)>| {
+            let app = Arc::new(App {
+                owners: HashMap::from([("shop.example.com".to_string(), "prod".to_string())]),
+                source: Box::new(Fake(vec![api(2)])),
+                challenges: Default::default(),
+                certs: Some(Certs {
+                    source: Box::new(FakeCerts(current)),
+                    domains_of: HashMap::from([("prod".to_string(), vec!["shop.example.com".to_string()])]),
+                }),
+            });
+            run(async move {
+                let response = router(app)
+                    .oneshot(
+                        Request::get(HEALTH_PATH)
+                            .header("host", "shop.example.com")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&body).unwrap())
+            })
+        };
+        let far = u64::MAX / 2;
+        let (status, body) = ask(Some((true, far)));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tls"], "valid");
+        let (status, body) = ask(Some((false, 0)));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            (body["status"].as_str(), body["tls"].as_str()),
+            (Some("degraded"), Some("self-signed"))
+        );
+        let (_, body) = ask(Some((true, 1)));
+        assert_eq!(body["tls"], "expiring");
     }
 }

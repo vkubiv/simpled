@@ -115,6 +115,24 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
         let challenges = acme::Challenges::default();
+        let certs = match &config.acme {
+            Some(acme_config) => {
+                let mut domains_of: std::collections::HashMap<String, Vec<String>> = Default::default();
+                for owner in &config.owners {
+                    if acme_config.domains.contains(&owner.domain) {
+                        domains_of
+                            .entry(owner.deployment.clone())
+                            .or_default()
+                            .push(owner.domain.clone());
+                    }
+                }
+                Some(http::Certs {
+                    source: Box::new(source::connect_docker()?),
+                    domains_of,
+                })
+            }
+            None => None,
+        };
         if let Some(acme_config) = config.acme.clone() {
             let docker = source::connect_docker()?;
             eprintln!(
@@ -125,6 +143,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
             tokio::spawn(acme::run(acme_config, docker, challenges.clone()));
         }
         let app = Arc::new(http::App {
+            certs,
             challenges,
             owners: config
                 .owners

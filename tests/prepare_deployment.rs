@@ -492,11 +492,6 @@ fn gateway_tls_and_mode_combinations_that_cannot_work_fail_validation() {
             "tls.upstream cannot be combined with tls.letsencrypt or tls.secret",
         ),
         (
-            envspec("docker", "swarm_mode: true", "type: traefik\n  global: true")
-                .replace("    disable: true", letsencrypt),
-            "gateway global cannot be combined with tls.letsencrypt",
-        ),
-        (
             envspec("docker", "swarm_mode: true", "type: nginx"),
             "gateway type nginx is no longer supported",
         ),

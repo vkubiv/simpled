@@ -108,7 +108,7 @@ fn jitter() -> f64 {
     (nanos % 1000) as f64 / 1000.0
 }
 
-async fn domain_secrets(docker: &Docker, domain: &str) -> Result<Vec<CertSecret>> {
+pub async fn domain_secrets(docker: &Docker, domain: &str) -> Result<Vec<CertSecret>> {
     let secrets = docker
         .list_secrets(Some(ListSecretsOptions {
             filters: Some(HashMap::from([(
