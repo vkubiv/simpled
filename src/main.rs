@@ -4,6 +4,7 @@ use std::path::Path;
 
 mod app_bundle;
 mod bundle_repo;
+mod daemon;
 mod deploy_plan;
 mod deploy_steps;
 mod docker_compose;
@@ -68,6 +69,17 @@ enum Commands {
     Step {
         #[command(subcommand)]
         command: StepCommands,
+    },
+
+    /// The environment's daemon, next to the gateway: answers the version and
+    /// health of every deployment. Run by the generated stack, not by hand
+    #[command(hide = true)]
+    Daemon {
+        /// The daemon.json that prepare-deployment writes
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
     },
 
     /// Used for local development and tests
@@ -329,6 +341,9 @@ fn main() -> Result<()> {
         }
         Commands::Step { command } => {
             step_command(command)?;
+        }
+        Commands::Daemon { config, listen } => {
+            daemon::run(config, listen)?;
         }
         Commands::Local { command } => {
             local(command)?;
