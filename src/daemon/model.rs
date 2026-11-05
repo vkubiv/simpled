@@ -1,0 +1,182 @@
+//! What the daemon answers, computed from the state of a deployment's services.
+//! Pure functions, so the rules are tested without Docker.
+
+use serde::Serialize;
+use serde_json::{json, Value};
+
+/// Labels `prepare-deployment` puts on every service of a deployment. The daemon
+/// finds a deployment's services by them and reads its version from them.
+pub mod labels {
+    pub const DEPLOYMENT: &str = "simpled.deployment";
+    pub const APPLICATION: &str = "simpled.application";
+    pub const VERSION: &str = "simpled.version";
+    pub const DEPLOYED_AT: &str = "simpled.deployed_at";
+    /// The name from the spec (`api`), not the Swarm name (`prod_api`). Only a
+    /// deployment's own services carry it: the gateway also has
+    /// `simpled.deployment`, naming the deployment that deployed it.
+    pub const SERVICE: &str = "simpled.service";
+}
+
+/// One service of a deployment, as Docker reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceState {
+    pub service: String,
+    pub application: String,
+    pub version: String,
+    pub deployed_at: u64,
+    /// Tasks (Swarm) or containers (standalone) that should be running.
+    pub desired: u64,
+    pub running: u64,
+    /// Running, but failing their healthcheck.
+    pub unhealthy: u64,
+    /// A Swarm update or rollback is in progress or paused.
+    pub updating: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Healthy,
+    Degraded,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Health {
+    pub status: Status,
+    /// The rollout has finished: no update is in progress, and every service is
+    /// at the deployment's latest version.
+    pub converged: bool,
+    pub version: Option<String>,
+}
+
+/// The services of the last deploy: the one with the newest `deployed_at`.
+fn latest(services: &[ServiceState]) -> Option<&ServiceState> {
+    services.iter().max_by_key(|s| s.deployed_at)
+}
+
+/// The `/version` document, the same shape the nginx sidecar served. `None` when
+/// the deployment has no services running under its labels.
+pub fn version_document(deployment: &str, services: &[ServiceState]) -> Option<Value> {
+    let latest = latest(services)?;
+    Some(json!({
+        "application": latest.application,
+        "version": latest.version,
+        "deployment": deployment,
+        "deployed_at": latest.deployed_at,
+    }))
+}
+
+/// `down` when a service that should run has nothing running, `degraded` when one
+/// runs fewer tasks than it should or has an unhealthy one. A service scaled to
+/// zero on purpose counts as neither. A deployment with no services is `down`.
+pub fn health(services: &[ServiceState]) -> Health {
+    let Some(latest) = latest(services) else {
+        return Health {
+            status: Status::Down,
+            converged: false,
+            version: None,
+        };
+    };
+    let status = if services.iter().any(|s| s.desired > 0 && s.running == 0) {
+        Status::Down
+    } else if services.iter().any(|s| s.running < s.desired || s.unhealthy > 0) {
+        Status::Degraded
+    } else {
+        Status::Healthy
+    };
+    let converged = services.iter().all(|s| !s.updating && s.version == latest.version);
+    Health {
+        status,
+        converged,
+        version: Some(latest.version.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(name: &str, version: &str, desired: u64, running: u64) -> ServiceState {
+        ServiceState {
+            service: name.to_string(),
+            application: "shop".to_string(),
+            version: version.to_string(),
+            deployed_at: 100,
+            desired,
+            running,
+            unhealthy: 0,
+            updating: false,
+        }
+    }
+
+    #[test]
+    fn every_service_running_is_healthy_and_converged() {
+        let health = health(&[service("api", "1.2.3", 2, 2), service("web", "1.2.3", 1, 1)]);
+        assert_eq!(
+            health,
+            Health {
+                status: Status::Healthy,
+                converged: true,
+                version: Some("1.2.3".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn a_service_with_nothing_running_is_down() {
+        let health = health(&[service("api", "1.2.3", 2, 0), service("web", "1.2.3", 1, 1)]);
+        assert_eq!(health.status, Status::Down);
+    }
+
+    #[test]
+    fn missing_or_unhealthy_tasks_are_degraded() {
+        assert_eq!(health(&[service("api", "1.2.3", 2, 1)]).status, Status::Degraded);
+        let mut unhealthy = service("api", "1.2.3", 1, 1);
+        unhealthy.unhealthy = 1;
+        assert_eq!(health(&[unhealthy]).status, Status::Degraded);
+    }
+
+    #[test]
+    fn a_service_scaled_to_zero_does_not_count() {
+        let health = health(&[service("api", "1.2.3", 1, 1), service("worker", "1.2.3", 0, 0)]);
+        assert_eq!(health.status, Status::Healthy);
+    }
+
+    #[test]
+    fn no_services_is_down() {
+        assert_eq!(
+            health(&[]),
+            Health {
+                status: Status::Down,
+                converged: false,
+                version: None
+            }
+        );
+        assert_eq!(version_document("prod", &[]), None);
+    }
+
+    #[test]
+    fn an_update_in_progress_is_not_converged() {
+        let mut api = service("api", "1.2.3", 1, 1);
+        api.updating = true;
+        assert!(!health(&[api]).converged);
+    }
+
+    #[test]
+    fn the_latest_deploy_names_the_version() {
+        // A service Swarm rolled back gets the previous spec back, labels
+        // included, so it reports the older version and the deployment is not
+        // converged.
+        let mut new = service("api", "1.3.0", 1, 1);
+        new.deployed_at = 200;
+        let old = service("web", "1.2.3", 1, 1);
+        let health = health(&[old.clone(), new.clone()]);
+        assert_eq!(health.version.as_deref(), Some("1.3.0"));
+        assert!(!health.converged);
+        assert_eq!(
+            version_document("prod", &[old, new]),
+            Some(json!({"application": "shop", "version": "1.3.0", "deployment": "prod", "deployed_at": 200}))
+        );
+    }
+}

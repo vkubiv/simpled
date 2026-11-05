@@ -20,14 +20,18 @@ sha2 = "0.10"
 # in a second rustls crypto provider (aws-lc-rs next to reqwest's ring), which makes
 # rustls panic at the first connection until one is chosen explicitly.
 axum-reverse-proxy = { version = "1.0", default-features = false }
-tokio = { version = "1.48", features = ["rt-multi-thread", "net", "sync"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "net", "sync", "signal", "macros"] }
 ctrlc = "3.4"
 axum = "0.8.8"
 # default-features off keeps native-tls (and so OpenSSL on Linux) out of the build.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# The daemon reads services and containers through the Docker API. The default
+# features are the Unix socket and the Windows named pipe; no TLS.
+bollard = "0.21.1"
 
 [dev-dependencies]
 tempfile = "3.8"
+tower = { version = "0.5", features = ["util"] }
 
 # Smaller, faster release binaries; the tarball ships this straight to users.
 [profile.release]
