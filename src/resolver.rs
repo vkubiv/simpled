@@ -251,77 +251,7 @@ fn resolve_secrets(
     // A document several secrets share is read and parsed once.
     let mut documents: HashMap<JsonDocument, serde_json::Value> = HashMap::new();
     for secret_spec in &deployment.secrets {
-        let value = match &secret_spec.source {
-            DeploymentSecretSource::EnvVariable(var_name) => {
-                let value = env::var(var_name).context(format!("Secret environment variable {} not set", var_name))?;
-                let value = trim_secret_value(&value);
-                if value.is_empty() {
-                    return Err(anyhow!("Secret environment variable {} is empty", var_name));
-                }
-                SecretResolvedValue::Literal(value.to_string())
-            }
-            // `secrets_env_prefix`, so the variable's name was derived rather than
-            // written down. Everything after the lookup is the `env:` source's.
-            DeploymentSecretSource::PrefixedEnvVariable(lookup) => {
-                match env_var_ignoring_case(&lookup.variable)? {
-                    Some((var_name, value)) => {
-                        let value = trim_secret_value(&value);
-                        if value.is_empty() {
-                            return Err(anyhow!("Secret environment variable {} is empty", var_name));
-                        }
-                        SecretResolvedValue::Literal(value.to_string())
-                    }
-                    // `secrets_aws` ends the chain: its lookup belongs on the deploy
-                    // target, so nothing after it could be tried here anyway.
-                    None => match &lookup.fallback {
-                        Some(reference) => resolve_aws_secret(env_spec, reference)?,
-                        None => {
-                            let mut tried = lookup.tried.clone();
-                            tried.push(format!("${} (not set)", lookup.variable));
-                            return Err(anyhow!(
-                                "Secret '{}' has no value. Tried: {}",
-                                secret_spec.secret_name,
-                                tried.join(", ")
-                            ));
-                        }
-                    },
-                }
-            }
-            DeploymentSecretSource::FilePath(path_str) => {
-                let path = Path::new(path_str);
-                if !path.exists() {
-                    return Err(anyhow!("Secret file not found: {:?}", path_str));
-                }
-                let content = fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?;
-                let value = trim_secret_value(&content);
-                if value.is_empty() {
-                    return Err(anyhow!("Secret file {:?} is empty", path_str));
-                }
-                SecretResolvedValue::Literal(value.to_string())
-            }
-            DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
-            DeploymentSecretSource::Aws(reference) => resolve_aws_secret(env_spec, reference)?,
-            DeploymentSecretSource::JsonField(json) => {
-                let name = &secret_spec.secret_name;
-                if !documents.contains_key(&json.document) {
-                    let parsed = read_json_document(name, &json.document)?;
-                    documents.insert(json.document.clone(), parsed);
-                }
-                let value = select_json_field(&documents[&json.document], &json.field).ok_or_else(|| {
-                    anyhow!(
-                        "Secret '{}' has no value: {} has no {}",
-                        name,
-                        json.document.describe(),
-                        json.filter
-                    )
-                })?;
-                let value = trim_secret_value(&value);
-                if value.is_empty() {
-                    return Err(anyhow!("Secret '{}' is empty in {}", name, json.document.describe()));
-                }
-                SecretResolvedValue::Literal(value.to_string())
-            }
-        };
+        let value = resolve_secret_value(env_spec, secret_spec, &mut documents)?;
         match &value {
             SecretResolvedValue::Literal(literal) => {
                 secrets.values.insert(secret_spec.secret_name.clone(), literal.clone());
@@ -336,6 +266,86 @@ fn resolve_secrets(
         });
     }
     Ok(secrets)
+}
+
+/// One secret's value: read now, or deferred to the deploy target (`aws`).
+/// `documents` caches the JSON documents several secrets share.
+fn resolve_secret_value(
+    env_spec: &DeploymentEnvironmentSpec,
+    secret_spec: &crate::spec::DeploymentSecretSpec,
+    documents: &mut HashMap<JsonDocument, serde_json::Value>,
+) -> Result<SecretResolvedValue> {
+    Ok(match &secret_spec.source {
+        DeploymentSecretSource::EnvVariable(var_name) => {
+            let value = env::var(var_name).context(format!("Secret environment variable {} not set", var_name))?;
+            let value = trim_secret_value(&value);
+            if value.is_empty() {
+                return Err(anyhow!("Secret environment variable {} is empty", var_name));
+            }
+            SecretResolvedValue::Literal(value.to_string())
+        }
+        // `secrets_env_prefix`, so the variable's name was derived rather than
+        // written down. Everything after the lookup is the `env:` source's.
+        DeploymentSecretSource::PrefixedEnvVariable(lookup) => {
+            match env_var_ignoring_case(&lookup.variable)? {
+                Some((var_name, value)) => {
+                    let value = trim_secret_value(&value);
+                    if value.is_empty() {
+                        return Err(anyhow!("Secret environment variable {} is empty", var_name));
+                    }
+                    SecretResolvedValue::Literal(value.to_string())
+                }
+                // `secrets_aws` ends the chain: its lookup belongs on the deploy
+                // target, so nothing after it could be tried here anyway.
+                None => match &lookup.fallback {
+                    Some(reference) => resolve_aws_secret(env_spec, reference)?,
+                    None => {
+                        let mut tried = lookup.tried.clone();
+                        tried.push(format!("${} (not set)", lookup.variable));
+                        return Err(anyhow!(
+                            "Secret '{}' has no value. Tried: {}",
+                            secret_spec.secret_name,
+                            tried.join(", ")
+                        ));
+                    }
+                },
+            }
+        }
+        DeploymentSecretSource::FilePath(path_str) => {
+            let path = Path::new(path_str);
+            if !path.exists() {
+                return Err(anyhow!("Secret file not found: {:?}", path_str));
+            }
+            let content = fs::read_to_string(path).context(format!("Failed to read secret file {:?}", path_str))?;
+            let value = trim_secret_value(&content);
+            if value.is_empty() {
+                return Err(anyhow!("Secret file {:?} is empty", path_str));
+            }
+            SecretResolvedValue::Literal(value.to_string())
+        }
+        DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
+        DeploymentSecretSource::Aws(reference) => resolve_aws_secret(env_spec, reference)?,
+        DeploymentSecretSource::JsonField(json) => {
+            let name = &secret_spec.secret_name;
+            if !documents.contains_key(&json.document) {
+                let parsed = read_json_document(name, &json.document)?;
+                documents.insert(json.document.clone(), parsed);
+            }
+            let value = select_json_field(&documents[&json.document], &json.field).ok_or_else(|| {
+                anyhow!(
+                    "Secret '{}' has no value: {} has no {}",
+                    name,
+                    json.document.describe(),
+                    json.filter
+                )
+            })?;
+            let value = trim_secret_value(&value);
+            if value.is_empty() {
+                return Err(anyhow!("Secret '{}' is empty in {}", name, json.document.describe()));
+            }
+            SecretResolvedValue::Literal(value.to_string())
+        }
+    })
 }
 
 /// The JSON document of a `json_file` or `json_env` secret. The error never
