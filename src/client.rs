@@ -1,6 +1,6 @@
-//! `simpled status`, `simpled logs` and `simpled wait`: clients of the daemon
-//! (`docs/design/daemon.md` §4). The first two use the private API, which the
-//! env spec routes under `gateway.daemon.hosts`, with the token in
+//! `simpled status`, `simpled logs` and `simpled wait`: clients of the controller
+//! (`docs/design/controller.md` §4). The first two use the private API, which the
+//! env spec routes under `controller.hosts`, with the token in
 //! `SIMPLED_TOKEN`. `wait` polls a deployment's public `/health`.
 
 use crate::spec::DeploymentEnvironmentSpec;
@@ -28,15 +28,15 @@ fn first_domain<'a>(env: &'a DeploymentEnvironmentSpec, alias: &str) -> Result<&
         .ok_or_else(|| anyhow!("gateway.hosts has no domain for '{}'", alias))
 }
 
-/// `https://<domain><prefix>/api/v1`, from the first of `gateway.daemon.hosts`.
+/// `https://<domain><prefix>/api/v1`, from the first of `controller.hosts`.
 pub fn api_base(env: &DeploymentEnvironmentSpec) -> Result<String> {
     let (alias, prefix) = env
         .ingress
-        .daemon
+        .controller
         .as_ref()
         .and_then(|d| d.hosts.first())
         .ok_or_else(|| {
-            anyhow!("The env spec routes no private API: set gateway.daemon.hosts and a token, or pass --url")
+            anyhow!("The env spec routes no private API: set controller.hosts and a token, or pass --url")
         })?;
     Ok(format!(
         "{}://{}{}/api/v1",
@@ -57,7 +57,7 @@ pub fn health_url(env: &DeploymentEnvironmentSpec, deployment: &str) -> Result<S
         "{}://{}{}",
         scheme(env),
         first_domain(env, &dep.primary_host)?,
-        crate::daemon::http::HEALTH_PATH
+        crate::controller::http::HEALTH_PATH
     ))
 }
 
@@ -66,7 +66,7 @@ fn token() -> Result<String> {
         .ok()
         .filter(|t| !t.trim().is_empty())
         .map(|t| t.trim().to_string())
-        .ok_or_else(|| anyhow!("Set {} to the daemon's read or manage token", TOKEN_VAR))
+        .ok_or_else(|| anyhow!("Set {} to the controller's read or manage token", TOKEN_VAR))
 }
 
 fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
@@ -78,7 +78,7 @@ fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
 /// What a refused request means, in words.
 fn refused(status: reqwest::StatusCode, url: &str, what: &str) -> anyhow::Error {
     match status.as_u16() {
-        401 => anyhow!("The daemon refused the token in {} (401)", TOKEN_VAR),
+        401 => anyhow!("The controller refused the token in {} (401)", TOKEN_VAR),
         403 => anyhow!("The token in {} may not do that (403)", TOKEN_VAR),
         404 => anyhow!("{}: not found (404) at {}", what, url),
         429 => anyhow!("Too many failed attempts from here; try again in a minute (429)"),
@@ -93,7 +93,7 @@ fn get_json(url: &str, token: &str) -> Result<Value> {
         .send()
         .with_context(|| format!("Cannot reach {}", url))?;
     if !response.status().is_success() {
-        return Err(refused(response.status(), url, "the daemon's API"));
+        return Err(refused(response.status(), url, "the controller's API"));
     }
     response.json().with_context(|| format!("{} did not answer JSON", url))
 }
@@ -187,7 +187,7 @@ pub fn logs(base: &str, args: &LogArgs) -> Result<()> {
                 .ok()
                 .and_then(|v| v["error"].as_str().map(String::from))
                 .unwrap_or_default();
-            bail!("The daemon refused the query: {}", message);
+            bail!("The controller refused the query: {}", message);
         }
         return Err(refused(response.status(), &url, &what));
     }
@@ -257,7 +257,7 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     if let Ok(seconds) = value.parse::<u64>() {
         return Ok(Duration::from_secs(seconds));
     }
-    crate::daemon::inspect::parse_duration(value)
+    crate::controller::inspect::parse_duration(value)
         .ok_or_else(|| anyhow!("'{}' is not a duration like 30s, 10m or 2h", value))
 }
 

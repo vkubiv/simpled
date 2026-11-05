@@ -1,10 +1,10 @@
-//! The daemon as the gateway's only ACME client, on Docker Swarm
-//! (`docs/design/daemon.md` §7.1). For each domain it issues a certificate when
+//! The controller as the gateway's only ACME client, on Docker Swarm
+//! (`docs/design/controller.md` §7.1). For each domain it issues a certificate when
 //! there is none, only the self-signed placeholder, or one that expires within
 //! 30 days. Each certificate goes into a Swarm secret, and one rolling update of
 //! the gateway moves it onto every secret issued in that round.
 //!
-//! The HTTP-01 challenge is answered by the daemon itself: every gateway task, on
+//! The HTTP-01 challenge is answered by the controller itself: every gateway task, on
 //! every node, routes `/.well-known/acme-challenge/` to it, so it does not matter
 //! which node Let's Encrypt reaches.
 
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// Part of `daemon.json`, written from the env spec's `tls.letsencrypt`.
+/// Part of `controller.json`, written from the env spec's `tls.letsencrypt`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcmeConfig {
     /// The ACME directory URL: Let's Encrypt's, or `letsencrypt.server`.
@@ -44,7 +44,7 @@ const RENEW_BEFORE_SECONDS: u64 = 30 * 24 * 3600;
 /// this only bounds how late a renewal or a new domain is noticed.
 const CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Before the first check: the gateway that routes the challenges to this
-/// daemon is deployed in the same stack, and may not be routing yet.
+/// controller is deployed in the same stack, and may not be routing yet.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(20);
 
 /// A domain's certificate secret, as its labels describe it.
@@ -87,7 +87,7 @@ pub fn stale(secrets: &[CertSecret]) -> Vec<&CertSecret> {
 }
 
 /// After the n-th failure in a row: an hour, doubling up to a day, with up to a
-/// tenth more, so several daemons do not retry in step.
+/// tenth more, so several controllers do not retry in step.
 pub fn backoff(failures: u32, jitter: f64) -> Duration {
     let hours = 2u64.saturating_pow(failures.saturating_sub(1)).min(24);
     Duration::from_secs_f64(hours as f64 * 3600.0 * (1.0 + jitter.clamp(0.0, 1.0) / 10.0))
@@ -155,7 +155,7 @@ async fn account(config: &AcmeConfig) -> Result<Account> {
     .context("Cannot set up the ACME client")?;
     let contact = format!("mailto:{}", config.email);
     // A new account on each start: Let's Encrypt's limits that matter are on
-    // certificates, not accounts, and the daemon then keeps no state.
+    // certificates, not accounts, and the controller then keeps no state.
     let (account, _) = builder
         .create(
             &NewAccount {
@@ -322,7 +322,7 @@ async fn prune(docker: &Docker, domain: &str) {
     }
 }
 
-/// Runs for the daemon's lifetime.
+/// Runs for the controller's lifetime.
 pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
     let mut account: Option<Account> = None;
     let mut failures: HashMap<String, (u32, u64)> = HashMap::new();

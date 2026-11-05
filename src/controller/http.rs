@@ -1,4 +1,4 @@
-//! The daemon's routes. The gateway forwards the public paths of every host
+//! The controller's routes. The gateway forwards the public paths of every host
 //! here unchanged, so the Host header says which deployment is asked about.
 
 use super::model::{self, Status};
@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub const VERSION_PATH: &str = crate::version_endpoint::PATH;
 pub const HEALTH_PATH: &str = "/.well-known/simpled/health";
 
-/// The certificates the daemon issues, which a deployment's health reports on.
+/// The certificates the controller issues, which a deployment's health reports on.
 pub struct Certs {
     pub source: Box<dyn super::source::CertSource>,
     /// Deployment to the domains it owns that have a certificate.

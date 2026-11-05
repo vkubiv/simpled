@@ -146,6 +146,9 @@ pub struct DeploymentEnvironmentSpecYaml {
     // target the simpled binary is shipped to.
     pub target_platform: Option<String>,
     pub gateway: Option<IngressSpecYaml>,
+    // Docker only: the simpled controller, next to the gateway, and its private
+    // API. Top level, not under `gateway`: it belongs to the environment.
+    pub controller: Option<ControllerSpecYaml>,
     // deprecated: use gateway instead
     pub ingress: Option<IngressSpecYaml>,
     pub registry: Option<HashMap<String, String>>,
@@ -190,8 +193,6 @@ pub struct IngressSpecYaml {
     // They are never routed to a service, but they are still part of the
     // certificate, since the redirect has to be served over HTTPS too.
     pub redirects: Option<Vec<RedirectSpecYaml>>,
-    // Docker only: the simpled daemon's private API, and who may use it.
-    pub daemon: Option<DaemonSpecYaml>,
 
     // Only `traefik` is accepted, and only on Docker: Traefik is the one Docker
     // gateway. Kept so a spec that still names it parses, and `nginx` gets an
@@ -202,9 +203,9 @@ pub struct IngressSpecYaml {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct DaemonSpecYaml {
+pub struct ControllerSpecYaml {
     // Where the private API is routed: host alias to the path it is served under.
-    pub hosts: Option<HashMap<String, DaemonHostYaml>>,
+    pub hosts: Option<HashMap<String, ControllerHostYaml>>,
     // Secret sources, the same shapes a deployment secret takes.
     pub read_token: Option<DeploymentSecretSpecExYaml>,
     pub manage_token: Option<DeploymentSecretSpecExYaml>,
@@ -212,7 +213,7 @@ pub struct DaemonSpecYaml {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct DaemonHostYaml {
+pub struct ControllerHostYaml {
     pub prefix: String,
 }
 

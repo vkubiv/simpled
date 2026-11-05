@@ -44,7 +44,7 @@ fn the_swarm_gateway_mounts_one_certificate_secret_per_domain() {
         }
     }
 
-    // The daemon answers the HTTP-01 challenges, over plain HTTP: the redirect
+    // The controller answers the HTTP-01 challenges, over plain HTTP: the redirect
     // to HTTPS sits below every router on `web`.
     let challenge = &dynamic["http"]["routers"]["simpled-acme-challenge"];
     assert_eq!(
@@ -52,16 +52,16 @@ fn the_swarm_gateway_mounts_one_certificate_secret_per_domain() {
         Some("PathPrefix(`/.well-known/acme-challenge/`)")
     );
     assert_eq!(challenge["entryPoints"][0].as_str(), Some("web"));
-    assert_eq!(challenge["service"].as_str(), Some("simpled-daemon"));
+    assert_eq!(challenge["service"].as_str(), Some("simpled-controller"));
     let traefik: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
     assert_eq!(
         traefik["entryPoints"]["web"]["http"]["redirections"]["entryPoint"]["priority"].as_u64(),
         Some(1)
     );
-    let daemon: serde_json::Value =
-        serde_json::from_str(&read(&out.join("ingress").join("daemon").join("daemon.json"))).unwrap();
+    let controller: serde_json::Value =
+        serde_json::from_str(&read(&out.join("ingress").join("controller").join("controller.json"))).unwrap();
     assert_eq!(
-        daemon["acme"],
+        controller["acme"],
         serde_json::json!({
             "directory": "https://acme-v02.api.letsencrypt.org/directory",
             "email": "ops@example.com",
@@ -117,8 +117,8 @@ fn standalone_keeps_traefiks_own_acme_client() {
         traefik
     );
     assert!(!read(&out.join("deploy.sh")).contains("tls-secrets"));
-    let daemon = read(&out.join("daemon").join("daemon.json"));
-    assert!(!daemon.contains("acme"), "{}", daemon);
+    let controller = read(&out.join("controller").join("controller.json"));
+    assert!(!controller.contains("acme"), "{}", controller);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn without_letsencrypt_there_are_no_certificate_secrets() {
     assert!(!read(&out.join("deploy.sh")).contains("tls-secrets"));
 }
 
-/// The daemon is the only ACME client, so a gateway task on every node is fine:
+/// The controller is the only ACME client, so a gateway task on every node is fine:
 /// each forwards the challenges to it, and each mounts the same secrets.
 #[test]
 fn a_global_gateway_can_use_letsencrypt_on_swarm() {

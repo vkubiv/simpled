@@ -86,7 +86,7 @@ pub fn resolved_env(env_type: DeploymentEnvType, deployment: DeploymentResolvedS
         ingress: IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
-            daemon: None,
+            controller: None,
             trusted_proxies: vec![],
             global: false,
             placement: None,

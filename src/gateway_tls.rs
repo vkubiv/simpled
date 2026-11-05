@@ -1,19 +1,19 @@
 //! The gateway's certificates on Docker Swarm: one Swarm secret per domain,
 //! holding the certificate chain and the key in one PEM file, which Traefik
 //! reads through its file provider. Secrets reach every node through Raft, so
-//! any node can run a gateway task (`docs/design/daemon.md` §7.1).
+//! any node can run a gateway task (`docs/design/controller.md` §7.1).
 //!
-//! The daemon issues and renews them. Until it has, a domain is served with a
+//! The controller issues and renews them. Until it has, a domain is served with a
 //! self-signed placeholder, which `step tls-secrets` creates on the first deploy.
 
 use crate::resolved_spec::IngressResolvedSpec;
 use anyhow::{Context, Result};
 
-/// Labels of a certificate secret. The daemon never reads a certificate back:
+/// Labels of a certificate secret. The controller never reads a certificate back:
 /// what it needs to know is in these.
 pub mod labels {
     pub const DOMAIN: &str = "simpled.tls.domain";
-    /// `acme` for a certificate the daemon issued, `self-signed` for the
+    /// `acme` for a certificate the controller issued, `self-signed` for the
     /// placeholder.
     pub const ISSUER: &str = "simpled.tls.issuer";
     /// Unix seconds; `0` for the placeholder, which nothing renews by date.

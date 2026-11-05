@@ -652,7 +652,7 @@ mod tests {
         IngressResolvedSpec {
             version_routes: vec![],
             version_document: None,
-            daemon: None,
+            controller: None,
             trusted_proxies: Vec::new(),
             global: false,
             placement: None,
@@ -699,7 +699,7 @@ mod tests {
             ingress: IngressResolvedSpec {
                 version_routes: vec![],
                 version_document: None,
-                daemon: None,
+                controller: None,
                 trusted_proxies: Vec::new(),
                 global: false,
                 placement: None,

@@ -5,7 +5,7 @@ use std::path::Path;
 mod app_bundle;
 mod bundle_repo;
 mod client;
-mod daemon;
+mod controller;
 mod deploy_plan;
 mod deploy_steps;
 mod docker_compose;
@@ -73,8 +73,8 @@ enum Commands {
         command: StepCommands,
     },
 
-    /// Every deployment's version, health and services, from the simpled daemon.
-    /// Reads the API's address from the env spec here (gateway.daemon.hosts)
+    /// Every deployment's version, health and services, from the simpled controller.
+    /// Reads the API's address from the env spec here (controller.hosts)
     /// and the token from SIMPLED_TOKEN
     Status {
         /// The API's base instead, e.g. https://ops.example.com/api/v1
@@ -85,7 +85,7 @@ enum Commands {
         json: bool,
     },
 
-    /// A service's log, from the simpled daemon. On Swarm, every task's lines
+    /// A service's log, from the simpled controller. On Swarm, every task's lines
     Logs {
         deployment: String,
         service: String,
@@ -131,11 +131,11 @@ enum Commands {
         command: TlsCommands,
     },
 
-    /// The environment's daemon, next to the gateway: answers the version and
+    /// The environment's controller, next to the gateway: answers the version and
     /// health of every deployment. Run by the generated stack, not by hand
     #[command(hide = true)]
-    Daemon {
-        /// The daemon.json that prepare-deployment writes
+    Controller {
+        /// The controller.json that prepare-deployment writes
         #[arg(long)]
         config: std::path::PathBuf,
         #[arg(long, default_value = "0.0.0.0:8080")]
@@ -237,7 +237,7 @@ enum Commands {
 enum TlsCommands {
     /// Turns the certificates in a Traefik acme.json (simpled 2.0.x kept it in
     /// docker-deploy/letsencrypt/) into the gateway's certificate secrets, so
-    /// the daemon issues nothing new. Run it on a swarm manager
+    /// the controller issues nothing new. Run it on a swarm manager
     Import {
         /// The acme.json
         file: std::path::PathBuf,
@@ -482,8 +482,8 @@ fn main() -> Result<()> {
             let report = deploy_steps::import_acme_json(&deploy_steps::DockerCli, &text, None, unix_now())?;
             print_import_report(&report);
         }
-        Commands::Daemon { config, listen } => {
-            daemon::run(config, listen)?;
+        Commands::Controller { config, listen } => {
+            controller::run(config, listen)?;
         }
         Commands::Local { command } => {
             local(command)?;

@@ -58,7 +58,7 @@ pub fn resolve(
         &app_spec.version.to_string(),
         &deployment.name,
     );
-    // Kubernetes only. On Docker the environment's daemon answers for every
+    // Kubernetes only. On Docker the environment's controller answers for every
     // deployment from its services' labels; locally the local gateway does.
     let is_local = env_spec.env_type == DeploymentEnvType::Local;
     if env_spec.env_type == DeploymentEnvType::K8S {
@@ -826,7 +826,7 @@ fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppS
 fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolvedSpec> {
     let rules = build_ingress_rules(env_spec);
     check_route_conflicts(&rules)?;
-    let rules_for_daemon = rules.clone();
+    let rules_for_controller = rules.clone();
 
     let tls = env_spec.ingress.tls.as_ref().map(|tls_spec| IngressTlsResolvedSpec {
         secret: tls_spec.secret.clone(),
@@ -864,11 +864,11 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         trusted_proxies: env_spec.ingress.trusted_proxies.clone(),
         global: env_spec.ingress.global,
         placement: env_spec.ingress.placement.clone(),
-        daemon: env_spec
+        controller: env_spec
             .ingress
-            .daemon
+            .controller
             .as_ref()
-            .map(|d| resolve_daemon(env_spec, d, &rules_for_daemon))
+            .map(|d| resolve_controller(env_spec, d, &rules_for_controller))
             .transpose()?,
     })
 }
@@ -877,15 +877,15 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
 /// socket's view of the environment, logs included.
 const MIN_TOKEN_LENGTH: usize = 32;
 
-/// `gateway.daemon`: each host alias's domains, and the tokens' values, which
+/// `controller`: each host alias's domains, and the tokens' values, which
 /// are read here like a deployment's secrets, or deferred to the deploy target.
-fn resolve_daemon(
+fn resolve_controller(
     env_spec: &DeploymentEnvironmentSpec,
-    daemon: &crate::spec::DaemonSpec,
+    controller: &crate::spec::ControllerSpec,
     rules: &[IngressRule],
-) -> Result<crate::resolved_spec::DaemonResolvedSpec> {
+) -> Result<crate::resolved_spec::ControllerResolvedSpec> {
     let mut routes = Vec::new();
-    for (alias, prefix) in &daemon.hosts {
+    for (alias, prefix) in &controller.hosts {
         for host in env_spec.ingress.hosts.iter().filter(|h| &h.name == alias) {
             for domain in &host.domain_names {
                 let taken = rules
@@ -895,7 +895,7 @@ fn resolve_daemon(
                     .find(|s| s.prefix.trim_end_matches('/') == prefix.trim_end_matches('/'));
                 if let Some(service) = taken {
                     return Err(anyhow!(
-                        "gateway.daemon.hosts.{} routes {}{} to the daemon, but service '{}' of deployment '{}' is routed there too",
+                        "controller.hosts.{} routes {}{} to the controller, but service '{}' of deployment '{}' is routed there too",
                         alias,
                         domain,
                         prefix,
@@ -914,7 +914,7 @@ fn resolve_daemon(
         if let SecretResolvedValue::Literal(literal) = &value {
             if literal.chars().count() < MIN_TOKEN_LENGTH {
                 return Err(anyhow!(
-                    "gateway.daemon.{} is {} characters long; a token needs at least {}, for example `openssl rand -hex 32`",
+                    "controller.{} is {} characters long; a token needs at least {}, for example `openssl rand -hex 32`",
                     spec.secret_name,
                     literal.chars().count(),
                     MIN_TOKEN_LENGTH
@@ -922,14 +922,14 @@ fn resolve_daemon(
             }
         }
         Ok(Some(SecretResolvedSpec {
-            name: format!("simpled-daemon-{}", spec.secret_name.replace('_', "-")),
+            name: format!("simpled-controller-{}", spec.secret_name.replace('_', "-")),
             value,
         }))
     };
-    Ok(crate::resolved_spec::DaemonResolvedSpec {
+    Ok(crate::resolved_spec::ControllerResolvedSpec {
         routes,
-        read_token: token(&daemon.read_token)?,
-        manage_token: token(&daemon.manage_token)?,
+        read_token: token(&controller.read_token)?,
+        manage_token: token(&controller.manage_token)?,
     })
 }
 
@@ -1362,7 +1362,7 @@ mod tests {
             trusted_proxies: Vec::new(),
             global: false,
             placement: None,
-            daemon: None,
+            controller: None,
         }
     }
 

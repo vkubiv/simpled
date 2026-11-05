@@ -45,7 +45,12 @@ pub fn convert_env_spec(
     };
     let ingress_type_str = gateway_yaml.ingress_type.clone();
     let has_trusted_proxies = gateway_yaml.trusted_proxies.as_ref().is_some_and(|p| !p.is_empty());
-    let ingress = convert_ingress(gateway_yaml, &env_type_yaml, root)?;
+    let mut ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
+    ingress.controller = yaml
+        .controller
+        .as_ref()
+        .map(|c| convert_controller(c, &ingress.hosts, &env_type_yaml, root))
+        .transpose()?;
     let tls_upstream = ingress.tls.as_ref().is_some_and(|t| t.upstream);
     let has_tls_secret = ingress.tls.as_ref().is_some_and(|t| t.secret.is_some());
     let registry = yaml.registry.unwrap_or_default();
@@ -752,12 +757,7 @@ fn any_service_has_working_dir(deployments: &HashMap<String, DeploymentSpecYaml>
     })
 }
 
-fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml, root: &Path) -> Result<IngressSpec> {
-    let daemon = yaml
-        .daemon
-        .as_ref()
-        .map(|d| convert_daemon(d, &yaml.hosts, env_type, root))
-        .transpose()?;
+fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> Result<IngressSpec> {
     let mut hosts = Vec::new();
     for (name, host) in yaml.hosts {
         match host {
@@ -849,7 +849,7 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml, root
         .map(|p| convert_placement(p, "gateway"))
         .transpose()?;
     // `global` with `tls.letsencrypt` is fine: `global` is Swarm-only, and there
-    // the daemon is the only ACME client, which every gateway task forwards the
+    // the controller is the only ACME client, which every gateway task forwards the
     // HTTP-01 challenges to, whichever node they reach.
     if global && placement.as_ref().is_some_and(|p| !p.spread.is_empty()) {
         return Err(anyhow!(
@@ -866,35 +866,36 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml, root
         trusted_proxies,
         global,
         placement,
-        daemon,
+        // Set from the env spec's top level, once the hosts are known.
+        controller: None,
     })
 }
 
-/// `gateway.daemon`. Docker only for now: the daemon runs next to the Docker
+/// `controller`. Docker only for now: the controller runs next to the Docker
 /// gateway. Its tokens take every source a deployment secret takes, without
 /// a deployment's fallbacks (`secrets_json`, `secrets_aws`, ...).
-fn convert_daemon(
-    yaml: &DaemonSpecYaml,
-    hosts: &HashMap<String, HostSpecYaml>,
+fn convert_controller(
+    yaml: &ControllerSpecYaml,
+    hosts: &[spec::HostSpec],
     env_type: &DeploymentEnvTypeYaml,
     root: &Path,
-) -> Result<spec::DaemonSpec> {
+) -> Result<spec::ControllerSpec> {
     if !matches!(env_type, DeploymentEnvTypeYaml::Docker) {
         return Err(anyhow!(
-            "gateway.daemon is only supported on Docker: the simpled daemon runs next to the Docker gateway"
+            "controller is only supported on Docker: the simpled controller runs next to the Docker gateway"
         ));
     }
     let mut routes = Vec::new();
     for (alias, host) in yaml.hosts.iter().flatten() {
-        if !hosts.contains_key(alias) {
+        if !hosts.iter().any(|h| &h.name == alias) {
             return Err(anyhow!(
-                "gateway.daemon.hosts names '{}', which is not a host under gateway.hosts",
+                "controller.hosts names '{}', which is not a host under gateway.hosts",
                 alias
             ));
         }
         if !host.prefix.starts_with('/') {
             return Err(anyhow!(
-                "gateway.daemon.hosts.{}.prefix '{}' must start with /",
+                "controller.hosts.{}.prefix '{}' must start with /",
                 alias,
                 host.prefix
             ));
@@ -914,7 +915,7 @@ fn convert_daemon(
             .map(|y| {
                 Ok(DeploymentSecretSpec {
                     secret_name: name.to_string(),
-                    source: convert_secret_source(&format!("gateway.daemon.{}", name), y, root, &no_fallbacks)?,
+                    source: convert_secret_source(&format!("controller.{}", name), y, root, &no_fallbacks)?,
                 })
             })
             .transpose()
@@ -924,15 +925,15 @@ fn convert_daemon(
     let has_token = read_token.is_some() || manage_token.is_some();
     if has_token && routes.is_empty() {
         eprintln!(
-            "Warning: gateway.daemon sets a token but no hosts, so the daemon's private API is not routed and the token cannot be used"
+            "Warning: controller sets a token but no hosts, so the controller's private API is not routed and the token cannot be used"
         );
     }
     if !has_token && !routes.is_empty() {
         eprintln!(
-            "Warning: gateway.daemon sets hosts but no read_token or manage_token, so the private API has no routes to serve"
+            "Warning: controller sets hosts but no read_token or manage_token, so the private API has no routes to serve"
         );
     }
-    Ok(spec::DaemonSpec {
+    Ok(spec::ControllerSpec {
         hosts: routes,
         read_token,
         manage_token,

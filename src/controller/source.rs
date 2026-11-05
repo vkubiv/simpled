@@ -1,4 +1,4 @@
-//! Where the daemon reads a deployment's services from: Swarm services on a
+//! Where the controller reads a deployment's services from: Swarm services on a
 //! swarm, containers on standalone Docker. Both are found by the labels
 //! `prepare-deployment` writes (`model::labels`).
 
@@ -126,7 +126,7 @@ fn logs_options(query: &LogQuery) -> LogsOptions {
 
 impl DockerSource {
     /// The Swarm service ID of one of a deployment's services, found by labels,
-    /// so only services the daemon owns are found.
+    /// so only services the controller owns are found.
     async fn swarm_service_id(&self, deployment: &str, service: &str) -> Result<Option<String>> {
         let services = self
             .docker

@@ -263,7 +263,7 @@ one inline with `extends:`.
   quietly dropped. A `prefixes` typo used to produce wrong routing in silence.
 - Every gateway host answers `/.well-known/simpled/version` with the deployed
   application, version and deployment, and on Docker `/.well-known/simpled/health`
-  (200 only when healthy, plus `converged`). On Docker the environment's daemon, next
+  (200 only when healthy, plus `converged`). On Docker the environment's controller, next
   to the gateway, answers them; on Kubernetes a `simpled-version-<deployment>`
   service. Do not route those paths to an app service.
 - Several copies of one local stack need named ports: `ports:` at the top of

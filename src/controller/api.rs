@@ -1,5 +1,5 @@
-//! The daemon's private API, under `gateway.daemon.hosts`
-//! (`docs/design/daemon.md` §4). Every route needs `Authorization: Bearer
+//! The controller's private API, under `controller.hosts`
+//! (`docs/design/controller.md` §4). Every route needs `Authorization: Bearer
 //! <token>`. The read token reads state; the manage token can do everything the
 //! read token can, and the write routes later. Without a token the routes do
 //! not exist.
@@ -47,7 +47,7 @@ impl Api {
     }
 
     /// Reads a token file. A missing, empty or short token is reported and left
-    /// out, so the daemon still answers the public routes.
+    /// out, so the controller still answers the public routes.
     pub fn read_token(path: Option<&str>) -> Option<String> {
         let path = path?;
         match std::fs::read_to_string(path) {
@@ -81,7 +81,7 @@ fn same(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// The client as the gateway saw it. Only the gateway reaches the daemon, and
+/// The client as the gateway saw it. Only the gateway reaches the controller, and
 /// it sets these from the connection, or from `trusted_proxies`.
 fn client(headers: &HeaderMap) -> String {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
@@ -253,7 +253,7 @@ async fn logs(
     }
 }
 
-/// The gateway's tasks per node, and, where the daemon issues them, the
+/// The gateway's tasks per node, and, where the controller issues them, the
 /// certificates of its domains with their expiry.
 async fn gateway(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if let Err(denied) = guard(&app, &headers) {
@@ -334,7 +334,7 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     json_ok(json!({ "deployments": out }))
 }
 
-/// One deployment's services. A deployment the daemon does not know is a 404,
+/// One deployment's services. A deployment the controller does not know is a 404,
 /// the same as a name it may not see, so names cannot be probed.
 async fn services(State(app): State<Arc<App>>, headers: HeaderMap, Path(deployment): Path<String>) -> Response {
     if let Err(denied) = guard(&app, &headers) {

@@ -461,13 +461,13 @@ pub struct IngressSpec {
     pub global: bool,
     /// Swarm only: where the gateway task(s) may run.
     pub placement: Option<Placement>,
-    /// Docker only: the daemon's private API.
-    pub daemon: Option<DaemonSpec>,
+    /// Docker only: the controller's private API.
+    pub controller: Option<ControllerSpec>,
 }
 
-/// `gateway.daemon`: where the daemon's private API is routed, and its tokens.
+/// `controller`: where the controller's private API is routed, and its tokens.
 #[derive(Debug, Clone)]
-pub struct DaemonSpec {
+pub struct ControllerSpec {
     /// Host alias and the path prefix the API is served under, which the gateway
     /// strips.
     pub hosts: Vec<(String, String)>,
