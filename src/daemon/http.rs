@@ -23,6 +23,8 @@ pub struct Certs {
 }
 
 pub struct App {
+    /// The private API; `None` without a token.
+    pub api: Option<super::api::Api>,
     pub certs: Option<Certs>,
     /// Answers to pending ACME challenges, which the ACME task fills in.
     pub challenges: super::acme::Challenges,
@@ -37,6 +39,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route(VERSION_PATH, get(version))
         .route(HEALTH_PATH, get(health))
         .route("/.well-known/acme-challenge/{token}", get(challenge))
+        .merge(super::api::routes())
         .with_state(app)
 }
 
@@ -94,6 +97,25 @@ async fn version(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     }
 }
 
+/// Adds the certificates of the deployment's domains to its health.
+pub async fn health_with_tls(app: &App, deployment: &str, health: model::Health) -> model::Health {
+    let Some(certs) = &app.certs else {
+        return health;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut states = Vec::new();
+    for domain in certs.domains_of.get(deployment).into_iter().flatten() {
+        match certs.source.current(domain).await {
+            Ok(current) => states.push(model::tls_state(current, now)),
+            Err(e) => eprintln!("health for {}: certificate of {}: {:#}", deployment, domain, e),
+        }
+    }
+    model::with_tls(health, &states)
+}
+
 /// The key authorization of a pending HTTP-01 challenge, on any host: the
 /// token is the secret, and it is only known while the order is pending.
 async fn challenge(State(app): State<Arc<App>>, axum::extract::Path(token): axum::extract::Path<String>) -> Response {
@@ -126,23 +148,7 @@ async fn health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             }
         }
     };
-    let health = match &app.certs {
-        Some(certs) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
-            let mut states = Vec::new();
-            for domain in certs.domains_of.get(deployment).into_iter().flatten() {
-                match certs.source.current(domain).await {
-                    Ok(current) => states.push(model::tls_state(current, now)),
-                    Err(e) => eprintln!("health for {}: certificate of {}: {:#}", deployment, domain, e),
-                }
-            }
-            model::with_tls(health, &states)
-        }
-        None => health,
-    };
+    let health = health_with_tls(&app, deployment, health).await;
     let status = if health.status == Status::Healthy {
         StatusCode::OK
     } else {
@@ -168,6 +174,10 @@ mod tests {
             let services = if deployment == "prod" { self.0.clone() } else { vec![] };
             Box::pin(async move { Ok(services) })
         }
+
+        fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            Box::pin(async move { Ok(vec!["prod".to_string()]) })
+        }
     }
 
     fn api(running: u64) -> ServiceState {
@@ -180,6 +190,7 @@ mod tests {
             running,
             unhealthy: 0,
             updating: false,
+            image: String::new(),
         }
     }
 
@@ -192,6 +203,7 @@ mod tests {
             source: Box::new(Fake(services)),
             challenges: Default::default(),
             certs: None,
+            api: None,
         });
         let response = router(app)
             .oneshot(Request::get(path).header("host", host).body(Body::empty()).unwrap())
@@ -249,6 +261,7 @@ mod tests {
             source: Box::new(Fake(vec![])),
             challenges: Default::default(),
             certs: None,
+            api: None,
         });
         app.challenges
             .write()
@@ -294,6 +307,7 @@ mod tests {
                 owners: HashMap::from([("shop.example.com".to_string(), "prod".to_string())]),
                 source: Box::new(Fake(vec![api(2)])),
                 challenges: Default::default(),
+                api: None,
                 certs: Some(Certs {
                     source: Box::new(FakeCerts(current)),
                     domains_of: HashMap::from([("prod".to_string(), vec!["shop.example.com".to_string()])]),
@@ -326,5 +340,57 @@ mod tests {
         );
         let (_, body) = ask(Some((true, 1)));
         assert_eq!(body["tls"], "expiring");
+    }
+
+    #[test]
+    fn the_private_api_answers_with_a_token_and_does_not_exist_without_one() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
+        let call = |api: Option<super::super::api::Api>, path: &'static str, token: Option<&'static str>| {
+            let app = Arc::new(App {
+                owners: HashMap::new(),
+                source: Box::new(Fake(vec![api_service()])),
+                challenges: Default::default(),
+                certs: None,
+                api,
+            });
+            run(async move {
+                let mut request = Request::get(path).header("host", "ops.example.com");
+                if let Some(t) = token {
+                    request = request.header("authorization", format!("Bearer {}", t));
+                }
+                let response = router(app).oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default(),
+                )
+            })
+        };
+        let api = || super::super::api::Api::new(Some(TOKEN.to_string()), None);
+
+        let (status, body) = call(api(), "/api/v1/status", Some(TOKEN));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deployments"][0]["name"], "prod");
+        assert_eq!(body["deployments"][0]["health"]["status"], "healthy");
+        assert_eq!(
+            body["deployments"][0]["services"][0],
+            json!({"name": "api", "desired": 2, "running": 2})
+        );
+
+        let (status, body) = call(api(), "/api/v1/deployments/prod/services", Some(TOKEN));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["services"][0]["version"], "1.2.3");
+        assert_eq!(
+            call(api(), "/api/v1/deployments/other/services", Some(TOKEN)).0,
+            StatusCode::NOT_FOUND
+        );
+
+        assert_eq!(call(api(), "/api/v1/status", None).0, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(None, "/api/v1/status", Some(TOKEN)).0, StatusCode::NOT_FOUND);
+    }
+
+    fn api_service() -> ServiceState {
+        api(2)
     }
 }

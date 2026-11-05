@@ -647,7 +647,48 @@ The gateway is shared by every deployment of an env spec and rewritten by each o
 | Network | `simpled_control`, an overlay network only the gateway and the daemon are on | `simpled_control`, a bridge network, the same way |
 | Docker access | `/var/run/docker.sock`. As root, since the daemon may run on another manager than the one running `deploy.sh`, whose `docker` group may have another number. Read-only filesystem, no capabilities. | `/var/run/docker.sock`, as user 65532 with the socket's group (`stat -c %g`). Read-only filesystem, no capabilities. |
 
-App containers are not on `simpled_control` and reach the daemon only through the gateway's two public routes. The Docker socket is effectively root on the host: the daemon only reads through it.
+App containers are not on `simpled_control` and reach the daemon only through the gateway's routes. The Docker socket is effectively root on the host. On Swarm with `tls.letsencrypt` the daemon also writes through it: it creates the certificate secrets and updates the gateway service.
+
+#### daemon (private API)
+
+The daemon also has a private API, which reports every deployment's services. It is off until `gateway.daemon` routes it and gives it a token:
+
+```yaml
+gateway:
+  hosts:
+    web: shop.example.com
+    ops: ops.example.com
+  daemon:
+    hosts:
+      ops:
+        prefix: /                 # or e.g.  web: { prefix: /_simpled }
+    read_token:
+      aws: prod/simpled/tokens    # any source a deployment secret takes
+      jq: .read
+    manage_token:
+      env: SIMPLED_MANAGE_TOKEN
+```
+
+| Field | Description |
+|-------|-------------|
+| `hosts` | Host alias to `{ prefix }`: where the API is served. The gateway strips the prefix, so `/_simpled/api/v1/status` reaches the daemon as `/api/v1/status`. A prefix that a service already has on the same domain fails validation. |
+| `read_token` | Reads state. Every source a deployment secret takes (`env`, `file`, `aws`, `json_env`, …); an `aws` token is fetched on the deploy target by `fetch-secrets.sh`. At least 32 characters, for example `openssl rand -hex 32`. |
+| `manage_token` | Everything the read token can, and the write routes when they come. |
+
+Without `hosts` the API is not routed; without a token its routes do not exist. Docker only. The tokens reach the daemon as gateway Swarm secrets on Swarm, so every manager has them, and as files under `daemon/` on standalone Docker; `daemon.json` only says where they are.
+
+**The read token is a credential**, not a viewer password: what the API returns, and the logs it will serve, can be as sensitive as the secrets that leak into them.
+
+Every request needs `Authorization: Bearer <token>`. A missing or wrong token gets 401 and a token without enough rights 403. A client that fails 10 times within a minute gets 429 until the minute is over; the client is the address the gateway forwards.
+
+| Route | Returns |
+|---|---|
+| `GET /api/v1/status` | Every deployment: its version document, its health (as `/health`), and its services with desired and running counts. |
+| `GET /api/v1/deployments/{deployment}/services` | Per service: name, image, version, desired, running, unhealthy and whether an update is in progress. A deployment the daemon does not know is a 404. |
+
+```bash
+curl -H "Authorization: Bearer $SIMPLED_TOKEN" https://ops.example.com/api/v1/status
+```
 
 #### body_limit
 
