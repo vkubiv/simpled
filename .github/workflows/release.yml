@@ -208,10 +208,21 @@ jobs:
           sha256sum * > sha256sums.txt
           cat sha256sums.txt
 
+      - name: Find release notes
+        # docs/releases/<version>.md, when there is one, goes above the generated
+        # list of pull requests.
+        id: notes
+        run: |
+          NOTES="docs/releases/${VERSION#v}.md"
+          if [ -f "$NOTES" ]; then echo "path=$NOTES" >> $GITHUB_OUTPUT; fi
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.get-version.outputs.version }}
           name: Release ${{ needs.get-version.outputs.version }}
           files: artifacts/*
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true

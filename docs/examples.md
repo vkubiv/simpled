@@ -578,3 +578,26 @@ app_services:
 ```
 
 simpled returns a parse error if a service references a named volume not declared in `volumes:`.
+
+On Docker Swarm the env spec also says where each volume lives, and `./local-seed`
+is an error, because it would be a different directory on every node. Ship the seed
+files as a config instead, and bind the volumes:
+
+```yaml
+# envspec.yaml
+type: docker
+swarm_mode: true
+
+deployments:
+  prod:
+    volumes:
+      postgres-data:
+        node: db-1                  # postgres runs on db-1
+      redis-data:
+        node: db-1
+      uploads:
+        nfs: fs-1.example.com:/prod/uploads   # api runs on any node
+```
+
+A single-node swarm can skip the bindings with `multi_node: false`; see
+[Volumes on Docker Swarm](reference.md#volumes-on-docker-swarm).

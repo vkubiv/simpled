@@ -1721,9 +1721,10 @@ Swarm objects cannot be changed, so each one is named after its content:
    nothing. New content is a new object, which changes the services that mount it,
    and Swarm does a rolling update of exactly those. Nothing time-dependent is
    written into a Swarm service, so a deploy restarts only the services whose image,
-   environment, configs or secrets changed. Two exceptions restart on every deploy:
-   the deployment's version service, whose answer includes the time of the deploy,
-   and the gateway. To restart a service without changing anything, use
+   environment, configs or secrets changed. The gateway restarts when its routing
+   changes, since that renames its config. One exception restarts on every deploy:
+   the deployment's version service, whose answer includes the time of the deploy.
+   To restart a service without changing anything, use
    `docker service update --force <stack>_<service>`. The deploy log still says
    `Updating service ...` for every service: `docker stack deploy` sends each one an
    update, and Swarm only replaces the tasks of those whose spec differs.
@@ -1738,7 +1739,9 @@ A config file or secret larger than 500 KB, Swarm's limit for one object, fails
 `prepare-deployment`.
 
 Still a bind mount of the deploy directory: Traefik's Let's Encrypt store
-(`letsencrypt/`), on whichever node the gateway runs.
+(`letsencrypt/`). The directory exists only on the manager that runs `deploy.sh`, so
+on a swarm of several nodes pin the gateway there with
+[`gateway.placement`](#global-and-placement-swarm).
 
 ---
 
@@ -1837,3 +1840,27 @@ The compose file sets its project name to `<application.name>_local`, so several
 | `<working_dir>/.env` | Environment and secrets for a host-run service that sets `working_dir` |
 
 `simpled test` writes the same layout to `test_env/`, as project `<application.name>_test`, plus the suite's `.env` and secret files in its `working_dir`. Keep `local_env*/` and `test_env*/` (the instance directories included) out of version control.
+
+---
+
+## Upgrading to 2.0.0
+
+2.0.0 changes what simpled generates for Docker Swarm. Kubernetes, standalone Docker
+and `type: local` env specs need no changes, unless they use the nginx gateway.
+
+| A 1.x env spec with | What 2.0.0 does | What to change |
+|---|---|---|
+| Swarm, a mounted named volume without a binding | Error, listing the volumes in a block ready to paste | Bind each one under `deployments.<name>.volumes`, see [Volumes on Docker Swarm](#volumes-on-docker-swarm). Or set `multi_node: false` on a single-node swarm. |
+| Swarm, a relative bind path such as `./data:/data` | Error | A config for files the service only reads, a bound volume for data it writes. Or `multi_node: false`. |
+| Swarm, configs or secrets | Become Swarm objects, see [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm) | Nothing, unless one is larger than 500 KB. |
+| Swarm, a target that is not Linux amd64 | `prepare-deployment` ships an amd64 `simpled` next to `deploy.sh` | Set [`target_platform`](#envspecyaml--localenvyaml), and pass `--target-binary` until releases build the arm64 binary. |
+| Swarm, several deployments deployed from one directory on the target | Each `deploy.sh` replaces the other's files | One directory per deployment, see [Several deployments in one env spec](#several-deployments-in-one-env-spec). |
+| `gateway.type: nginx` | Error | Remove it: Traefik is the only Docker gateway. |
+| `gateway.tls.secret` on Docker | Error | `tls.letsencrypt`, or `tls.upstream: true` when TLS ends in front of the gateway. |
+
+The first 2.0.0 deploy of a Swarm deployment replaces every service once: their
+mounts move to Swarm objects, and `DEPLOY_DATE` is gone. After that, a deploy
+restarts only the services that changed.
+
+CI steps that install the latest simpled, and `simpled update`, move to 2.0.0. Pin
+1.13.1 until the Swarm env specs prepare without errors.

@@ -43,7 +43,10 @@ Get these right and most specs validate on the first try.
    needs *different* paths on different domains uses `hosts:` instead (see
    `docs reference --section hosts`).
 6. **Named volumes must be declared** in the top-level `volumes:` list before a service
-   mounts them. Host paths (`./x`, `/x`) need no declaration.
+   mounts them. Host paths (`./x`, `/x`) need no declaration. On Swarm each mounted
+   volume also needs a binding under `deployments.<name>.volumes` (`node`, `path` or
+   `nfs`), and relative host paths are an error, unless the env spec sets
+   `multi_node: false` (see `docs reference --section "Volumes on Docker Swarm"`).
 7. **A service may only reference variables** that exist in the `environment:` block
    (or use `$all`).
 

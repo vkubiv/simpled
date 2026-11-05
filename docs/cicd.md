@@ -244,7 +244,8 @@ jobs:
           username: deploy
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           source: environments/prod/docker-deploy/
-          target: /opt/deployments/
+          target: /opt/deployments/myapp_prod/
+          strip_components: 2
 
       - name: Deploy stack
         uses: appleboy/ssh-action@v1
@@ -253,8 +254,15 @@ jobs:
           username: deploy
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            cd /opt/deployments/docker-deploy && sudo ./deploy.sh
+            cd /opt/deployments/myapp_prod/docker-deploy && sudo ./deploy.sh
 ```
+
+`docker-deploy/` holds a `simpled` binary that `deploy.sh` runs for its harder steps.
+On an `ubuntu-latest` runner it is a copy of the simpled that prepared the
+deployment. Copy the directory whole, and give every deployment of the env spec its
+own directory on the server (`myapp_prod/` here), so two deploys never share files.
+Deploys to the same swarm wait for each other; see
+[Several deployments in one env spec](reference.md#several-deployments-in-one-env-spec).
 
 ---
 
