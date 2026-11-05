@@ -1124,74 +1124,10 @@ fn convert_deployment(
     let secrets = if let Some(sec) = &yaml.secrets {
         let mut list = Vec::new();
         for (k, v) in sec {
-            match v {
-                DeploymentSecretSpecExYaml::Detailed(v) => {
-                    let sources = [
-                        v.env.is_some(),
-                        v.file.is_some(),
-                        v.aws.is_some(),
-                        v.json_file.is_some(),
-                        v.json_env.is_some(),
-                    ]
-                    .iter()
-                    .filter(|present| **present)
-                    .count();
-                    if sources > 1 {
-                        return Err(anyhow!(
-                            "Secret {} can only have one of the env, file, aws, json_file and json_env sources",
-                            k
-                        ));
-                    }
-                    if v.jq.is_some() && (v.env.is_some() || v.file.is_some()) {
-                        return Err(anyhow!(
-                            "Secret {} sets jq, which selects from a JSON document and not from an env or file source",
-                            k
-                        ));
-                    }
-                    let source = if let Some(env) = &v.env {
-                        DeploymentSecretSource::EnvVariable(env.clone())
-                    } else if let Some(file) = &v.file {
-                        DeploymentSecretSource::FilePath(root.join(file).to_string_lossy().into_owned())
-                    } else if let Some(json_file) = &v.json_file {
-                        let path = root.join(json_file);
-                        json_field_source(
-                            k,
-                            JsonDocument::File {
-                                path: path.to_string_lossy().into_owned(),
-                                display: path_for_message(&path),
-                            },
-                            v.jq.as_deref(),
-                        )?
-                    } else if let Some(variable) = &v.json_env {
-                        json_field_source(k, JsonDocument::Env(variable.clone()), v.jq.as_deref())?
-                    } else if let Some(aws) = &v.aws {
-                        // An `aws` source with no filter is the whole secret, which is
-                        // how a secret that holds one value is read. Only the
-                        // deployment-wide documents default to a field.
-                        DeploymentSecretSource::Aws(AwsSecretRef {
-                            secret_id: aws.clone(),
-                            jq: v.jq.clone(),
-                        })
-                    } else {
-                        // `jq:` on its own: the field of the deployment's document.
-                        find_fallback_source(k, v.jq.as_deref(), &secret_fallbacks)?
-                    };
-                    list.push(DeploymentSecretSpec {
-                        secret_name: k.clone(),
-                        source,
-                    });
-                }
-                DeploymentSecretSpecExYaml::Local(opt_value) => {
-                    let source = match opt_value.as_deref() {
-                        Some(v) if !v.is_empty() => DeploymentSecretSource::Embedded(v.to_string()),
-                        _ => find_fallback_source(k, None, &secret_fallbacks)?,
-                    };
-                    list.push(DeploymentSecretSpec {
-                        secret_name: k.clone(),
-                        source,
-                    });
-                }
-            }
+            list.push(DeploymentSecretSpec {
+                secret_name: k.clone(),
+                source: convert_secret_source(k, v, root, &secret_fallbacks)?,
+            });
         }
         list
     } else {
@@ -1313,6 +1249,78 @@ fn convert_nfs(yaml: &NfsBindingYaml, owner: &str) -> Result<NfsVolume> {
 
 /// Every path an env spec names is taken relative to the spec's own directory,
 /// so a spec reads the same wherever `simpled` is run from (`--path`).
+/// One secret's source, from any of the shapes a deployment secret accepts.
+/// `fallbacks` is where a secret with no source of its own is looked for.
+fn convert_secret_source(
+    k: &str,
+    v: &DeploymentSecretSpecExYaml,
+    root: &Path,
+    secret_fallbacks: &SecretFallbacks,
+) -> Result<DeploymentSecretSource> {
+    match v {
+        DeploymentSecretSpecExYaml::Detailed(v) => {
+            let sources = [
+                v.env.is_some(),
+                v.file.is_some(),
+                v.aws.is_some(),
+                v.json_file.is_some(),
+                v.json_env.is_some(),
+            ]
+            .iter()
+            .filter(|present| **present)
+            .count();
+            if sources > 1 {
+                return Err(anyhow!(
+                    "Secret {} can only have one of the env, file, aws, json_file and json_env sources",
+                    k
+                ));
+            }
+            if v.jq.is_some() && (v.env.is_some() || v.file.is_some()) {
+                return Err(anyhow!(
+                    "Secret {} sets jq, which selects from a JSON document and not from an env or file source",
+                    k
+                ));
+            }
+            let source = if let Some(env) = &v.env {
+                DeploymentSecretSource::EnvVariable(env.clone())
+            } else if let Some(file) = &v.file {
+                DeploymentSecretSource::FilePath(root.join(file).to_string_lossy().into_owned())
+            } else if let Some(json_file) = &v.json_file {
+                let path = root.join(json_file);
+                json_field_source(
+                    k,
+                    JsonDocument::File {
+                        path: path.to_string_lossy().into_owned(),
+                        display: path_for_message(&path),
+                    },
+                    v.jq.as_deref(),
+                )?
+            } else if let Some(variable) = &v.json_env {
+                json_field_source(k, JsonDocument::Env(variable.clone()), v.jq.as_deref())?
+            } else if let Some(aws) = &v.aws {
+                // An `aws` source with no filter is the whole secret, which is
+                // how a secret that holds one value is read. Only the
+                // deployment-wide documents default to a field.
+                DeploymentSecretSource::Aws(AwsSecretRef {
+                    secret_id: aws.clone(),
+                    jq: v.jq.clone(),
+                })
+            } else {
+                // `jq:` on its own: the field of the deployment's document.
+                find_fallback_source(k, v.jq.as_deref(), secret_fallbacks)?
+            };
+            Ok(source)
+        }
+        DeploymentSecretSpecExYaml::Local(opt_value) => {
+            let source = match opt_value.as_deref() {
+                Some(v) if !v.is_empty() => DeploymentSecretSource::Embedded(v.to_string()),
+                _ => find_fallback_source(k, None, secret_fallbacks)?,
+            };
+            Ok(source)
+        }
+    }
+}
+
 fn convert_deployment_app(yaml: &DeploymentAppSpecYaml, root: &Path) -> Result<DeploymentAppSpec> {
     let version = if let Some(v) = &yaml.version {
         Some(semver::VersionReq::parse(v)?)
