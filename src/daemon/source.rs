@@ -32,16 +32,22 @@ pub struct DockerSource {
 }
 
 impl DockerSource {
-    /// `DOCKER_HOST`, or else the local socket (the named pipe on Windows).
     pub fn connect(mode: Mode) -> Result<Self> {
-        let docker = if std::env::var_os("DOCKER_HOST").is_some() {
-            Docker::connect_with_defaults()
-        } else {
-            Docker::connect_with_local_defaults()
-        }
-        .context("Cannot connect to Docker")?;
-        Ok(DockerSource { docker, mode })
+        Ok(DockerSource {
+            docker: connect_docker()?,
+            mode,
+        })
     }
+}
+
+/// `DOCKER_HOST`, or else the local socket (the named pipe on Windows).
+pub fn connect_docker() -> Result<Docker> {
+    if std::env::var_os("DOCKER_HOST").is_some() {
+        Docker::connect_with_defaults()
+    } else {
+        Docker::connect_with_local_defaults()
+    }
+    .context("Cannot connect to Docker")
 }
 
 fn label_filter(deployment: &str) -> HashMap<String, Vec<String>> {

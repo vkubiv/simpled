@@ -1193,6 +1193,13 @@ fn write_traefik_static_config(
         writeln!(file, "        entryPoint:")?;
         writeln!(file, "          to: websecure")?;
         writeln!(file, "          scheme: https")?;
+        // Without Traefik's own ACME (Swarm, where the daemon issues the
+        // certificates): below every router on `web`, so the challenge route is
+        // answered over plain HTTP instead of redirected. Traefik's default is
+        // above every router.
+        if letsencrypt.is_none() {
+            writeln!(file, "          priority: 1")?;
+        }
         writeln!(file, "  websecure:")?;
         writeln!(file, "    address: \":443\"")?;
         write_traefik_trusted_ips(file, trusted_proxies)?;
@@ -1517,6 +1524,20 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
         writeln!(file, "        - {}", name)?;
     }
 
+    // HTTP-01 challenges, on every domain over plain HTTP: the daemon is the
+    // ACME client, and every gateway task routes them to it.
+    if !cert_domains.is_empty() {
+        writeln!(file, "    simpled-acme-challenge:")?;
+        writeln!(
+            file,
+            "      rule: \"PathPrefix(`{}`)\"",
+            crate::daemon::acme::CHALLENGE_PREFIX
+        )?;
+        writeln!(file, "      service: {}", TRAEFIK_DAEMON_SERVICE)?;
+        writeln!(file, "      entryPoints:")?;
+        writeln!(file, "        - web")?;
+    }
+
     writeln!(file, "  services:")?;
     for (i, rule) in ingress.rules.iter().enumerate() {
         let router_name_base = rule.domain_name.replace(".", "-");
@@ -1534,7 +1555,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
 
     // The daemon answers for every deployment, by the request's Host, so one
     // service serves every domain's routes.
-    if !ingress.version_routes.is_empty() {
+    if !ingress.version_routes.is_empty() || !cert_domains.is_empty() {
         writeln!(file, "    {}:", TRAEFIK_DAEMON_SERVICE)?;
         writeln!(file, "      loadBalancer:")?;
         writeln!(file, "        servers:")?;

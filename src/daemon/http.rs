@@ -16,6 +16,8 @@ pub const VERSION_PATH: &str = crate::version_endpoint::PATH;
 pub const HEALTH_PATH: &str = "/.well-known/simpled/health";
 
 pub struct App {
+    /// Answers to pending ACME challenges, which the ACME task fills in.
+    pub challenges: super::acme::Challenges,
     /// Domain (lower case) to the deployment that answers for it, as
     /// `version_endpoint::routes` decided when the deployment was prepared.
     pub owners: HashMap<String, String>,
@@ -26,6 +28,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route(VERSION_PATH, get(version))
         .route(HEALTH_PATH, get(health))
+        .route("/.well-known/acme-challenge/{token}", get(challenge))
         .with_state(app)
 }
 
@@ -80,6 +83,21 @@ async fn version(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 json!({"error": "cannot read the deployment's state"}),
             )
         }
+    }
+}
+
+/// The key authorization of a pending HTTP-01 challenge, on any host: the
+/// token is the secret, and it is only known while the order is pending.
+async fn challenge(State(app): State<Arc<App>>, axum::extract::Path(token): axum::extract::Path<String>) -> Response {
+    let answer = app.challenges.read().ok().and_then(|m| m.get(&token).cloned());
+    match answer {
+        Some(key_authorization) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            key_authorization,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -146,6 +164,7 @@ mod tests {
                 ("blog.example.com".to_string(), "blog".to_string()),
             ]),
             source: Box::new(Fake(services)),
+            challenges: Default::default(),
         });
         let response = router(app)
             .oneshot(Request::get(path).header("host", host).body(Body::empty()).unwrap())
@@ -194,5 +213,40 @@ mod tests {
         let (status, body) = run(get(vec![api(2)], "blog.example.com", HEALTH_PATH));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "down");
+    }
+
+    #[test]
+    fn a_pending_challenge_is_answered_on_any_host_and_nothing_else() {
+        let app = Arc::new(App {
+            owners: HashMap::new(),
+            source: Box::new(Fake(vec![])),
+            challenges: Default::default(),
+        });
+        app.challenges
+            .write()
+            .unwrap()
+            .insert("tok".to_string(), "tok.thumb".to_string());
+        let ask = |path: &'static str| {
+            let app = app.clone();
+            run(async move {
+                let response = router(app)
+                    .oneshot(
+                        Request::get(path)
+                            .header("host", "any.example.com")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            })
+        };
+        assert_eq!(
+            ask("/.well-known/acme-challenge/tok"),
+            (StatusCode::OK, "tok.thumb".to_string())
+        );
+        assert_eq!(ask("/.well-known/acme-challenge/other").0, StatusCode::NOT_FOUND);
     }
 }

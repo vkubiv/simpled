@@ -44,6 +44,31 @@ fn the_swarm_gateway_mounts_one_certificate_secret_per_domain() {
         }
     }
 
+    // The daemon answers the HTTP-01 challenges, over plain HTTP: the redirect
+    // to HTTPS sits below every router on `web`.
+    let challenge = &dynamic["http"]["routers"]["simpled-acme-challenge"];
+    assert_eq!(
+        challenge["rule"].as_str(),
+        Some("PathPrefix(`/.well-known/acme-challenge/`)")
+    );
+    assert_eq!(challenge["entryPoints"][0].as_str(), Some("web"));
+    assert_eq!(challenge["service"].as_str(), Some("simpled-daemon"));
+    let traefik: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
+    assert_eq!(
+        traefik["entryPoints"]["web"]["http"]["redirections"]["entryPoint"]["priority"].as_u64(),
+        Some(1)
+    );
+    let daemon: serde_json::Value =
+        serde_json::from_str(&read(&out.join("ingress").join("daemon").join("daemon.json"))).unwrap();
+    assert_eq!(
+        daemon["acme"],
+        serde_json::json!({
+            "directory": "https://acme-v02.api.letsencrypt.org/directory",
+            "email": "ops@example.com",
+            "domains": ["shop.example.com"],
+        })
+    );
+
     let plan: serde_json::Value = serde_json::from_str(&read(&out.join("ingress").join("plan.json"))).unwrap();
     assert_eq!(
         plan["tls"],
@@ -66,7 +91,10 @@ fn standalone_keeps_traefiks_own_acme_client() {
     let out = dir.path().join("docker-deploy");
     let traefik = read(&out.join("traefik").join("traefik.yml"));
     assert!(traefik.contains("certificatesResolvers"), "{}", traefik);
+    assert!(!traefik.contains("priority"), "{}", traefik);
     assert!(!read(&out.join("deploy.sh")).contains("tls-secrets"));
+    let daemon = read(&out.join("daemon").join("daemon.json"));
+    assert!(!daemon.contains("acme"), "{}", daemon);
 }
 
 #[test]
