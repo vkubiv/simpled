@@ -72,6 +72,12 @@ enum Commands {
         command: StepCommands,
     },
 
+    /// The gateway's certificates on Docker Swarm
+    Tls {
+        #[command(subcommand)]
+        command: TlsCommands,
+    },
+
     /// The environment's daemon, next to the gateway: answers the version and
     /// health of every deployment. Run by the generated stack, not by hand
     #[command(hide = true)]
@@ -175,6 +181,17 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum TlsCommands {
+    /// Turns the certificates in a Traefik acme.json (simpled 2.0.x kept it in
+    /// docker-deploy/letsencrypt/) into the gateway's certificate secrets, so
+    /// the daemon issues nothing new. Run it on a swarm manager
+    Import {
+        /// The acme.json
+        file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum StepCommands {
     /// multi_node: false. Fails unless exactly one node accepts tasks, and prints
     /// `export SIMPLED_NODE_ID=...` for the constraint every service carries
@@ -201,6 +218,12 @@ enum StepCommands {
     /// The certificate secret of each of the gateway's domains, creating a
     /// self-signed placeholder for a domain that has none yet
     TlsSecrets { plan: std::path::PathBuf },
+    /// Imports the gateway's domains from a 2.0.x acme.json, then renames it to
+    /// acme.json.imported so later deploys do not import it again
+    TlsImport {
+        plan: std::path::PathBuf,
+        file: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -346,6 +369,13 @@ fn main() -> Result<()> {
         Commands::Step { command } => {
             step_command(command)?;
         }
+        Commands::Tls {
+            command: TlsCommands::Import { file },
+        } => {
+            let text = std::fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
+            let report = deploy_steps::import_acme_json(&deploy_steps::DockerCli, &text, None, unix_now())?;
+            print_import_report(&report);
+        }
         Commands::Daemon { config, listen } => {
             daemon::run(config, listen)?;
         }
@@ -421,6 +451,28 @@ fn version_command() -> Result<()> {
     let app_spec = spec_loader::load_app_spec(Path::new("."), None)?;
     println!("{}", app_spec.version);
     Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+fn print_import_report(report: &deploy_steps::ImportReport) {
+    for name in &report.imported {
+        eprintln!("Imported the certificate of {}", name);
+    }
+    for name in &report.already_there {
+        eprintln!("The certificate of {} was imported before", name);
+    }
+    for (name, why) in &report.skipped {
+        eprintln!("Skipped {}: {}", name, why);
+    }
+    if report.imported.is_empty() && report.already_there.is_empty() {
+        eprintln!("No certificate imported");
+    }
 }
 
 fn step_command(command: &StepCommands) -> Result<()> {
@@ -525,6 +577,17 @@ fn step_command(command: &StepCommands) -> Result<()> {
         StepCommands::Unlock { force } => {
             let token = std::env::var("SIMPLED_LOCK_TOKEN").ok();
             deploy_steps::unlock(&docker, token.as_deref(), *force)?;
+        }
+        StepCommands::TlsImport { plan, file } => {
+            let plan = read_plan(plan)?;
+            let domains: Vec<String> = plan.tls.iter().map(|t| t.domain.clone()).collect();
+            let text = std::fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
+            let report = deploy_steps::import_acme_json(&docker, &text, Some(&domains), unix_now())?;
+            print_import_report(&report);
+            let done = file.with_extension("json.imported");
+            std::fs::rename(file, &done)
+                .with_context(|| format!("Cannot rename {} to {}", file.display(), done.display()))?;
+            eprintln!("Renamed {} to {}", file.display(), done.display());
         }
         StepCommands::TlsSecrets { plan } => {
             let plan = read_plan(plan)?;

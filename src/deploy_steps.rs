@@ -274,6 +274,118 @@ pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, Stri
     Ok(exports)
 }
 
+// ---------------------------------------------------------------- tls import
+
+/// What an import of an `acme.json` did, per certificate name.
+#[derive(Debug, Default, PartialEq)]
+pub struct ImportReport {
+    pub imported: Vec<String>,
+    pub already_there: Vec<String>,
+    /// Name and why: expired, a wildcard, or not one of the gateway's domains.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Turns the certificates in Traefik's `acme.json` (simpled 2.0.x kept it in
+/// `letsencrypt/`) into the gateway's certificate secrets, so an upgrade issues
+/// nothing new. Each name a certificate covers gets its own secret, like the
+/// ones the daemon issues. `only` restricts the import to these domains.
+/// Importing twice creates nothing new: the names are content-addressed.
+pub fn import_acme_json(
+    docker: &dyn Docker,
+    acme_json: &str,
+    only: Option<&[String]>,
+    now: u64,
+) -> Result<ImportReport> {
+    use crate::gateway_tls::{labels, ISSUER_ACME, OWNER_LABEL};
+    use base64::Engine;
+    let store: serde_json::Value =
+        serde_json::from_str(acme_json).context("This is not a Traefik acme.json: it is not JSON")?;
+    let resolvers = store
+        .as_object()
+        .context("This is not a Traefik acme.json: expected one entry per certificate resolver")?;
+    let decode = |field: &serde_json::Value, what: &str, name: &str| -> Result<String> {
+        let text = field
+            .as_str()
+            .with_context(|| format!("The {} of {} is missing", what, name))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .with_context(|| format!("The {} of {} is not base64", what, name))?;
+        String::from_utf8(bytes).with_context(|| format!("The {} of {} is not PEM", what, name))
+    };
+
+    let mut report = ImportReport::default();
+    for resolver in resolvers.values() {
+        let Some(certificates) = resolver.get("Certificates").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for entry in certificates {
+            let domain = &entry["domain"];
+            let mut names: Vec<String> = domain["main"].as_str().map(String::from).into_iter().collect();
+            if let Some(sans) = domain["sans"].as_array() {
+                names.extend(sans.iter().filter_map(|s| s.as_str().map(String::from)));
+            }
+            let Some(main) = names.first().cloned() else {
+                continue;
+            };
+            let chain = decode(&entry["certificate"], "certificate", &main)?;
+            let key = decode(&entry["key"], "key", &main)?;
+            let pem = format!(
+                "{}
+{}",
+                chain.trim_end(),
+                key.trim_end()
+            ) + "
+";
+            let expires = crate::daemon::acme::not_after(&chain)?;
+            for name in names {
+                if name.starts_with("*.") {
+                    report
+                        .skipped
+                        .push((name, "a wildcard, which HTTP-01 cannot renew".to_string()));
+                    continue;
+                }
+                if only.is_some_and(|domains| !domains.contains(&name)) {
+                    report
+                        .skipped
+                        .push((name, "not one of the gateway's domains".to_string()));
+                    continue;
+                }
+                if expires <= now {
+                    report.skipped.push((name, "expired".to_string()));
+                    continue;
+                }
+                let secret = object_name(&crate::gateway_tls::secret_base(&name), pem.as_bytes());
+                if docker.run(&["secret", "inspect", &secret])?.success {
+                    report.already_there.push(name);
+                    continue;
+                }
+                let output = docker.run_input(
+                    &[
+                        "secret",
+                        "create",
+                        "--label",
+                        OWNER_LABEL,
+                        "--label",
+                        &format!("{}={}", labels::DOMAIN, name),
+                        "--label",
+                        &format!("{}={}", labels::ISSUER, ISSUER_ACME),
+                        "--label",
+                        &format!("{}={}", labels::NOT_AFTER, expires),
+                        &secret,
+                        "-",
+                    ],
+                    pem.as_bytes(),
+                )?;
+                if !output.success {
+                    bail!("Cannot create the secret of {}: {}", name, output.stderr.trim());
+                }
+                report.imported.push(name);
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// Removes older objects: of each base name, the two newest stay, the current
 /// one and the previous one, which a `docker service rollback` still mounts.
 /// Docker refuses to remove an object a service still uses, so an older one in
@@ -1177,5 +1289,90 @@ c
                 name
             )
         );
+    }
+
+    /// A Traefik acme.json entry: base64 of the PEM chain and of the key.
+    fn acme_entry(main: &str, sans: &[&str], year: i32) -> serde_json::Value {
+        use base64::Engine;
+        let mut names = vec![main.to_string()];
+        names.extend(sans.iter().map(|s| s.to_string()));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
+        params.not_before = rcgen::date_time_ymd(year - 1, 1, 1);
+        params.not_after = rcgen::date_time_ymd(year, 1, 1);
+        let cert = params.self_signed(&key).unwrap();
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        serde_json::json!({
+            "domain": {"main": main, "sans": sans},
+            "certificate": b64(&cert.pem()),
+            "key": b64(&key.serialize_pem()),
+            "Store": "default",
+        })
+    }
+
+    const NOW_2026: u64 = 1_793_000_000;
+
+    #[test]
+    fn every_name_of_an_imported_certificate_gets_its_own_secret() {
+        let store = serde_json::json!({
+            "myresolver": {
+                "Account": {"Email": "ops@example.com"},
+                "Certificates": [
+                    acme_entry("shop.example.com", &["www.shop.example.com"], 2027),
+                    acme_entry("old.example.com", &[], 2025),
+                    acme_entry("*.example.com", &[], 2027),
+                ],
+            }
+        })
+        .to_string();
+        let docker = FakeDocker::new(&[("secret inspect", false, "")]);
+        let report = import_acme_json(&docker, &store, None, NOW_2026).unwrap();
+        assert_eq!(report.imported, vec!["shop.example.com", "www.shop.example.com"]);
+        let skipped: Vec<(&str, &str)> = report.skipped.iter().map(|(n, w)| (n.as_str(), w.as_str())).collect();
+        assert_eq!(
+            skipped,
+            vec![
+                ("old.example.com", "expired"),
+                ("*.example.com", "a wildcard, which HTTP-01 cannot renew")
+            ]
+        );
+        let calls = docker.calls.borrow();
+        let creates: Vec<&String> = calls.iter().filter(|c| c.starts_with("secret create")).collect();
+        assert_eq!(creates.len(), 2);
+        assert!(
+            creates[0].contains("--label simpled.tls.domain=shop.example.com"),
+            "{}",
+            creates[0]
+        );
+        assert!(creates[0].contains("--label simpled.tls.issuer=acme"), "{}", creates[0]);
+        assert!(
+            creates[0].contains("--label simpled.tls.not_after=1798761600"),
+            "{}",
+            creates[0]
+        );
+    }
+
+    #[test]
+    fn an_import_is_limited_to_the_gateways_domains_and_creates_nothing_twice() {
+        let store = serde_json::json!({
+            "myresolver": {"Certificates": [
+                acme_entry("shop.example.com", &[], 2027),
+                acme_entry("gone.example.com", &[], 2027),
+            ]}
+        })
+        .to_string();
+        let docker = FakeDocker::new(&[("secret inspect", true, "")]);
+        let only = vec!["shop.example.com".to_string()];
+        let report = import_acme_json(&docker, &store, Some(&only), NOW_2026).unwrap();
+        assert_eq!(report.already_there, vec!["shop.example.com"]);
+        assert_eq!(report.skipped[0].0, "gone.example.com");
+        assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("secret create")));
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_acme_json_says_so() {
+        let docker = FakeDocker::new(&[]);
+        let err = import_acme_json(&docker, "not json", None, NOW_2026).unwrap_err();
+        assert!(err.to_string().contains("not a Traefik acme.json"), "{}", err);
     }
 }

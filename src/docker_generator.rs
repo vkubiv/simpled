@@ -12,6 +12,11 @@ use std::io::Write;
 use std::path::Path;
 
 const DOCKER_NETWORK: &str = "common_network";
+/// Where simpled 2.0.x's Swarm gateway kept Traefik's ACME store, relative to
+/// deploy.sh.
+const LEGACY_ACME_JSON: &str = "letsencrypt/acme.json";
+/// Let's Encrypt's production directory, the default of `letsencrypt.server`.
+const LETSENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// The Traefik service every domain's version and health routes go to.
 const TRAEFIK_DAEMON_SERVICE: &str = "simpled-daemon";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
@@ -679,6 +684,15 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     writeln!(deploy_sh)?;
 
     if !tls_plan(resolved_spec).is_empty() {
+        // simpled 2.0.x let Traefik keep its certificates in letsencrypt/; they
+        // become secrets once, so the upgrade requests nothing new.
+        writeln!(deploy_sh, "if [ -f {} ]; then", LEGACY_ACME_JSON)?;
+        writeln!(
+            deploy_sh,
+            "  ./simpled step tls-import {} {}",
+            INGRESS_PLAN, LEGACY_ACME_JSON
+        )?;
+        writeln!(deploy_sh, "fi")?;
         writeln!(deploy_sh, "tls=\"$(./simpled step tls-secrets {})\"", INGRESS_PLAN)?;
         writeln!(deploy_sh, "eval \"${{tls}}\"")?;
     }
@@ -1222,6 +1236,11 @@ fn write_traefik_static_config(
         writeln!(file, "  {}:", TRAEFIK_RESOLVER)?;
         writeln!(file, "    acme:")?;
         writeln!(file, "      email: \"{}\"", le.email)?;
+        // Only when it is not Let's Encrypt's, Traefik's default, so a spec
+        // without `server` keeps the config it had.
+        if le.server != LETSENCRYPT_DIRECTORY {
+            writeln!(file, "      caServer: {}", serde_json::to_string(&le.server)?)?;
+        }
         writeln!(file, "      storage: \"/letsencrypt/acme.json\"")?;
         writeln!(file, "      httpChallenge:")?;
         writeln!(file, "        entryPoint: web")?;
