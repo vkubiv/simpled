@@ -32,9 +32,9 @@ fn configs_become_swarm_configs_synced_before_the_stacks_deploy() {
         "{}"
     );
 
-    let ingress = read(&out.join("ingress").join("docker-compose.yaml"));
+    let ingress = read(&out.join("gateway").join("docker-compose.yaml"));
     let ingress: serde_yaml::Value = serde_yaml::from_str(&ingress).unwrap();
-    let traefik = &ingress["services"]["traefik"];
+    let traefik = &ingress["services"]["gateway"];
     assert!(traefik["volumes"].is_null(), "{:?}", traefik);
     let targets: Vec<&str> = traefik["configs"]
         .as_sequence()
@@ -53,10 +53,10 @@ fn configs_become_swarm_configs_synced_before_the_stacks_deploy() {
 
     // Each owner's plan lists its objects, which the steps sync and prune.
     let plan = |path: &std::path::Path| -> serde_json::Value { serde_json::from_str(&read(path)).unwrap() };
-    let gateway = plan(&out.join("ingress").join("plan.json"));
+    let gateway = plan(&out.join("gateway").join("plan.json"));
     assert_eq!(gateway["owner_label"], "simpled.scope=environment");
     assert_eq!(gateway["objects"][0]["base"], "gateway_traefik.yml");
-    assert_eq!(gateway["objects"][0]["file"], "ingress/traefik/traefik.yml");
+    assert_eq!(gateway["objects"][0]["file"], "gateway/traefik/traefik.yml");
     assert_eq!(gateway["objects"][1]["var"], "SIMPLED_GATEWAY_OBJECT_2");
     let deployment = plan(&out.join("prod").join("plan.json"));
     assert_eq!(deployment["owner_label"], "simpled.deployment=prod");
@@ -66,7 +66,7 @@ fn configs_become_swarm_configs_synced_before_the_stacks_deploy() {
 
     let script = read(&out.join("deploy.sh"));
     let gateway = script
-        .find("gateway_objects=\"$(./simpled step sync-objects ingress/plan.json)\"\neval \"${gateway_objects}\"")
+        .find("gateway_objects=\"$(./simpled step sync-objects gateway/plan.json)\"\neval \"${gateway_objects}\"")
         .expect("gateway files are synced");
     let config = script
         .find("objects=\"$(./simpled step sync-objects prod/plan.json)\"\neval \"${objects}\"")
@@ -77,7 +77,7 @@ fn configs_become_swarm_configs_synced_before_the_stacks_deploy() {
     // Pruning comes after the last deploy.
     let last_deploy = script.rfind("docker stack deploy").unwrap();
     for line in [
-        "./simpled step prune-objects ingress/plan.json",
+        "./simpled step prune-objects gateway/plan.json",
         "./simpled step prune-objects prod/plan.json",
     ] {
         assert!(
@@ -155,7 +155,7 @@ fn preparing_twice_gives_the_same_stack_file() {
     let first = prepare(&swarm());
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let second = prepare(&swarm());
-    for stack_dir in ["prod", "ingress"] {
+    for stack_dir in ["prod", "gateway"] {
         let stack = |dir: &tempfile::TempDir| {
             read(
                 &dir.path()
@@ -244,16 +244,19 @@ fn a_deploy_holds_the_lock_and_checks_the_gateway_it_replaces() {
         .find("lock=\"$(./simpled step lock 'prod')\"\neval \"${lock}\"\ntrap './simpled step unlock' EXIT\n")
         .expect("the lock is taken and released on exit");
     let check = script
-        .find("./simpled step check-gateway ingress/plan.json\ndocker stack deploy -c ingress/docker-compose.yaml")
+        .find(
+            "./simpled step check-gateway gateway/plan.json\n./simpled step retire-legacy-stack\n\
+             docker stack deploy -c gateway/docker-compose.yaml simpled ",
+        )
         .expect("the gateway is checked right before it is deployed");
-    let sync = script.find("./simpled step sync-objects ingress/plan.json").unwrap();
+    let sync = script.find("./simpled step sync-objects gateway/plan.json").unwrap();
     // Locked before the first change to the swarm; checked once the new
     // gateway objects' names are known.
     assert!(lock < sync && sync < check, "{}", script);
 
     let ingress: serde_yaml::Value =
-        serde_yaml::from_str(&read(&out.join("ingress").join("docker-compose.yaml"))).unwrap();
-    let labels = &ingress["services"]["traefik"]["deploy"]["labels"];
+        serde_yaml::from_str(&read(&out.join("gateway").join("docker-compose.yaml"))).unwrap();
+    let labels = &ingress["services"]["gateway"]["deploy"]["labels"];
     assert_eq!(labels["simpled.version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(labels["simpled.deployment"].as_str(), Some("prod"));
 }

@@ -98,9 +98,9 @@ pub fn connect_docker() -> Result<Docker> {
     .context("Cannot connect to Docker")
 }
 
-/// The gateway, as the ingress stack and the standalone deploy.sh name it.
-const GATEWAY_SWARM_SERVICE: &str = "ingress_traefik";
-const GATEWAY_CONTAINER: &str = "traefik-ingress";
+/// The gateway, as the `simpled` stack and the standalone deploy.sh name it.
+const GATEWAY_SWARM_SERVICE: &str = crate::deploy_steps::GATEWAY_SERVICE;
+const GATEWAY_CONTAINER: &str = crate::docker_generator::GATEWAY_CONTAINER;
 
 fn one_service_filter(deployment: &str, service: &str) -> HashMap<String, Vec<String>> {
     HashMap::from([(

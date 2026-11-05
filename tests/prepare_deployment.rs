@@ -297,10 +297,10 @@ fn swarm_gateway_publishes_its_ports_in_host_mode() {
     let stack = read(
         &dir.path()
             .join("docker-deploy")
-            .join("ingress")
+            .join("gateway")
             .join("docker-compose.yaml"),
     );
-    assert_eq!(host_mode_ports(&stack, "traefik"), vec![80]);
+    assert_eq!(host_mode_ports(&stack, "gateway"), vec![80]);
     assert!(!stack.contains("start-first"), "{}", stack);
 
     let env = envspec(
@@ -310,9 +310,9 @@ fn swarm_gateway_publishes_its_ports_in_host_mode() {
     )
     .replace("    disable: true", "    letsencrypt:\n      email: ops@example.com");
     let dir = prepare(&env);
-    let ingress = dir.path().join("docker-deploy").join("ingress");
+    let ingress = dir.path().join("docker-deploy").join("gateway");
     let stack = read(&ingress.join("docker-compose.yaml"));
-    assert_eq!(host_mode_ports(&stack, "traefik"), vec![80, 443]);
+    assert_eq!(host_mode_ports(&stack, "gateway"), vec![80, 443]);
 
     let traefik = read(&ingress.join("traefik").join("traefik.yml"));
     let parsed: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
@@ -395,7 +395,7 @@ fn an_upstream_tls_swarm_gateway_serves_plain_http_on_every_node() {
         "type: traefik\n  global: true\n  placement:\n    constraints: [\"node.role == worker\"]\n  trusted_proxies: [\"10.0.0.0/16\"]\n  redirects:\n    - from: example.com\n      to: shop.example.com",
     );
     let dir = prepare(&env);
-    let ingress = dir.path().join("docker-deploy").join("ingress");
+    let ingress = dir.path().join("docker-deploy").join("gateway");
 
     let traefik = read(&ingress.join("traefik").join("traefik.yml"));
     let parsed: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
@@ -426,9 +426,9 @@ fn an_upstream_tls_swarm_gateway_serves_plain_http_on_every_node() {
     );
 
     let stack = read(&ingress.join("docker-compose.yaml"));
-    assert_eq!(host_mode_ports(&stack, "traefik"), vec![80]);
+    assert_eq!(host_mode_ports(&stack, "gateway"), vec![80]);
     let stack: serde_yaml::Value = serde_yaml::from_str(&stack).unwrap();
-    let deploy = &stack["services"]["traefik"]["deploy"];
+    let deploy = &stack["services"]["gateway"]["deploy"];
     assert_eq!(deploy["mode"].as_str(), Some("global"));
     assert_eq!(
         deploy["placement"]["constraints"][0].as_str(),
@@ -448,7 +448,7 @@ fn an_upstream_tls_standalone_traefik_publishes_only_port_80() {
     let script = read(&out.join("deploy.sh"));
     let traefik_run = script
         .lines()
-        .find(|l| l.starts_with("docker run -d --name traefik-ingress"))
+        .find(|l| l.starts_with("docker run -d --name simpled-gateway"))
         .unwrap();
     assert!(traefik_run.contains(" -p 80:80"), "{}", traefik_run);
     assert!(!traefik_run.contains("443"), "{}", traefik_run);
@@ -617,8 +617,8 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
     );
     // The gateway service; the controller next to it is always placed on a manager.
     let ingress: serde_yaml::Value =
-        serde_yaml::from_str(&read(&out.join("ingress").join("docker-compose.yaml"))).unwrap();
-    let gateway = &ingress["services"]["traefik"]["deploy"];
+        serde_yaml::from_str(&read(&out.join("gateway").join("docker-compose.yaml"))).unwrap();
+    let gateway = &ingress["services"]["gateway"]["deploy"];
     assert!(
         gateway["mode"].is_null() && gateway["placement"].is_null(),
         "{:?}",

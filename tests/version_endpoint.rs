@@ -17,7 +17,7 @@ fn the_swarm_gateway_stack_runs_the_controller_and_no_deployment_ships_a_sidecar
     let stack: serde_yaml::Value = serde_yaml::from_str(&read(&out.join("prod").join("docker-compose.yaml"))).unwrap();
     assert!(stack["services"]["simpled-version-prod"].is_null());
 
-    let ingress_text = read(&out.join("ingress").join("docker-compose.yaml"));
+    let ingress_text = read(&out.join("gateway").join("docker-compose.yaml"));
     let ingress: serde_yaml::Value = serde_yaml::from_str(&ingress_text).unwrap();
     let controller = &ingress["services"]["controller"];
     assert_eq!(
@@ -61,14 +61,14 @@ fn the_swarm_gateway_stack_runs_the_controller_and_no_deployment_ships_a_sidecar
             .collect()
     };
     assert_eq!(networks("controller"), vec!["simpled_control"]);
-    assert_eq!(networks("traefik"), vec!["default", "simpled_control"]);
+    assert_eq!(networks("gateway"), vec!["default", "simpled_control"]);
     assert_eq!(
         ingress["networks"]["simpled_control"]["driver"].as_str(),
         Some("overlay")
     );
 
     let config: serde_json::Value =
-        serde_json::from_str(&read(&out.join("ingress").join("controller").join("controller.json"))).unwrap();
+        serde_json::from_str(&read(&out.join("gateway").join("controller").join("controller.json"))).unwrap();
     assert_eq!(config["mode"], "swarm");
     assert_eq!(
         config["owners"],
@@ -93,7 +93,7 @@ fn traefik_routes_version_and_health_to_the_controller() {
     assert_eq!(router["service"].as_str(), Some("simpled-controller"));
     assert_eq!(
         parsed["http"]["services"]["simpled-controller"]["loadBalancer"]["servers"][0]["url"].as_str(),
-        Some("http://ingress_controller:8080/"),
+        Some("http://simpled_controller:8080/"),
         "{}",
         traefik
     );
@@ -103,7 +103,7 @@ fn traefik_routes_version_and_health_to_the_controller() {
     let script = read(&out.join("deploy.sh"));
     assert!(!script.contains("simpled-version-prod"), "{}", script);
     let controller = script
-        .find("docker run -d --name simpled-controller --network simpled_control --network-alias ingress_controller")
+        .find("docker run -d --name simpled-controller --network simpled_control --network-alias simpled_controller")
         .expect(&script);
     assert!(
         script.contains("--group-add \"$(stat -c %g /var/run/docker.sock)\""),
@@ -111,12 +111,12 @@ fn traefik_routes_version_and_health_to_the_controller() {
         script
     );
     assert!(
-        controller < script.find("docker run -d --name traefik-ingress").unwrap(),
+        controller < script.find("docker run -d --name simpled-gateway").unwrap(),
         "{}",
         script
     );
     assert!(
-        script.contains("docker network connect simpled_control traefik-ingress"),
+        script.contains("docker network connect simpled_control simpled-gateway"),
         "{}",
         script
     );

@@ -46,7 +46,7 @@ So:
 
 | Target | How it runs |
 |---|---|
-| Swarm | Service `controller` in the `ingress` stack, next to `traefik`. `replicas: 1`, constraint `node.role == manager`. |
+| Swarm | Service `controller` in the `simpled` stack (`simpled_controller`), next to `gateway` (`simpled_gateway`, Traefik); the stack was `ingress` in 2.0.x. `replicas: 1`, constraint `node.role == manager`. |
 | Standalone Docker | `docker run -d --name simpled-controller` in `deploy.sh`, right before the gateway, the same way the gateway is started today. |
 | Local | No container. The local gateway (`local_ingress.rs`) serves the routes in-process. |
 
@@ -113,7 +113,7 @@ effectively root on the host. Mitigations:
 - The public routes take no input beyond the Host header. Every other route needs a
   token, and with no tokens configured, those routes do not exist.
 - The controller only acts on objects it owns: anything labelled `simpled.*`, the
-  `ingress` stack, and `simpled_*` configs and secrets. It refuses everything else
+  `simpled` stack, and `simpled_*` configs and secrets. It refuses everything else
   even with the manage token.
 - `read_only: true` root filesystem and no capabilities. On standalone Docker, a
   non-root user in the group that owns the socket, looked up by `deploy.sh` on the
@@ -573,7 +573,7 @@ cd "$(dirname "$0")"
 . ./fetch-secrets.sh
 ./simpled step lock shop
 ./simpled step check-nodes                 # only with multi_node: false
-./simpled step sync-objects                # environment objects (ingress/plan.json)
+./simpled step sync-objects                # environment objects (gateway/plan.json)
 ./simpled step sync-objects shop           # this deployment's objects (shop/plan.json)
 
 docker stack deploy -c ingress/docker-compose.yaml ingress --prune --detach=false
@@ -625,7 +625,7 @@ variables, on files next to the spec, on `extends`, and on the downloaded bundle
 
 | File | Holds |
 |---|---|
-| `ingress/plan.json` | The environment: gateway, controller, environment objects, `multi_node`, the env spec hash, the simpled version |
+| `gateway/plan.json` | The environment: gateway, controller, environment objects, `multi_node`, the env spec hash, the simpled version |
 | `<deployment>/plan.json` | One deployment: its objects with their hashes, its jobs, constraints and phases |
 
 A plan holds no more than the stack file does. File secrets appear only as paths, and
@@ -644,7 +644,7 @@ from interfering with each other:
 1. **One directory per deployment on the target**, for example
    `rsync -a docker-deploy/ host:~/deploy/shop/`. The reference recommends this layout.
    Nothing generated is shared between two deployments: each has its own
-   `deploy.sh`, binary, plans and `ingress/` copy.
+   `deploy.sh`, binary, plans and `gateway/` copy.
 2. **Owners on every object, and pruning that stays within its owner.** Deployment
    objects are labelled `simpled.deployment=<name>`, and `prune-objects shop` touches
    only those. Environment objects (gateway files, controller tokens, certificates) are

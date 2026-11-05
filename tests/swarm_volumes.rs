@@ -309,9 +309,9 @@ fn single_node_keeps_the_1x_layout_and_pins_everything_to_the_deploying_node() {
         );
     }
     let ingress: serde_yaml::Value =
-        serde_yaml::from_str(&read(&out.join("ingress").join("docker-compose.yaml"))).unwrap();
+        serde_yaml::from_str(&read(&out.join("gateway").join("docker-compose.yaml"))).unwrap();
     assert_eq!(
-        constraints(&ingress["services"]["traefik"]),
+        constraints(&ingress["services"]["gateway"]),
         vec!["node.id == ${SIMPLED_NODE_ID}"]
     );
 

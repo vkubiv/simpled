@@ -37,7 +37,7 @@ pub struct AcmeConfig {
 /// `/.well-known/acme-challenge/<token>` while an order is pending.
 pub type Challenges = Arc<RwLock<HashMap<String, String>>>;
 
-pub const GATEWAY_SERVICE: &str = "ingress_traefik";
+pub const GATEWAY_SERVICE: &str = crate::deploy_steps::GATEWAY_SERVICE;
 pub const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 const RENEW_BEFORE_SECONDS: u64 = 30 * 24 * 3600;
 /// How often the certificates are checked. Issuing waits for nothing else, so

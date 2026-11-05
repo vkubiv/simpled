@@ -12,6 +12,8 @@ use std::io::Write;
 use std::path::Path;
 
 const DOCKER_NETWORK: &str = "common_network";
+/// The standalone gateway's container.
+pub const GATEWAY_CONTAINER: &str = "simpled-gateway";
 /// Where simpled 2.0.x's Swarm gateway kept Traefik's ACME store, relative to
 /// deploy.sh.
 const LEGACY_ACME_JSON: &str = "letsencrypt/acme.json";
@@ -28,7 +30,7 @@ const TRAEFIK_RESOLVER: &str = "myresolver";
 /// Placeholder backend for redirect-only routers, which still have to name one.
 const TRAEFIK_REDIRECT_SERVICE: &str = "redirect-noop";
 /// The gateway's plan, relative to the deploy directory.
-const INGRESS_PLAN: &str = "ingress/plan.json";
+const INGRESS_PLAN: &str = "gateway/plan.json";
 /// Stack file holding only the services the jobs depend on (phase 1 of a deploy).
 const DEPS_COMPOSE_FILE: &str = "docker-compose.deps.yaml";
 /// Default seconds to wait for one job to reach a terminal state.
@@ -439,7 +441,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     }
 
     let controller_tokens =
-        crate::controller::write_token_files(resolved_spec, output_dir, "ingress/controller", &mut fetch_script)?;
+        crate::controller::write_token_files(resolved_spec, output_dir, "gateway/controller", &mut fetch_script)?;
     if !fetch_script.is_empty() {
         fetch_script.write(
             &output_dir.join(secret_fetch::SCRIPT_NAME),
@@ -506,7 +508,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     }
 
     // 4. Ingress Stack
-    let ingress_dir = output_dir.join("ingress");
+    let ingress_dir = output_dir.join("gateway");
     fs::create_dir_all(&ingress_dir)?;
 
     let gateway_objects =
@@ -569,7 +571,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     )?;
     writeln!(
         deploy_sh,
-        "# read <deployment>/plan.json and ingress/plan.json. A step that sets variables"
+        "# read <deployment>/plan.json and gateway/plan.json. A step that sets variables"
     )?;
     writeln!(
         deploy_sh,
@@ -710,11 +712,14 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     // Every deployment of the env spec redeploys the shared gateway from its own
     // copy of the env spec, so what runs is checked first.
     writeln!(deploy_sh, "./simpled step check-gateway {}", INGRESS_PLAN)?;
+    // A 2.0.x gateway in the `ingress` stack holds the ports; removed once.
+    writeln!(deploy_sh, "./simpled step retire-legacy-stack")?;
     // --prune removes services that still carry the stack label but are no
     // longer in the file, e.g. after the ingress type was switched.
     writeln!(
         deploy_sh,
-        "docker stack deploy -c ingress/docker-compose.yaml ingress --prune --detach=false"
+        "docker stack deploy -c gateway/docker-compose.yaml {} --prune --detach=false",
+        crate::deploy_steps::STACK
     )?;
 
     if jobs.is_empty() {
@@ -1000,12 +1005,13 @@ fn generate_traefik_standalone(
     write_standalone_controller(resolved_spec, output_dir, deploy_sh, controller_tokens)?;
 
     writeln!(deploy_sh, "echo 'Starting Traefik ingress...'")?;
-    writeln!(deploy_sh, "docker rm -f traefik-ingress || true")?;
+    // `traefik-ingress` is the name before simpled 2.1; it holds the ports too.
+    writeln!(deploy_sh, "docker rm -f traefik-ingress {} || true", GATEWAY_CONTAINER)?;
 
     write!(
         deploy_sh,
-        "docker run -d --name traefik-ingress --network {}",
-        network_name
+        "docker run -d --name {} --network {}",
+        GATEWAY_CONTAINER, network_name
     )?;
     write!(deploy_sh, " -p 80:80")?;
     if has_tls {
@@ -1029,8 +1035,9 @@ fn generate_traefik_standalone(
     // `docker run` takes one network; the controller's is joined after the start.
     writeln!(
         deploy_sh,
-        "docker network connect {} traefik-ingress",
-        crate::controller::CONTROL_NETWORK
+        "docker network connect {} {}",
+        crate::controller::CONTROL_NETWORK,
+        GATEWAY_CONTAINER
     )?;
 
     Ok(())
@@ -1127,7 +1134,7 @@ fn generate_traefik_swarm(
     let mut stack = File::create(ingress_dir.join("docker-compose.yaml"))?;
     writeln!(stack, "version: '3.8'")?;
     writeln!(stack, "services:")?;
-    writeln!(stack, "  traefik:")?;
+    writeln!(stack, "  gateway:")?;
     writeln!(stack, "    image: {}", TRAEFIK_IMAGE)?;
     write_swarm_ingress_deploy(
         &mut stack,
@@ -1148,7 +1155,7 @@ fn generate_traefik_swarm(
         let object = objects.add(
             ObjectKind::Config,
             &format!("gateway_{}", file),
-            &format!("ingress/traefik/{}", file),
+            &format!("gateway/traefik/{}", file),
             "SIMPLED_GATEWAY_OBJECT_",
         );
         writeln!(stack, "      - source: {}", object.base)?;
@@ -1386,7 +1393,7 @@ fn write_swarm_controller(
     let config = objects.add(
         ObjectKind::Config,
         "gateway_controller.json",
-        "ingress/controller/controller.json",
+        "gateway/controller/controller.json",
         "SIMPLED_GATEWAY_OBJECT_",
     );
 
@@ -1414,7 +1421,7 @@ fn write_swarm_controller(
             let secret = objects.add(
                 ObjectKind::Secret,
                 &format!("gateway_controller_{}", token),
-                &crate::controller::token_file("ingress/controller", token),
+                &crate::controller::token_file("gateway/controller", token),
                 "SIMPLED_GATEWAY_OBJECT_",
             );
             writeln!(stack, "      - source: {}", secret.base)?;
