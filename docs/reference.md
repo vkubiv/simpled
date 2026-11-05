@@ -622,7 +622,7 @@ On Docker the host also answers `GET /.well-known/simpled/health`, with status 2
 
 On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`. Right after the first deploy, that lasts until the daemon has issued the certificates, usually under a minute.
 
-`converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
+`converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped, which [`simpled wait`](#simpled-wait) does. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
 
 There is nothing to configure. A host belongs to a deployment:
 
@@ -1637,6 +1637,54 @@ Options:
 
 The generated file is a plain Markdown document; adapt it freely, or pipe `--stdout`
 into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
+
+### `simpled status`
+
+Every deployment's version, health and services, from the
+[daemon's private API](#daemon-private-api). Run it next to the env spec: the API's
+address comes from `gateway.daemon.hosts`, the token from `SIMPLED_TOKEN` (the read
+or the manage token).
+
+```
+simpled status [--url <API>] [--json]
+
+  --url   The API's base instead, e.g. https://ops.example.com/api/v1
+  --json  Print the API's answer as it is
+```
+
+```
+$ SIMPLED_TOKEN=... simpled status
+prod  shop 1.2.3  healthy
+  api                      2/2
+  primary-db               1/1
+blog  blog 0.9.0  degraded, updating
+  web                      1/2
+```
+
+### `simpled logs`
+
+A service's log, from the daemon: on Swarm, the lines of every task, read from the
+manager. Same address and token as `simpled status`.
+
+```
+simpled logs <DEPLOYMENT> <SERVICE> [-f] [--tail <N|all>] [--since <TIME>] [--timestamps] [--url <API>]
+
+  -f, --follow    Keep printing new lines until interrupted
+  --tail          Lines from the end of each task's log (default 200)
+  --since         30s, 10m, 2h, 1d, or Unix seconds
+  --timestamps    Prefix every line with its time
+```
+
+### `simpled wait`
+
+Waits until a deployment reports a version as healthy and converged: it polls the
+public [`/.well-known/simpled/health`](#version-endpoint) of the deployment's primary
+host, so it needs no token. For CI, right after `deploy.sh`; it fails when the time
+is up, with the last state it saw.
+
+```
+simpled wait <DEPLOYMENT> --version <VERSION> [--timeout 10m] [--interval 5s] [--url <HEALTH URL>]
+```
 
 ### `simpled tls import`
 
