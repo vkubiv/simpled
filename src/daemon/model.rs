@@ -64,6 +64,8 @@ pub struct ServiceState {
     pub unhealthy: u64,
     /// A Swarm update or rollback is in progress or paused.
     pub updating: bool,
+    /// The image the service runs, as Swarm or Docker reports it.
+    pub image: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -182,6 +184,7 @@ mod tests {
             running,
             unhealthy: 0,
             updating: false,
+            image: String::new(),
         }
     }
 

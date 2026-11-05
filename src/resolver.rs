@@ -826,6 +826,7 @@ fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppS
 fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolvedSpec> {
     let rules = build_ingress_rules(env_spec);
     check_route_conflicts(&rules)?;
+    let rules_for_daemon = rules.clone();
 
     let tls = env_spec.ingress.tls.as_ref().map(|tls_spec| IngressTlsResolvedSpec {
         secret: tls_spec.secret.clone(),
@@ -863,6 +864,72 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         trusted_proxies: env_spec.ingress.trusted_proxies.clone(),
         global: env_spec.ingress.global,
         placement: env_spec.ingress.placement.clone(),
+        daemon: env_spec
+            .ingress
+            .daemon
+            .as_ref()
+            .map(|d| resolve_daemon(env_spec, d, &rules_for_daemon))
+            .transpose()?,
+    })
+}
+
+/// A token shorter than this is refused: it is a credential to the Docker
+/// socket's view of the environment, logs included.
+const MIN_TOKEN_LENGTH: usize = 32;
+
+/// `gateway.daemon`: each host alias's domains, and the tokens' values, which
+/// are read here like a deployment's secrets, or deferred to the deploy target.
+fn resolve_daemon(
+    env_spec: &DeploymentEnvironmentSpec,
+    daemon: &crate::spec::DaemonSpec,
+    rules: &[IngressRule],
+) -> Result<crate::resolved_spec::DaemonResolvedSpec> {
+    let mut routes = Vec::new();
+    for (alias, prefix) in &daemon.hosts {
+        for host in env_spec.ingress.hosts.iter().filter(|h| &h.name == alias) {
+            for domain in &host.domain_names {
+                let taken = rules
+                    .iter()
+                    .filter(|r| &r.domain_name == domain)
+                    .flat_map(|r| r.services.iter())
+                    .find(|s| s.prefix.trim_end_matches('/') == prefix.trim_end_matches('/'));
+                if let Some(service) = taken {
+                    return Err(anyhow!(
+                        "gateway.daemon.hosts.{} routes {}{} to the daemon, but service '{}' of deployment '{}' is routed there too",
+                        alias,
+                        domain,
+                        prefix,
+                        service.service_name,
+                        service.deployment_name
+                    ));
+                }
+                routes.push((domain.clone(), prefix.clone()));
+            }
+        }
+    }
+    let mut documents = HashMap::new();
+    let mut token = |spec: &Option<crate::spec::DeploymentSecretSpec>| -> Result<Option<SecretResolvedSpec>> {
+        let Some(spec) = spec else { return Ok(None) };
+        let value = resolve_secret_value(env_spec, spec, &mut documents)?;
+        if let SecretResolvedValue::Literal(literal) = &value {
+            if literal.chars().count() < MIN_TOKEN_LENGTH {
+                return Err(anyhow!(
+                    "gateway.daemon.{} is {} characters long; a token needs at least {}, for example `openssl rand -hex 32`",
+                    spec.secret_name,
+                    literal.chars().count(),
+                    MIN_TOKEN_LENGTH
+                ));
+            }
+        }
+        Ok(Some(SecretResolvedSpec {
+            name: format!("simpled-daemon-{}", spec.secret_name.replace('_', "-")),
+            value,
+        }))
+    };
+    Ok(crate::resolved_spec::DaemonResolvedSpec {
+        routes,
+        read_token: token(&daemon.read_token)?,
+        manage_token: token(&daemon.manage_token)?,
     })
 }
 
@@ -1295,6 +1362,7 @@ mod tests {
             trusted_proxies: Vec::new(),
             global: false,
             placement: None,
+            daemon: None,
         }
     }
 

@@ -17,6 +17,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Source: Send + Sync {
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>>;
+    /// Every deployment with a labelled service, sorted.
+    fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>>;
 }
 
 /// The gateway's certificates, for `/health`.
@@ -121,10 +123,52 @@ pub fn swarm_service(service: &Service) -> Option<ServiceState> {
         running: status.and_then(|s| s.running_tasks).unwrap_or_default(),
         unhealthy: 0,
         updating,
+        image: spec
+            .task_template
+            .as_ref()
+            .and_then(|t| t.container_spec.as_ref())
+            .and_then(|c| c.image.as_deref())
+            // Swarm pins the digest it resolved; the tag is what was deployed.
+            .map(|image| image.split('@').next().unwrap_or(image).to_string())
+            .unwrap_or_default(),
     })
 }
 
 impl Source for DockerSource {
+    fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            let filters = HashMap::from([("label".to_string(), vec![labels::SERVICE.to_string()])]);
+            let mut names: Vec<String> = match self.mode {
+                Mode::Swarm => self
+                    .docker
+                    .list_services(Some(ListServicesOptions {
+                        filters: Some(filters),
+                        status: None,
+                    }))
+                    .await
+                    .context("Cannot list the swarm's services")?
+                    .into_iter()
+                    .filter_map(|s| s.spec?.labels?.get(labels::DEPLOYMENT).cloned())
+                    .collect(),
+                Mode::Standalone => self
+                    .docker
+                    .list_containers(Some(ListContainersOptions {
+                        all: true,
+                        filters: Some(filters),
+                        ..Default::default()
+                    }))
+                    .await
+                    .context("Cannot list the containers")?
+                    .into_iter()
+                    .filter_map(|c| c.labels?.get(labels::DEPLOYMENT).cloned())
+                    .collect(),
+            };
+            names.sort();
+            names.dedup();
+            Ok(names)
+        })
+    }
+
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>> {
         Box::pin(async move {
             match self.mode {
@@ -169,6 +213,7 @@ impl Source for DockerSource {
                             running: 0,
                             unhealthy: 0,
                             updating: false,
+                            image: container.image.clone().unwrap_or_default(),
                         });
                         state.desired += 1;
                         if container.state == Some(ContainerSummaryStateEnum::RUNNING) {
@@ -236,6 +281,7 @@ mod tests {
                 running: 1,
                 unhealthy: 0,
                 updating: true,
+                image: String::new(),
             })
         );
     }

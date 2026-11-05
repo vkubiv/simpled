@@ -4,6 +4,7 @@
 //! (`docs/design/daemon.md`).
 
 pub mod acme;
+pub mod api;
 pub mod http;
 pub mod model;
 pub mod source;
@@ -20,6 +21,9 @@ pub struct Config {
     pub mode: source::Mode,
     /// Which deployment answers on each domain.
     pub owners: Vec<Owner>,
+    /// `gateway.daemon` with a token: the private API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiConfig>,
     /// Swarm with `tls.letsencrypt`: the daemon issues the gateway's certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme: Option<acme::AcmeConfig>,
@@ -29,6 +33,59 @@ pub struct Config {
 pub struct Owner {
     pub domain: String,
     pub deployment: String,
+}
+
+/// The private API's tokens, as files the daemon reads at start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_token_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_token_file: Option<String>,
+}
+
+/// Where a token is mounted into the daemon's container.
+pub fn token_path(token: &str) -> String {
+    format!("/run/secrets/simpled_daemon_{}", token)
+}
+
+/// Where the daemon looks for a token file, relative to the deploy directory.
+pub fn token_file(dir: &str, token: &str) -> String {
+    format!("{}/{}", dir, token)
+}
+
+/// Writes the daemon's token files under `dir`, relative to `output_dir`: a
+/// token read when the deployment was prepared now, an `aws` one by the fetch
+/// script on the deploy target. Returns the tokens that are set.
+pub fn write_token_files(
+    spec: &crate::resolved_spec::EnvironmentResolvedSpec,
+    output_dir: &Path,
+    dir: &str,
+    fetch_script: &mut crate::secret_fetch::FetchScript,
+) -> Result<Vec<&'static str>> {
+    let Some(daemon) = &spec.ingress.daemon else {
+        return Ok(vec![]);
+    };
+    let mut tokens = Vec::new();
+    for (name, token) in daemon.tokens() {
+        let relative = token_file(dir, name);
+        match token.deferred() {
+            Some(reference) => {
+                fetch_script.fetch(token, reference);
+                fetch_script.write_to_file(token, &relative);
+            }
+            None => {
+                let path = output_dir.join(&relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, token.literal().unwrap_or_default())
+                    .with_context(|| format!("Cannot write {}", path.display()))?;
+            }
+        }
+        tokens.push(name);
+    }
+    Ok(tokens)
 }
 
 /// Where the daemon listens, inside its container.
@@ -68,6 +125,15 @@ pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: so
                 deployment: r.deployment_name.clone(),
             })
             .collect(),
+        api: spec.ingress.daemon.as_ref().and_then(|d| {
+            let path =
+                |t: &Option<crate::resolved_spec::SecretResolvedSpec>, name: &str| t.as_ref().map(|_| token_path(name));
+            let api = ApiConfig {
+                read_token_file: path(&d.read_token, "read_token"),
+                manage_token_file: path(&d.manage_token, "manage_token"),
+            };
+            (api.read_token_file.is_some() || api.manage_token_file.is_some()).then_some(api)
+        }),
         acme: match mode {
             source::Mode::Swarm => spec
                 .ingress
@@ -142,7 +208,17 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
             );
             tokio::spawn(acme::run(acme_config, docker, challenges.clone()));
         }
+        let api = config.api.as_ref().and_then(|a| {
+            api::Api::new(
+                api::Api::read_token(a.read_token_file.as_deref()),
+                api::Api::read_token(a.manage_token_file.as_deref()),
+            )
+        });
+        if api.is_some() {
+            eprintln!("Serving the private API under /api/v1");
+        }
         let app = Arc::new(http::App {
+            api,
             certs,
             challenges,
             owners: config
