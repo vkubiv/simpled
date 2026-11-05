@@ -523,6 +523,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         owner_label: deployment_objects.objects.owner_label.clone(),
         objects: deployment_objects.objects.plan_objects(),
         jobs: plan_jobs.clone(),
+        tls: vec![],
     }
     .write(&output_dir.join(&deployment_plan_path))?;
     Plan {
@@ -530,6 +531,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         owner_label: gateway_objects.owner_label.clone(),
         objects: gateway_objects.plan_objects(),
         jobs: vec![],
+        tls: tls_plan(resolved_spec),
     }
     .write(&output_dir.join(INGRESS_PLAN))?;
 
@@ -676,6 +678,10 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     }
     writeln!(deploy_sh)?;
 
+    if !tls_plan(resolved_spec).is_empty() {
+        writeln!(deploy_sh, "tls=\"$(./simpled step tls-secrets {})\"", INGRESS_PLAN)?;
+        writeln!(deploy_sh, "eval \"${{tls}}\"")?;
+    }
     // Every deployment of the env spec redeploys the shared gateway from its own
     // copy of the env spec, so what runs is checked first.
     writeln!(deploy_sh, "./simpled step check-gateway {}", INGRESS_PLAN)?;
@@ -962,7 +968,8 @@ fn generate_traefik_standalone(
         resolved_spec.ingress.tls_upstream(),
     )?;
 
-    generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
+    // Standalone keeps Traefik as its own ACME client, on its single host.
+    generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"), &[])?;
 
     write_standalone_daemon(resolved_spec, output_dir, deploy_sh)?;
 
@@ -1062,18 +1069,24 @@ fn generate_traefik_swarm(
     // Reuse generate logic for config, but write to new dir
     let has_tls = resolved_spec.ingress.terminates_tls();
     let upstream = resolved_spec.ingress.tls_upstream();
-    let letsencrypt = resolved_spec.ingress.tls.as_ref().and_then(|t| t.letsencrypt.as_ref());
+    // Traefik runs no ACME on Swarm: it reads each domain's certificate from a
+    // Swarm secret, which the daemon issues and renews.
+    let cert_domains = crate::gateway_tls::domains(&resolved_spec.ingress);
 
     let mut static_conf = File::create(traefik_dir.join("traefik.yml"))?;
     write_traefik_static_config(
         &mut static_conf,
         has_tls,
-        letsencrypt,
+        None,
         &resolved_spec.ingress.trusted_proxies,
         upstream,
     )?;
 
-    generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
+    generate_traefik_dynamic_config(
+        &resolved_spec.ingress,
+        &traefik_dir.join("dynamic_conf.yml"),
+        &cert_domains,
+    )?;
 
     let mut stack = File::create(ingress_dir.join("docker-compose.yaml"))?;
     writeln!(stack, "version: '3.8'")?;
@@ -1107,12 +1120,16 @@ fn generate_traefik_swarm(
         writeln!(stack, "        mode: 0444")?;
     }
 
-    // Traefik's ACME store, kept next to the deployment so a redeploy keeps it.
-    // Still a directory on one node; the daemon's certificates replace it.
-    if letsencrypt.is_some() {
-        writeln!(stack, "    volumes:")?;
-        writeln!(stack, "      - ../letsencrypt:/letsencrypt")?;
-        fs::create_dir_all(ingress_dir.parent().unwrap().join("letsencrypt"))?;
+    // One certificate secret per domain. Which one is current is looked up by
+    // `step tls-secrets` when deploy.sh runs, so a redeploy keeps the one the
+    // daemon last rolled out.
+    if !cert_domains.is_empty() {
+        writeln!(stack, "    secrets:")?;
+        for (i, domain) in cert_domains.iter().enumerate() {
+            writeln!(stack, "      - source: tls_{}", i + 1)?;
+            writeln!(stack, "        target: {}", crate::gateway_tls::cert_path(domain))?;
+            writeln!(stack, "        mode: 0400")?;
+        }
     }
     writeln!(stack, "    networks:")?;
     writeln!(stack, "      default:")?;
@@ -1135,8 +1152,28 @@ fn generate_traefik_swarm(
         writeln!(stack, "    external: true")?;
         writeln!(stack, "    name: \"{}\"", external.name)?;
     }
+    if !cert_domains.is_empty() {
+        writeln!(stack, "secrets:")?;
+        for (i, tls) in tls_plan(resolved_spec).iter().enumerate() {
+            writeln!(stack, "  tls_{}:", i + 1)?;
+            writeln!(stack, "    external: true")?;
+            writeln!(stack, "    name: \"${{{}}}\"", tls.var)?;
+        }
+    }
 
     Ok(objects)
+}
+
+/// The gateway's certificate secrets, in the order the stack numbers them.
+fn tls_plan(resolved_spec: &EnvironmentResolvedSpec) -> Vec<crate::deploy_plan::PlanTls> {
+    crate::gateway_tls::domains(&resolved_spec.ingress)
+        .into_iter()
+        .enumerate()
+        .map(|(i, domain)| crate::deploy_plan::PlanTls {
+            domain,
+            var: format!("{}{}", crate::gateway_tls::VAR_PREFIX, i + 1),
+        })
+        .collect()
 }
 
 fn write_traefik_static_config(
@@ -1324,7 +1361,9 @@ fn write_swarm_daemon(
     Ok(())
 }
 
-fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -> Result<()> {
+/// `cert_domains`: the domains whose certificates Traefik reads from files
+/// (Swarm). Empty where Traefik is its own ACME client (standalone).
+fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, cert_domains: &[String]) -> Result<()> {
     let mut file = File::create(path)?;
     // Clients use https whenever TLS is on, upstream or here; only the latter
     // puts the routers on `websecure`.
@@ -1420,10 +1459,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
             if has_tls {
                 writeln!(file, "      entryPoints:")?;
                 writeln!(file, "        - websecure")?;
-                writeln!(file, "      tls:")?;
-                if use_le {
-                    writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
-                }
+                write_router_tls(&mut file, use_le && cert_domains.is_empty())?;
             } else {
                 writeln!(file, "      entryPoints:")?;
                 writeln!(file, "        - web")?;
@@ -1455,10 +1491,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         if has_tls {
             writeln!(file, "      entryPoints:")?;
             writeln!(file, "        - websecure")?;
-            writeln!(file, "      tls:")?;
-            if use_le {
-                writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
-            }
+            write_router_tls(&mut file, use_le && cert_domains.is_empty())?;
         } else {
             writeln!(file, "      entryPoints:")?;
             writeln!(file, "        - web")?;
@@ -1475,10 +1508,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         if has_tls {
             writeln!(file, "      entryPoints:")?;
             writeln!(file, "        - websecure")?;
-            writeln!(file, "      tls:")?;
-            if use_le {
-                writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
-            }
+            write_router_tls(&mut file, use_le && cert_domains.is_empty())?;
         } else {
             writeln!(file, "      entryPoints:")?;
             writeln!(file, "        - web")?;
@@ -1525,6 +1555,30 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         writeln!(file, "          - url: \"http://127.0.0.1:1/\"")?;
     }
 
+    // Each domain's certificate and key, in one PEM: a Swarm secret per domain.
+    // Traefik picks the certificate by SNI.
+    if !cert_domains.is_empty() {
+        writeln!(file, "tls:")?;
+        writeln!(file, "  certificates:")?;
+        for domain in cert_domains {
+            let path = crate::gateway_tls::cert_path(domain);
+            writeln!(file, "    - certFile: {}", path)?;
+            writeln!(file, "      keyFile: {}", path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// A router's `tls`: Traefik's ACME resolver, or the certificates from the
+/// `tls` section.
+fn write_router_tls(file: &mut File, resolver: bool) -> Result<()> {
+    if resolver {
+        writeln!(file, "      tls:")?;
+        writeln!(file, "        certResolver: {}", TRAEFIK_RESOLVER)?;
+    } else {
+        writeln!(file, "      tls: {{}}")?;
+    }
     Ok(())
 }
 
@@ -1762,7 +1816,7 @@ mod tests {
     fn write_config(ingress: &IngressResolvedSpec) -> String {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conf");
-        generate_traefik_dynamic_config(ingress, &path).unwrap();
+        generate_traefik_dynamic_config(ingress, &path, &[]).unwrap();
         fs::read_to_string(path).unwrap()
     }
 
@@ -2334,7 +2388,7 @@ mkdir -p \"/var/"
         }));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dynamic_conf.yml");
-        generate_traefik_dynamic_config(&ingress, &path).unwrap();
+        generate_traefik_dynamic_config(&ingress, &path, &[]).unwrap();
         let conf = fs::read_to_string(&path).unwrap();
         assert!(!conf.contains("websecure") && !conf.contains("tls:"), "{}", conf);
         assert!(
@@ -2352,7 +2406,7 @@ mkdir -p \"/var/"
 
         // Without TLS at all the redirect stays on http, and there is no ping.
         ingress.tls = None;
-        generate_traefik_dynamic_config(&ingress, &path).unwrap();
+        generate_traefik_dynamic_config(&ingress, &path, &[]).unwrap();
         let conf = fs::read_to_string(&path).unwrap();
         assert!(!conf.contains("simpled-ping"), "{}", conf);
         assert!(

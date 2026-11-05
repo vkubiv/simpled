@@ -35,6 +35,16 @@ pub struct Plan {
     pub objects: Vec<PlanObject>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<PlanJob>,
+    /// The gateway's plan only: the domains it holds a certificate secret for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls: Vec<PlanTls>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PlanTls {
+    pub domain: String,
+    /// The variable the ingress stack reads the secret's name from.
+    pub var: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -191,6 +201,10 @@ mod tests {
                 service: "prod_migrate".to_string(),
                 args: vec!["--network".to_string(), "common_network".to_string()],
                 timeout_seconds: 600,
+            }],
+            tls: vec![PlanTls {
+                domain: "shop.example.com".to_string(),
+                var: "SIMPLED_TLS_1".to_string(),
             }],
         };
         let dir = tempfile::tempdir().unwrap();

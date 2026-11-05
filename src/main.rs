@@ -12,6 +12,7 @@ mod docker_generator;
 mod docker_resources;
 mod docs;
 mod env_loader;
+mod gateway_tls;
 mod k8s_generator;
 mod local_ingress;
 mod ports;
@@ -197,6 +198,9 @@ enum StepCommands {
     /// Before the gateway is redeployed: refuses to replace a newer simpled's
     /// gateway, and shows how its routing changes
     CheckGateway { plan: std::path::PathBuf },
+    /// The certificate secret of each of the gateway's domains, creating a
+    /// self-signed placeholder for a domain that has none yet
+    TlsSecrets { plan: std::path::PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -521,6 +525,12 @@ fn step_command(command: &StepCommands) -> Result<()> {
         StepCommands::Unlock { force } => {
             let token = std::env::var("SIMPLED_LOCK_TOKEN").ok();
             deploy_steps::unlock(&docker, token.as_deref(), *force)?;
+        }
+        StepCommands::TlsSecrets { plan } => {
+            let plan = read_plan(plan)?;
+            for (var, name) in deploy_steps::tls_secrets(&docker, &plan)? {
+                println!("{}", export_line(&var, &name));
+            }
         }
         StepCommands::CheckGateway { plan } => {
             let plan = read_plan(plan)?;
