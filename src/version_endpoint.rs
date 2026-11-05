@@ -3,10 +3,11 @@
 //!
 //! The gateway is shared by every deployment of an env spec and rewritten by
 //! each of their deploys, so it cannot hold the version itself — deploying one
-//! deployment would overwrite the others'. Each deployment instead gets a tiny
-//! service of its own that answers with its document, and the gateway only
-//! routes the path to the right one. Locally there is one deployment, and the
-//! local gateway answers directly.
+//! deployment would overwrite the others'. On Kubernetes each deployment gets a
+//! tiny nginx service of its own that answers with its document, and the
+//! ingress routes the path to the right one. On Docker the environment's daemon
+//! answers instead, from the labels of the running services (`crate::daemon`).
+//! Locally there is one deployment, and the local gateway answers directly.
 
 use crate::resolved_spec::{ServiceResolvedSpec, VersionRoute};
 use crate::spec::*;

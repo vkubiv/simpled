@@ -5,7 +5,6 @@ use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEnc
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
 use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBinding};
 use crate::swarm_objects::{self, ObjectKind, SwarmObjects};
-use crate::version_endpoint;
 use anyhow::{anyhow, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -13,6 +12,8 @@ use std::io::Write;
 use std::path::Path;
 
 const DOCKER_NETWORK: &str = "common_network";
+/// The Traefik service every domain's version and health routes go to.
+const TRAEFIK_DAEMON_SERVICE: &str = "simpled-daemon";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
 // would change the ingress underneath a deployment that touched nothing else.
 // Traefik stays on v2 because v3 changes the configuration format.
@@ -963,6 +964,8 @@ fn generate_traefik_standalone(
 
     generate_traefik_dynamic_config(&resolved_spec.ingress, &traefik_dir.join("dynamic_conf.yml"))?;
 
+    write_standalone_daemon(resolved_spec, output_dir, deploy_sh)?;
+
     writeln!(deploy_sh, "echo 'Starting Traefik ingress...'")?;
     writeln!(deploy_sh, "docker rm -f traefik-ingress || true")?;
 
@@ -990,7 +993,48 @@ fn generate_traefik_standalone(
 
     write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
     writeln!(deploy_sh, " {}", TRAEFIK_IMAGE)?;
+    // `docker run` takes one network; the daemon's is joined after the start.
+    writeln!(
+        deploy_sh,
+        "docker network connect {} traefik-ingress",
+        crate::daemon::CONTROL_NETWORK
+    )?;
 
+    Ok(())
+}
+
+/// The daemon's container, before the gateway that routes to it. Not root: on
+/// standalone Docker it runs on the host that runs deploy.sh, so the group that
+/// owns the socket is looked up here and added.
+fn write_standalone_daemon(
+    resolved_spec: &EnvironmentResolvedSpec,
+    output_dir: &Path,
+    deploy_sh: &mut File,
+) -> Result<()> {
+    crate::daemon::write_config(
+        &output_dir.join("daemon"),
+        &crate::daemon::config_for(resolved_spec, crate::daemon::source::Mode::Standalone),
+    )?;
+    let network = crate::daemon::CONTROL_NETWORK;
+    writeln!(deploy_sh, "echo 'Starting the simpled daemon...'")?;
+    writeln!(deploy_sh, "docker network create {} || true", network)?;
+    writeln!(deploy_sh, "docker rm -f simpled-daemon || true")?;
+    writeln!(
+        deploy_sh,
+        "docker run -d --name simpled-daemon --network {} --network-alias {} --restart unless-stopped \\",
+        network,
+        crate::daemon::HOST
+    )?;
+    writeln!(
+        deploy_sh,
+        "  --read-only --cap-drop ALL --group-add \"$(stat -c %g /var/run/docker.sock)\" \\"
+    )?;
+    writeln!(
+        deploy_sh,
+        "  -v /var/run/docker.sock:/var/run/docker.sock -v $(pwd)/daemon/daemon.json:{}:ro \\",
+        crate::daemon::CONFIG_PATH
+    )?;
+    writeln!(deploy_sh, "  \"{}\"", crate::daemon::image_reference())?;
     Ok(())
 }
 
@@ -1070,8 +1114,20 @@ fn generate_traefik_swarm(
         writeln!(stack, "      - ../letsencrypt:/letsencrypt")?;
         fs::create_dir_all(ingress_dir.parent().unwrap().join("letsencrypt"))?;
     }
+    writeln!(stack, "    networks:")?;
+    writeln!(stack, "      default:")?;
+    writeln!(stack, "      {}:", crate::daemon::CONTROL_NETWORK)?;
 
-    write_swarm_compose_network(&mut stack, &network_name)?;
+    write_swarm_daemon(&mut stack, resolved_spec, ingress_dir, &mut objects)?;
+
+    writeln!(stack, "networks:")?;
+    writeln!(stack, "  default:")?;
+    writeln!(stack, "    external: true")?;
+    writeln!(stack, "    name: {}", network_name)?;
+    // Created by the stack. Not attachable, so only these two services join it.
+    writeln!(stack, "  {}:", crate::daemon::CONTROL_NETWORK)?;
+    writeln!(stack, "    name: {}", crate::daemon::CONTROL_NETWORK)?;
+    writeln!(stack, "    driver: overlay")?;
 
     writeln!(stack, "configs:")?;
     for (key, external) in objects.externals(ObjectKind::Config) {
@@ -1218,13 +1274,53 @@ fn write_swarm_host_ports(stack: &mut File, has_tls: bool) -> Result<()> {
 
 /// No DEPLOY_DATE here: the gateway restarts when its configs or image change,
 /// not on every deploy of every deployment that shares it.
-fn write_swarm_compose_network(stack: &mut File, network_name: &str) -> Result<()> {
+/// The `daemon` service of the ingress stack, next to the gateway. It reads the
+/// swarm through the Docker socket, so it runs on a manager. As root, because it
+/// may land on a manager other than the one running deploy.sh, whose `docker`
+/// group need not have the same number; with the socket it could act as root
+/// anyway. Its filesystem is read-only and it has no capabilities.
+fn write_swarm_daemon(
+    stack: &mut File,
+    resolved_spec: &EnvironmentResolvedSpec,
+    ingress_dir: &Path,
+    objects: &mut SwarmObjects,
+) -> Result<()> {
+    crate::daemon::write_config(
+        &ingress_dir.join("daemon"),
+        &crate::daemon::config_for(resolved_spec, crate::daemon::source::Mode::Swarm),
+    )?;
+    let config = objects.add(
+        ObjectKind::Config,
+        "gateway_daemon.json",
+        "ingress/daemon/daemon.json",
+        "SIMPLED_GATEWAY_OBJECT_",
+    );
+
+    writeln!(stack, "  daemon:")?;
+    writeln!(
+        stack,
+        "    image: {}",
+        serde_json::to_string(&crate::daemon::image_reference())?
+    )?;
+    writeln!(stack, "    user: \"0:0\"")?;
+    writeln!(stack, "    read_only: true")?;
+    writeln!(stack, "    cap_drop:")?;
+    writeln!(stack, "      - ALL")?;
+    writeln!(stack, "    volumes:")?;
+    writeln!(stack, "      - /var/run/docker.sock:/var/run/docker.sock")?;
+    writeln!(stack, "    configs:")?;
+    writeln!(stack, "      - source: {}", config.base)?;
+    writeln!(stack, "        target: {}", crate::daemon::CONFIG_PATH)?;
+    writeln!(stack, "        mode: 0444")?;
     writeln!(stack, "    networks:")?;
-    writeln!(stack, "      default:")?;
-    writeln!(stack, "networks:")?;
-    writeln!(stack, "  default:")?;
-    writeln!(stack, "    external: true")?;
-    writeln!(stack, "    name: {}", network_name)?;
+    writeln!(stack, "      {}:", crate::daemon::CONTROL_NETWORK)?;
+    writeln!(stack, "    deploy:")?;
+    writeln!(stack, "      placement:")?;
+    writeln!(stack, "        constraints:")?;
+    writeln!(stack, "          - \"node.role == manager\"")?;
+    if single_node(resolved_spec) {
+        writeln!(stack, "          - {}", serde_json::to_string(NODE_PIN)?)?;
+    }
     Ok(())
 }
 
@@ -1350,11 +1446,12 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         writeln!(file, "    {}:", traefik_version_name(&route.domain_name))?;
         writeln!(
             file,
-            "      rule: \"Host(`{}`) && Path(`{}`)\"",
+            "      rule: \"Host(`{}`) && (Path(`{}`) || Path(`{}`))\"",
             route.domain_name,
-            version_endpoint::PATH
+            crate::daemon::http::VERSION_PATH,
+            crate::daemon::http::HEALTH_PATH
         )?;
-        writeln!(file, "      service: {}", traefik_version_name(&route.domain_name))?;
+        writeln!(file, "      service: {}", TRAEFIK_DAEMON_SERVICE)?;
         if has_tls {
             writeln!(file, "      entryPoints:")?;
             writeln!(file, "        - websecure")?;
@@ -1405,15 +1502,17 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path) -
         }
     }
 
-    for route in &ingress.version_routes {
-        writeln!(file, "    {}:", traefik_version_name(&route.domain_name))?;
+    // The daemon answers for every deployment, by the request's Host, so one
+    // service serves every domain's routes.
+    if !ingress.version_routes.is_empty() {
+        writeln!(file, "    {}:", TRAEFIK_DAEMON_SERVICE)?;
         writeln!(file, "      loadBalancer:")?;
         writeln!(file, "        servers:")?;
         writeln!(
             file,
-            "          - url: \"http://{}_{}:80/\"",
-            route.deployment_name,
-            version_endpoint::service_name(&route.deployment_name)
+            "          - url: \"http://{}:{}/\"",
+            crate::daemon::HOST,
+            crate::daemon::PORT
         )?;
     }
 
