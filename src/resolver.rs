@@ -70,6 +70,7 @@ pub fn resolve(
     let current_deployment = DeploymentResolvedSpec {
         name: deployment.name.clone(),
         application_name: deployment.application.name.clone(),
+        application_version: app_spec.version.to_string(),
         configs,
         secrets: secrets.specs,
         services: resolved_services,

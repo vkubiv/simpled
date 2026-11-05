@@ -129,8 +129,8 @@ impl Source for DockerSource {
                         }))
                         .await
                         .context("Cannot list the containers")?;
-                    // Every labelled container is meant to run: deploy.sh starts
-                    // each with a restart policy, and jobs are not labelled.
+                    // Every labelled container is meant to be running: jobs,
+                    // which exit, are not labelled.
                     let mut by_service: BTreeMap<String, ServiceState> = BTreeMap::new();
                     for container in &containers {
                         let Some((name, application, version, deployed_at)) =

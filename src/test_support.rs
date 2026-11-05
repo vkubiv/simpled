@@ -69,6 +69,7 @@ pub fn resolved_deployment(services: Vec<ServiceResolvedSpec>) -> DeploymentReso
     DeploymentResolvedSpec {
         name: "prod".to_string(),
         application_name: "shop".to_string(),
+        application_version: "1.0.0".to_string(),
         configs: vec![],
         secrets: vec![],
         services,

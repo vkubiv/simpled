@@ -144,6 +144,7 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
 
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
+    write_deployed_at(&mut deploy_sh)?;
 
     write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
 
@@ -236,6 +237,17 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
         }
 
         write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
+
+        if crate::daemon::model::labels::is_reported(deployment, service) {
+            for (key, value) in crate::daemon::model::labels::for_service(deployment, &service.full_name) {
+                if key == crate::daemon::model::labels::DEPLOYED_AT {
+                    // Double quotes, so the shell expands the deploy time.
+                    write!(deploy_sh, " --label \"{}={}\"", key, value)?;
+                } else {
+                    write!(deploy_sh, " --label {}", sh_quote(&format!("{}={}", key, value)))?;
+                }
+            }
+        }
 
         // `docker run` has no CPU reservation; a CPU request is Swarm-only.
         if let Some(resources) =
@@ -526,6 +538,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     writeln!(deploy_sh, "#!/bin/bash")?;
     writeln!(deploy_sh, "set -e")?;
     writeln!(deploy_sh, "cd \"$(dirname \"$0\")\"")?;
+    write_deployed_at(&mut deploy_sh)?;
     writeln!(deploy_sh)?;
     writeln!(
         deploy_sh,
@@ -978,6 +991,18 @@ fn generate_traefik_standalone(
     write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
     writeln!(deploy_sh, " {}", TRAEFIK_IMAGE)?;
 
+    Ok(())
+}
+
+/// The time of this deploy, which every service's `simpled.deployed_at` label
+/// carries. Exported, because `docker stack deploy` reads it from the
+/// environment.
+fn write_deployed_at(deploy_sh: &mut File) -> Result<()> {
+    writeln!(
+        deploy_sh,
+        "export {}=\"$(date +%s)\"",
+        crate::daemon::model::labels::DEPLOYED_AT_VAR
+    )?;
     Ok(())
 }
 
@@ -1535,6 +1560,7 @@ mod tests {
             current_deployment: DeploymentResolvedSpec {
                 name: "prod".to_string(),
                 application_name: "shop".to_string(),
+                application_version: "1.0.0".to_string(),
                 configs: vec![],
                 secrets: vec![],
                 services,

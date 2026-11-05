@@ -15,6 +15,39 @@ pub mod labels {
     /// deployment's own services carry it: the gateway also has
     /// `simpled.deployment`, naming the deployment that deployed it.
     pub const SERVICE: &str = "simpled.service";
+
+    /// Set by deploy.sh when it runs, so `deployed_at` is the time of the deploy
+    /// and the stack file is the same every time the deployment is prepared.
+    pub const DEPLOYED_AT_VAR: &str = "SIMPLED_DEPLOYED_AT";
+
+    /// The labels of one of a deployment's services. Only the time comes in as a
+    /// variable, written for the shell or for `docker stack deploy`, which both
+    /// read `${...}`.
+    pub fn for_service(
+        deployment: &crate::resolved_spec::DeploymentResolvedSpec,
+        service: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        [
+            (DEPLOYMENT, deployment.name.clone()),
+            (APPLICATION, deployment.application_name.clone()),
+            (VERSION, deployment.application_version.clone()),
+            (DEPLOYED_AT, format!("${{{}}}", DEPLOYED_AT_VAR)),
+            (SERVICE, service.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// A deployment's services the daemon reports on: the long-running ones.
+    /// Jobs finish, and the nginx version sidecar is not part of the app.
+    pub fn is_reported(
+        deployment: &crate::resolved_spec::DeploymentResolvedSpec,
+        service: &crate::resolved_spec::ServiceResolvedSpec,
+    ) -> bool {
+        !matches!(service.service_type, crate::spec::ServiceType::Job)
+            && service.full_name != crate::version_endpoint::service_name(&deployment.name)
+    }
 }
 
 /// One service of a deployment, as Docker reports it.
