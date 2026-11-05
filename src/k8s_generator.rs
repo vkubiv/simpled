@@ -727,6 +727,7 @@ mod tests {
             current_deployment: crate::resolved_spec::DeploymentResolvedSpec {
                 name: "prod".to_string(),
                 application_name: "shop".to_string(),
+                application_version: "1.0.0".to_string(),
                 configs: vec![],
                 secrets: vec![],
                 services: vec![],

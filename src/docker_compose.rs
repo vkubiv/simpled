@@ -172,6 +172,9 @@ pub struct DeployConfig {
     pub rollback_config: Option<UpdateConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement: Option<DockerPlacement>,
+    /// Service labels, which the daemon reads. Changing them restarts no task.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// `deploy.update_config` / `deploy.rollback_config`: only what is set.
@@ -498,6 +501,11 @@ pub fn prepare_service_with(
             update_config: update.map(UpdateConfig::from_policy),
             rollback_config: update.and_then(UpdateConfig::rollback_for),
             placement,
+            labels: if is_swarm && crate::daemon::model::labels::is_reported(&spec.current_deployment, service) {
+                crate::daemon::model::labels::for_service(&spec.current_deployment, &service.full_name)
+            } else {
+                BTreeMap::new()
+            },
             ..DeployConfig::default()
         }),
         _ => resources.map(|resources| DeployConfig {

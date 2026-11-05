@@ -236,6 +236,8 @@ pub const SHELL_VAR_PREFIX: &str = "SIMPLED_SECRET_";
 pub struct DeploymentResolvedSpec {
     pub name: String,
     pub application_name: String,
+    /// The app spec's version, which the services' `simpled.version` label carries.
+    pub application_version: String,
     pub configs: Vec<ConfigResolvedSpec>,
     pub secrets: Vec<SecretResolvedSpec>,
     pub services: Vec<ServiceResolvedSpec>,
