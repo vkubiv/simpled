@@ -2,23 +2,53 @@
 //! swarm, containers on standalone Docker. Both are found by the labels
 //! `prepare-deployment` writes (`model::labels`).
 
+use super::inspect::{self, LogQuery};
 use super::model::{labels, ServiceState};
 use anyhow::{Context, Result};
 use bollard::models::{
     ContainerSummaryHealthStatusEnum, ContainerSummaryStateEnum, Service, ServiceUpdateStatusStateEnum,
 };
 use bollard::query_parameters::{ListContainersOptions, ListServicesOptions};
+use bollard::query_parameters::{ListNodesOptions, ListTasksOptions, LogsOptions};
 use bollard::Docker;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// A log, as Docker streams it.
+pub type LogStream = Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>;
+
 pub trait Source: Send + Sync {
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>>;
     /// Every deployment with a labelled service, sorted.
     fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>>;
+
+    /// A service's tasks (Swarm) or containers (standalone). `None` when the
+    /// deployment has no such service.
+    fn tasks<'a>(&'a self, _deployment: &'a str, _service: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// A service's log. `None` when the deployment has no such service.
+    fn logs<'a>(
+        &'a self,
+        _deployment: &'a str,
+        _service: &'a str,
+        _query: LogQuery,
+    ) -> BoxFuture<'a, Result<Option<LogStream>>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// The gateway's tasks, or its container.
+    fn gateway(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async { Ok(Value::Null) })
+    }
+    /// The swarm's nodes; `None` on standalone Docker.
+    fn nodes(&self) -> BoxFuture<'_, Result<Option<Value>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The gateway's certificates, for `/health`.
@@ -66,6 +96,78 @@ pub fn connect_docker() -> Result<Docker> {
         Docker::connect_with_local_defaults()
     }
     .context("Cannot connect to Docker")
+}
+
+/// The gateway, as the ingress stack and the standalone deploy.sh name it.
+const GATEWAY_SWARM_SERVICE: &str = "ingress_traefik";
+const GATEWAY_CONTAINER: &str = "traefik-ingress";
+
+fn one_service_filter(deployment: &str, service: &str) -> HashMap<String, Vec<String>> {
+    HashMap::from([(
+        "label".to_string(),
+        vec![
+            format!("{}={}", labels::DEPLOYMENT, deployment),
+            format!("{}={}", labels::SERVICE, service),
+        ],
+    )])
+}
+
+fn logs_options(query: &LogQuery) -> LogsOptions {
+    LogsOptions {
+        follow: query.follow,
+        stdout: true,
+        stderr: true,
+        since: query.since.clamp(0, i32::MAX as i64) as i32,
+        until: 0,
+        timestamps: query.timestamps,
+        tail: query.tail.map_or_else(|| "all".to_string(), |n| n.to_string()),
+    }
+}
+
+impl DockerSource {
+    /// The Swarm service ID of one of a deployment's services, found by labels,
+    /// so only services the daemon owns are found.
+    async fn swarm_service_id(&self, deployment: &str, service: &str) -> Result<Option<String>> {
+        let services = self
+            .docker
+            .list_services(Some(ListServicesOptions {
+                filters: Some(one_service_filter(deployment, service)),
+                status: None,
+            }))
+            .await
+            .context("Cannot list the swarm's services")?;
+        Ok(services.into_iter().find_map(|s| s.id))
+    }
+
+    async fn containers(
+        &self,
+        filters: HashMap<String, Vec<String>>,
+    ) -> Result<Vec<bollard::models::ContainerSummary>> {
+        self.docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .context("Cannot list the containers")
+    }
+
+    async fn swarm_tasks(&self, service_id: &str) -> Result<Vec<Value>> {
+        let tasks = self
+            .docker
+            .list_tasks(Some(ListTasksOptions {
+                filters: Some(HashMap::from([("service".to_string(), vec![service_id.to_string()])])),
+            }))
+            .await
+            .context("Cannot list the tasks")?;
+        let nodes = self
+            .docker
+            .list_nodes(None::<ListNodesOptions>)
+            .await
+            .context("Cannot list the nodes")?;
+        Ok(inspect::tasks_json(&tasks, &inspect::hostnames(&nodes)))
+    }
 }
 
 fn label_filter(deployment: &str) -> HashMap<String, Vec<String>> {
@@ -135,6 +237,84 @@ pub fn swarm_service(service: &Service) -> Option<ServiceState> {
 }
 
 impl Source for DockerSource {
+    fn tasks<'a>(&'a self, deployment: &'a str, service: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
+        Box::pin(async move {
+            let tasks = match self.mode {
+                Mode::Swarm => match self.swarm_service_id(deployment, service).await? {
+                    Some(id) => self.swarm_tasks(&id).await?,
+                    None => return Ok(None),
+                },
+                Mode::Standalone => {
+                    let containers = self.containers(one_service_filter(deployment, service)).await?;
+                    if containers.is_empty() {
+                        return Ok(None);
+                    }
+                    containers.iter().map(inspect::container_json).collect()
+                }
+            };
+            Ok(Some(
+                json!({ "deployment": deployment, "service": service, "tasks": tasks }),
+            ))
+        })
+    }
+
+    fn logs<'a>(
+        &'a self,
+        deployment: &'a str,
+        service: &'a str,
+        query: LogQuery,
+    ) -> BoxFuture<'a, Result<Option<LogStream>>> {
+        Box::pin(async move {
+            let options = logs_options(&query);
+            let stream = match self.mode {
+                // The service's log, aggregated across nodes by the manager.
+                Mode::Swarm => match self.swarm_service_id(deployment, service).await? {
+                    Some(id) => self.docker.service_logs(&id, Some(options)).boxed(),
+                    None => return Ok(None),
+                },
+                Mode::Standalone => {
+                    let containers = self.containers(one_service_filter(deployment, service)).await?;
+                    match containers.into_iter().find_map(|c| c.id) {
+                        Some(id) => self.docker.logs(&id, Some(options)).boxed(),
+                        None => return Ok(None),
+                    }
+                }
+            };
+            let stream: LogStream =
+                Box::pin(stream.map(|chunk| chunk.map(|o| o.into_bytes()).map_err(std::io::Error::other)));
+            Ok(Some(stream))
+        })
+    }
+
+    fn gateway(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            match self.mode {
+                Mode::Swarm => Ok(json!({ "tasks": self.swarm_tasks(GATEWAY_SWARM_SERVICE).await? })),
+                Mode::Standalone => {
+                    let filters = HashMap::from([("name".to_string(), vec![format!("^/{}$", GATEWAY_CONTAINER)])]);
+                    let containers = self.containers(filters).await?;
+                    Ok(json!({ "tasks": containers.iter().map(inspect::container_json).collect::<Vec<_>>() }))
+                }
+            }
+        })
+    }
+
+    fn nodes(&self) -> BoxFuture<'_, Result<Option<Value>>> {
+        Box::pin(async move {
+            if self.mode != Mode::Swarm {
+                return Ok(None);
+            }
+            let nodes = self
+                .docker
+                .list_nodes(None::<ListNodesOptions>)
+                .await
+                .context("Cannot list the nodes")?;
+            Ok(Some(
+                json!({ "nodes": nodes.iter().map(inspect::node_json).collect::<Vec<_>>() }),
+            ))
+        })
+    }
+
     fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
             let filters = HashMap::from([("label".to_string(), vec![labels::SERVICE.to_string()])]);

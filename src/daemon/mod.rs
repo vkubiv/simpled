@@ -6,6 +6,7 @@
 pub mod acme;
 pub mod api;
 pub mod http;
+pub mod inspect;
 pub mod model;
 pub mod source;
 
@@ -195,6 +196,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
                 Some(http::Certs {
                     source: Box::new(source::connect_docker()?),
                     domains_of,
+                    domains: acme_config.domains.clone(),
                 })
             }
             None => None,

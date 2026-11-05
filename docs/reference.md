@@ -685,6 +685,12 @@ Every request needs `Authorization: Bearer <token>`. A missing or wrong token ge
 |---|---|
 | `GET /api/v1/status` | Every deployment: its version document, its health (as `/health`), and its services with desired and running counts. |
 | `GET /api/v1/deployments/{deployment}/services` | Per service: name, image, version, desired, running, unhealthy and whether an update is in progress. A deployment the daemon does not know is a 404. |
+| `GET /api/v1/deployments/{deployment}/services/{service}/tasks` | Swarm: the service's last 20 tasks, newest first, each with its node, state, desired state, since when, exit code and error, which say why a service does not converge. Standalone: its containers with state, status and health. |
+| `GET /api/v1/deployments/{deployment}/services/{service}/logs` | The service's log as `text/plain`, streamed; on Swarm aggregated across nodes. `tail=200` (default; `all`, at most 10000; on Swarm Docker applies it to each task), `since=10m` (`30s`, `2h`, `1d`, or Unix seconds), `follow=1` to keep streaming, `timestamps=1`. |
+| `GET /api/v1/gateway` | The gateway's tasks per node, or its container; with Let's Encrypt on Swarm, each domain's certificate: `issuer` (`acme`, `self-signed` or `none`) and `expires_at` (Unix seconds). |
+| `GET /api/v1/nodes` | Swarm: every node's hostname, role, availability, state, address, labels and whether it leads. A 404 on standalone Docker. |
+
+`{deployment}` and `{service}` are the names from the specs (`prod`, `api`), not Swarm's. A name the daemon does not own is a 404 either way, so names cannot be probed.
 
 ```bash
 curl -H "Authorization: Bearer $SIMPLED_TOKEN" https://ops.example.com/api/v1/status
