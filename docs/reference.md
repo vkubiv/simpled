@@ -1649,8 +1649,8 @@ The binary is the version that prepared the deployment, taken from, in order:
 3. that version's GitHub release, verified against the release's checksums.
 
 `target_platform` names the target: `linux-amd64` (default) or `linux-arm64`.
-Releases do not build a Linux arm64 binary yet, so for an arm64 target from any other
-machine, pass `--target-binary` with a simpled of the same version built for it.
+Releases from 2.0.1 on include both Linux binaries. `--target-binary` is needed only
+for a version without a release, such as a local build.
 
 The same `rsync` of `docker-deploy/` that carries the stack files carries the
 binary, and `deploy.sh` makes it executable. The target needs nothing beyond Docker
@@ -1853,7 +1853,7 @@ and `type: local` env specs need no changes, unless they use the nginx gateway.
 | Swarm, a mounted named volume without a binding | Error, listing the volumes in a block ready to paste | Bind each one under `deployments.<name>.volumes`, see [Volumes on Docker Swarm](#volumes-on-docker-swarm). Or set `multi_node: false` on a single-node swarm. |
 | Swarm, a relative bind path such as `./data:/data` | Error | A config for files the service only reads, a bound volume for data it writes. Or `multi_node: false`. |
 | Swarm, configs or secrets | Become Swarm objects, see [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm) | Nothing, unless one is larger than 500 KB. |
-| Swarm, a target that is not Linux amd64 | `prepare-deployment` ships an amd64 `simpled` next to `deploy.sh` | Set [`target_platform`](#envspecyaml--localenvyaml), and pass `--target-binary` until releases build the arm64 binary. |
+| Swarm, a target that is not Linux amd64 | `prepare-deployment` ships an amd64 `simpled` next to `deploy.sh` | Set [`target_platform`](#envspecyaml--localenvyaml). The arm64 binary is in releases from 2.0.1 on; with 2.0.0, pass `--target-binary`. |
 | Swarm, several deployments deployed from one directory on the target | Each `deploy.sh` replaces the other's files | One directory per deployment, see [Several deployments in one env spec](#several-deployments-in-one-env-spec). |
 | `gateway.type: nginx` | Error | Remove it: Traefik is the only Docker gateway. |
 | `gateway.tls.secret` on Docker | Error | `tls.letsencrypt`, or `tls.upstream: true` when TLS ends in front of the gateway. |
