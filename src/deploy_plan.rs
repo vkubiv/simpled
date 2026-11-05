@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-/// The plan of one owner: the gateway's (`ingress/plan.json`) or a deployment's
+/// The plan of one owner: the gateway's (`gateway/plan.json`) or a deployment's
 /// (`<deployment>/plan.json`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Plan {

@@ -38,8 +38,8 @@ fn on_swarm_the_token_is_a_gateway_secret_and_the_api_is_routed_under_its_prefix
     let dir = prepare(&with_controller("docker", "swarm_mode: true", &api_on_web(TOKEN)));
     let out = dir.path().join("docker-deploy");
 
-    assert_eq!(read(&out.join("ingress").join("controller").join("read_token")), TOKEN);
-    let text = read(&out.join("ingress").join("docker-compose.yaml"));
+    assert_eq!(read(&out.join("gateway").join("controller").join("read_token")), TOKEN);
+    let text = read(&out.join("gateway").join("docker-compose.yaml"));
     let stack: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let mount = &stack["services"]["controller"]["secrets"][0];
     assert_eq!(
@@ -58,16 +58,16 @@ fn on_swarm_the_token_is_a_gateway_secret_and_the_api_is_routed_under_its_prefix
         .starts_with("${SIMPLED_GATEWAY_OBJECT_"));
 
     let config: serde_json::Value =
-        serde_json::from_str(&read(&out.join("ingress").join("controller").join("controller.json"))).unwrap();
+        serde_json::from_str(&read(&out.join("gateway").join("controller").join("controller.json"))).unwrap();
     assert_eq!(
         config["api"],
         serde_json::json!({"read_token_file": "/run/secrets/simpled_controller_read_token"})
     );
     // The token is not in the config, only where to find it.
-    assert!(!read(&out.join("ingress").join("controller").join("controller.json")).contains(TOKEN));
+    assert!(!read(&out.join("gateway").join("controller").join("controller.json")).contains(TOKEN));
 
     let dynamic: serde_yaml::Value =
-        serde_yaml::from_str(&read(&out.join("ingress").join("traefik").join("dynamic_conf.yml"))).unwrap();
+        serde_yaml::from_str(&read(&out.join("gateway").join("traefik").join("dynamic_conf.yml"))).unwrap();
     let router = &dynamic["http"]["routers"]["simpled-controller-api-0"];
     assert_eq!(
         router["rule"].as_str(),
@@ -79,12 +79,12 @@ fn on_swarm_the_token_is_a_gateway_secret_and_the_api_is_routed_under_its_prefix
         Some("/_simpled")
     );
 
-    let plan: serde_json::Value = serde_json::from_str(&read(&out.join("ingress").join("plan.json"))).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&read(&out.join("gateway").join("plan.json"))).unwrap();
     assert!(plan["objects"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|o| o["kind"] == "secret" && o["file"] == "ingress/controller/read_token"));
+        .any(|o| o["kind"] == "secret" && o["file"] == "gateway/controller/read_token"));
 }
 
 #[test]
@@ -92,10 +92,10 @@ fn an_aws_token_is_fetched_on_the_deploy_target() {
     let controller = "    hosts:\n      web:\n        prefix: /_simpled\n    read_token:\n      aws: prod/simpled/tokens\n      jq: .read";
     let dir = prepare(&with_controller("docker", "swarm_mode: true", controller));
     let out = dir.path().join("docker-deploy");
-    assert!(!out.join("ingress").join("controller").join("read_token").exists());
+    assert!(!out.join("gateway").join("controller").join("read_token").exists());
     let fetch = read(&out.join("fetch-secrets.sh"));
     assert!(fetch.contains("'prod/simpled/tokens'"), "{}", fetch);
-    assert!(fetch.contains("ingress/controller/read_token"), "{}", fetch);
+    assert!(fetch.contains("gateway/controller/read_token"), "{}", fetch);
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn controller_mistakes_fail_validation() {
 fn without_a_controller_block_there_is_no_api() {
     let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
-    let config = read(&out.join("ingress").join("controller").join("controller.json"));
+    let config = read(&out.join("gateway").join("controller").join("controller.json"));
     assert!(!config.contains("\"api\""), "{}", config);
-    assert!(!read(&out.join("ingress").join("docker-compose.yaml")).contains("simpled_controller_read_token"));
+    assert!(!read(&out.join("gateway").join("docker-compose.yaml")).contains("simpled_controller_read_token"));
 }

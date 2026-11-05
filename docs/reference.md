@@ -641,9 +641,9 @@ The gateway is shared by every deployment of an env spec and rewritten by each o
 
 | | Swarm | Standalone |
 |---|---|---|
-| Runs as | service `controller` of the `ingress` stack, on a manager node | container `simpled-controller`, started by `deploy.sh` before the gateway |
+| Runs as | service `simpled_controller` of the `simpled` stack, on a manager node | container `simpled-controller`, started by `deploy.sh` before the gateway |
 | Image | `ghcr.io/vkubiv/simpled:<version>`, the version that prepared the deployment; `SIMPLED_CONTROLLER_IMAGE=<image> ./deploy.sh` overrides it | the same |
-| Config | `ingress/controller/controller.json`, as a Swarm config | `controller/controller.json`, bind-mounted |
+| Config | `gateway/controller/controller.json`, as a Swarm config | `controller/controller.json`, bind-mounted |
 | Network | `simpled_control`, an overlay network only the gateway and the controller are on | `simpled_control`, a bridge network, the same way |
 | Docker access | `/var/run/docker.sock`. As root, since the controller may run on another manager than the one running `deploy.sh`, whose `docker` group may have another number. Read-only filesystem, no capabilities. | `/var/run/docker.sock`, as user 65532 with the socket's group (`stat -c %g`). Read-only filesystem, no capabilities. |
 
@@ -779,10 +779,10 @@ About `/ping`: Traefik's built-in ping router is ``PathPrefix(`/ping`)``, which 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `global` | bool | `deploy.mode: global` on the ingress stack service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled controller](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
+| `global` | bool | `deploy.mode: global` on the `simpled_gateway` service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled controller](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
 | `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`. |
 
-Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the ingress stack is unchanged: a single replica placed anywhere.
+Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the gateway is unchanged: a single replica placed anywhere.
 
 #### Behind a load balancer (AWS ALB)
 
@@ -1745,15 +1745,15 @@ Output directory: `docker-deploy/`
 |------|-------------|
 | `deploy.sh` | Deploy script: image prune, Swarm configs and secrets, ingress, then the job phases, then the stack, then pruning of old configs and secrets. The steps marked `./simpled step` are run by the binary next to it. Images no container uses are pruned *before* the rollout, so the release that is running at that point stays on the node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
 | `simpled` | The simpled binary that runs the deploy steps, the version that prepared the deployment |
-| `ingress/plan.json`, `<deployment>/plan.json` | What the deploy steps act on: the gateway's and the deployment's objects, and the deployment's jobs |
+| `gateway/plan.json`, `<deployment>/plan.json` | What the deploy steps act on: the gateway's and the deployment's objects, and the deployment's jobs |
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
 | `<deployment>/docker-compose.deps.yaml` | Stack file with only the services the jobs depend on (phase 1); written only when that is a strict subset |
 | `<deployment>/<service>/` | Per-service `.env` file, read by `docker stack deploy` on the machine that runs it |
 | `<deployment>/configs/`, `<deployment>/secrets/` | The files the deployment's Swarm configs and secrets are created from. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm) |
 | `<deployment>/volumes/<name>/` | Only for unbound volumes, which `multi_node: false` allows |
-| `ingress/` | The gateway's stack: Traefik and the [simpled controller](#the-simpled-controller-docker). Its `traefik/` files and `controller/controller.json` are uploaded as Swarm configs too |
+| `gateway/` | The `simpled` stack: the gateway (`simpled_gateway`, Traefik) and the [simpled controller](#the-simpled-controller-docker) (`simpled_controller`). Its `traefik/` files and `controller/controller.json` are uploaded as Swarm configs too |
 
-The ingress stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
+The `simpled` stack publishes 80 (and 443 with TLS) in **host mode** (`mode: host` in the long port syntax), not through the routing mesh: the mesh rewrites the source address, so every client would reach the apps with the same `X-Forwarded-For` and share one per-IP rate limit. The consequence is that the gateway answers only on the node(s) running its task, so DNS or the CDN origin must point at that node, and only one gateway task per node can bind the ports. The stack keeps the default `stop-first` update order, as a second task could not bind them while the first holds them, so a gateway update drops connections for the moment the task restarts. With `gateway.global: true` there is one gateway task per node, so a load balancer can target every node; see [global and placement](#global-and-placement-swarm).
 
 ### Deploy steps on Docker Swarm
 
@@ -1773,7 +1773,7 @@ calls to the simpled binary shipped next to it:
 A step that sets variables for the rest of the script prints `export` lines, which
 `deploy.sh` captures and then evaluates, so a failing step stops the script.
 
-Steps read only the plans `prepare-deployment` wrote, `ingress/plan.json` and
+Steps read only the plans `prepare-deployment` wrote, `gateway/plan.json` and
 `<deployment>/plan.json`, never the env or app spec: those depend on the CI
 environment, on files next to the spec and on the downloaded bundle. Every string a
 plan passes to Docker is in compose's interpolation syntax (`${NAME}` is a variable
@@ -1807,7 +1807,7 @@ keeps them from getting in each other's way:
 - **One directory per deployment on the target**, for example
   `rsync -a docker-deploy/ host:~/deploy/shop/`. Nothing generated is then shared
   between two deployments: each has its own `deploy.sh`, binary, plans and
-  `ingress/` copy.
+  `gateway/` copy.
 - **Objects have owners.** A deployment's configs and secrets are labelled
   `simpled.deployment=<name>` and the gateway's `simpled.scope=environment`, and
   pruning only touches the owner being deployed.
@@ -1906,6 +1906,17 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
 The controller keeps no state: each start creates a new ACME account, and what it
 needs to know about a certificate is in its labels. If the controller is down, the
 gateway keeps serving; renewals wait, with 30 days of margin.
+
+**The `simpled` stack.** simpled 2.0.x ran the gateway in a stack called `ingress`,
+the same name as Swarm's own routing-mesh network. The gateway and the controller
+now run in the `simpled` stack, as `simpled_gateway` and `simpled_controller`, and
+the deploy directory has `gateway/` instead of `ingress/`. The first deploy with the
+new names removes the old stack (`./simpled step retire-legacy-stack`), which takes
+the gateway down for a few seconds once: the new gateway cannot bind ports 80 and 443
+while the old one holds them. It only removes an `ingress` stack whose gateway carries
+simpled's `simpled.version` label; any other one stops the deploy with what to do. On
+standalone Docker the gateway container is now `simpled-gateway`, and `deploy.sh`
+removes the old `traefik-ingress` one.
 
 **Upgrading from 2.0.x.** The 2.0.x gateway kept Traefik's certificates in
 `letsencrypt/acme.json` next to `deploy.sh`. When `deploy.sh` finds that file, it

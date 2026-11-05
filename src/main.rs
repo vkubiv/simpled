@@ -271,6 +271,9 @@ enum StepCommands {
     /// The certificate secret of each of the gateway's domains, creating a
     /// self-signed placeholder for a domain that has none yet
     TlsSecrets { plan: std::path::PathBuf },
+    /// Removes the `ingress` stack a simpled 2.0.x deploy left, whose gateway
+    /// holds the ports the `simpled` stack needs
+    RetireLegacyStack,
     /// Imports the gateway's domains from a 2.0.x acme.json, then renames it to
     /// acme.json.imported so later deploys do not import it again
     TlsImport {
@@ -700,6 +703,13 @@ fn step_command(command: &StepCommands) -> Result<()> {
             for (var, name) in deploy_steps::tls_secrets(&docker, &plan)? {
                 println!("{}", export_line(&var, &name));
             }
+        }
+        StepCommands::RetireLegacyStack => {
+            deploy_steps::retire_legacy_stack(
+                &docker,
+                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(2),
+            )?;
         }
         StepCommands::CheckGateway { plan } => {
             let plan = read_plan(plan)?;

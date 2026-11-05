@@ -95,8 +95,8 @@ pub const PORT: u16 = 8080;
 /// reach the controller except through the gateway's routes.
 pub const CONTROL_NETWORK: &str = "simpled_control";
 /// The name the gateway reaches the controller by: its Swarm service name in the
-/// `ingress` stack, and a network alias of the standalone container.
-pub const HOST: &str = "ingress_controller";
+/// `simpled` stack, and a network alias of the standalone container.
+pub const HOST: &str = "simpled_controller";
 /// Overrides the image, for a private registry or a local test build.
 pub const IMAGE_VAR: &str = "SIMPLED_CONTROLLER_IMAGE";
 /// Where the generated stack mounts `controller.json`.

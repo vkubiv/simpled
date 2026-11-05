@@ -386,6 +386,63 @@ pub fn import_acme_json(
     Ok(report)
 }
 
+// --------------------------------------------------------- retire-legacy-stack
+
+/// simpled 2.0.x ran the gateway in a stack called `ingress`. Its gateway task
+/// holds ports 80 and 443 on the host, which the `simpled` stack's gateway
+/// needs, and the stack owns the `simpled_control` network. So the first deploy
+/// with the new names removes it, once, and waits until its containers and
+/// networks are gone. Only a stack whose gateway carries simpled's label is
+/// removed; any other `ingress` stack stops the deploy with what to do.
+pub fn retire_legacy_stack(docker: &dyn Docker, wait: std::time::Duration, poll: std::time::Duration) -> Result<bool> {
+    let output = docker.run(&[
+        "service",
+        "inspect",
+        LEGACY_GATEWAY_SERVICE,
+        "--format",
+        "{{index .Spec.Labels \"simpled.version\"}}",
+    ])?;
+    if !output.success {
+        return Ok(false);
+    }
+    let version = output.stdout.trim();
+    if version.is_empty() || version == "<no value>" {
+        bail!(
+            "A stack '{}' with a service {} holds the gateway's ports, but it carries no simpled.version label, so \
+             simpled will not remove it. If an older simpled deployed it, remove it with `docker stack rm {}` and \
+             run deploy.sh again; the gateway is down in between.",
+            LEGACY_STACK,
+            LEGACY_GATEWAY_SERVICE,
+            LEGACY_STACK
+        );
+    }
+    eprintln!(
+        "The gateway now runs in the '{}' stack. Removing the '{}' stack simpled {} deployed; \
+         the gateway is down until the new one starts.",
+        STACK, LEGACY_STACK, version
+    );
+    checked(docker, &["stack", "rm", LEGACY_STACK])?;
+    let namespace = format!("label=com.docker.stack.namespace={}", LEGACY_STACK);
+    let started = std::time::Instant::now();
+    loop {
+        let containers = checked(docker, &["ps", "-q", "--filter", &namespace])?;
+        let networks = checked(docker, &["network", "ls", "-q", "--filter", &namespace])?;
+        if containers.trim().is_empty() && networks.trim().is_empty() {
+            return Ok(true);
+        }
+        if started.elapsed() >= wait {
+            bail!(
+                "The '{}' stack was removed, but its containers or networks were still there after {}; \
+                 run deploy.sh again once `docker ps --filter {}` shows nothing",
+                LEGACY_STACK,
+                human(wait),
+                namespace
+            );
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// Removes older objects: of each base name, the two newest stay, the current
 /// one and the previous one, which a `docker service rollback` still mounts.
 /// Docker refuses to remove an object a service still uses, so an older one in
@@ -681,7 +738,13 @@ pub fn unlock(docker: &dyn Docker, token: Option<&str>, force: bool) -> Result<(
 // ---------------------------------------------------------------- check-gateway
 
 /// The gateway service of the ingress stack.
-pub const GATEWAY_SERVICE: &str = "ingress_traefik";
+/// The stack the gateway and the controller run in, and their services.
+pub const STACK: &str = "simpled";
+pub const GATEWAY_SERVICE: &str = "simpled_gateway";
+/// Before simpled 2.1 the stack was `ingress`, which is also the name of
+/// Swarm's own routing-mesh network.
+pub const LEGACY_STACK: &str = "ingress";
+pub const LEGACY_GATEWAY_SERVICE: &str = "ingress_traefik";
 
 /// Every deployment of an env spec redeploys the shared gateway from its own copy
 /// of the env spec. Before it does, this compares what runs with what is about to
@@ -700,7 +763,18 @@ pub fn check_gateway(
     lookup: &dyn Fn(&str) -> Option<String>,
     allow_downgrade: bool,
 ) -> Result<()> {
-    let output = docker.run(&["service", "inspect", GATEWAY_SERVICE, "--format", "{{json .Spec}}"])?;
+    // The gateway a 2.0.x deploy left in the `ingress` stack counts too: it is
+    // the one this deploy replaces.
+    let mut output = docker.run(&["service", "inspect", GATEWAY_SERVICE, "--format", "{{json .Spec}}"])?;
+    if !output.success {
+        output = docker.run(&[
+            "service",
+            "inspect",
+            LEGACY_GATEWAY_SERVICE,
+            "--format",
+            "{{json .Spec}}",
+        ])?;
+    }
     if !output.success {
         return Ok(()); // The first deploy: no gateway yet.
     }
@@ -1175,7 +1249,7 @@ mod tests {
     #[test]
     fn an_older_simpled_does_not_replace_a_newer_gateway() {
         let dir = tempfile::tempdir().unwrap();
-        let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, &gateway_spec("2.1.0", "x"))]);
+        let docker = FakeDocker::new(&[("service inspect simpled_gateway", true, &gateway_spec("2.1.0", "x"))]);
         let err = check_gateway(&docker, &gateway_plan("2.0.0"), dir.path(), &|_: &str| None, false)
             .unwrap_err()
             .to_string();
@@ -1374,5 +1448,52 @@ c
         let docker = FakeDocker::new(&[]);
         let err = import_acme_json(&docker, "not json", None, NOW_2026).unwrap_err();
         assert!(err.to_string().contains("not a Traefik acme.json"), "{}", err);
+    }
+
+    #[test]
+    fn the_downgrade_guard_also_reads_a_gateway_in_the_old_ingress_stack() {
+        let docker = FakeDocker::new(&[
+            ("service inspect simpled_gateway", false, ""),
+            ("service inspect ingress_traefik", true, &gateway_spec("9.0.0", "x")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let err = check_gateway(&docker, &gateway_plan("2.1.0"), dir.path(), &|_| None, false).unwrap_err();
+        assert!(err.to_string().contains("simpled 9.0.0"), "{}", err);
+    }
+
+    #[test]
+    fn only_a_simpled_made_ingress_stack_is_retired() {
+        let quick = std::time::Duration::from_millis(1);
+        // None there: nothing to do.
+        let docker = FakeDocker::new(&[("service inspect ingress_traefik", false, "")]);
+        assert!(!retire_legacy_stack(&docker, quick, quick).unwrap());
+        assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("stack rm")));
+
+        // simpled's: removed, then waited for.
+        let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, "2.0.1\n")]);
+        assert!(retire_legacy_stack(&docker, quick, quick).unwrap());
+        let calls = docker.calls.borrow();
+        assert!(calls.contains(&"stack rm ingress".to_string()), "{:?}", calls);
+        assert!(calls
+            .iter()
+            .any(|c| c == "ps -q --filter label=com.docker.stack.namespace=ingress"));
+        drop(calls);
+
+        // Someone else's: left alone, with what to do.
+        let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, "<no value>\n")]);
+        let err = retire_legacy_stack(&docker, quick, quick).unwrap_err();
+        assert!(err.to_string().contains("carries no simpled.version label"), "{}", err);
+        assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("stack rm")));
+    }
+
+    #[test]
+    fn retiring_gives_up_when_the_old_stack_lingers() {
+        let quick = std::time::Duration::from_millis(1);
+        let docker = FakeDocker::new(&[
+            ("service inspect ingress_traefik", true, "2.0.1"),
+            ("ps -q", true, "abc123\n"),
+        ]);
+        let err = retire_legacy_stack(&docker, quick, quick).unwrap_err();
+        assert!(err.to_string().contains("still there"), "{}", err);
     }
 }
