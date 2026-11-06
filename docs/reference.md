@@ -700,7 +700,7 @@ The private API reports every deployment's services. Its routes exist only when 
 
 **The read token is a credential**, not a viewer password: what the API returns, and the logs it will serve, can be as sensitive as the secrets that leak into them. The tokens reach the controller as gateway Swarm secrets on Swarm, so every manager has them, and as files under `controller/` on standalone Docker; `controller.json` only says where they are.
 
-Every request needs `Authorization: Bearer <token>`. A missing or wrong token gets 401 and a token without enough rights 403. A client that fails 10 times within a minute gets 429 instead of 401 until the minute is over, and every answer to it, whatever token it presents, is delayed by a second per failure past the tenth, up to ten seconds; the client is the address the gateway forwards, so a valid token still passes, since behind a proxy the address is everyone's.
+Every request needs `Authorization: Bearer <token>`. A missing or wrong token gets 401 and a token without enough rights 403. A client that fails 10 times within a minute gets 429 instead of 401 until the minute is over, and every answer to it, whatever token it presents, is delayed by a second per failure past the tenth, up to ten seconds, one request at a time; the client is the address the gateway forwards, so a valid token still passes, since behind a proxy the address is everyone's.
 
 | Route | Returns |
 |---|---|

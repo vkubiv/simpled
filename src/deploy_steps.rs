@@ -659,6 +659,13 @@ fn lock_holder(docker: &dyn Docker) -> Result<Option<LockHolder>> {
     }))
 }
 
+/// Whether a lock taken at `since` is older than `stale_after` at `now`: one a
+/// deploy that died left behind. deploy.sh reports it; the controller ignores
+/// it. One without a readable time (`since` 0) is as old as it gets.
+pub fn lock_is_stale(since: u64, now: u64, stale_after: Duration) -> bool {
+    now.saturating_sub(since) >= stale_after.as_secs()
+}
+
 /// Timing of `lock`, apart so tests need not wait.
 pub struct LockTiming {
     /// How long to wait for another deploy to release the lock.
@@ -737,7 +744,7 @@ pub fn lock(
                 human(age),
                 human(timing.wait)
             );
-            if age >= timing.stale_after {
+            if lock_is_stale(holder.since, now(), timing.stale_after) {
                 message.push_str(&format!(
                     "\nA deploy does not take that long, so that one probably died. If nothing is deploying, \
                      clear the lock with: ./simpled step unlock --force (or docker config rm {})",
