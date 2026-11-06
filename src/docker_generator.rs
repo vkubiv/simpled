@@ -345,6 +345,11 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
         writeln!(deploy_sh)?;
     }
 
+    // Containers of services the spec no longer has: `docker rm -f` above only
+    // replaces the current ones, and a leftover would keep counting toward the
+    // deployment's health.
+    write_remove_retired_containers(&mut deploy_sh, deployment)?;
+
     // Ingress Container
     if !resolved_spec.ingress.rules.is_empty() {
         generate_traefik_standalone(
@@ -356,6 +361,44 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
         )?;
     }
 
+    Ok(())
+}
+
+/// Writes the loop that removes the deployment's labelled containers whose
+/// `simpled.service` is not one of the services reported now.
+fn write_remove_retired_containers(
+    deploy_sh: &mut File,
+    deployment: &crate::resolved_spec::DeploymentResolvedSpec,
+) -> Result<()> {
+    use crate::controller::model::labels;
+    let current: Vec<String> = deployment
+        .services
+        .iter()
+        .filter(|s| labels::is_reported(deployment, s))
+        .map(|s| sh_quote(&s.full_name))
+        .collect();
+    // Both labels: the gateway carries `simpled.deployment` too, but no service.
+    let filter = format!(
+        "{} --filter {}",
+        sh_quote(&format!("label={}={}", labels::DEPLOYMENT, deployment.name)),
+        sh_quote(&format!("label={}", labels::SERVICE))
+    );
+    let format = sh_quote(&format!("{{{{.ID}}}} {{{{.Label \"{}\"}}}}", labels::SERVICE));
+    writeln!(
+        deploy_sh,
+        "docker ps -a --filter {} --format {} | while read -r id service; do",
+        filter, format
+    )?;
+    writeln!(deploy_sh, "  case \"$service\" in")?;
+    if !current.is_empty() {
+        writeln!(deploy_sh, "    {}) ;;", current.join("|"))?;
+    }
+    writeln!(
+        deploy_sh,
+        "    *) echo \"Removing the retired service $service...\"; docker rm -f \"$id\" >/dev/null ;;"
+    )?;
+    writeln!(deploy_sh, "  esac")?;
+    writeln!(deploy_sh, "done")?;
     Ok(())
 }
 

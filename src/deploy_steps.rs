@@ -39,34 +39,35 @@ pub struct DockerCli;
 
 impl Docker for DockerCli {
     fn run(&self, args: &[&str]) -> Result<DockerOutput> {
-        let output = Command::new("docker")
-            .args(args)
-            .output()
-            .context("Failed to run docker. Is the Docker CLI installed and on PATH?")?;
-        Ok(DockerOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        docker_cli(args, None)
     }
 
     fn run_input(&self, args: &[&str], input: &[u8]) -> Result<DockerOutput> {
-        use std::io::Write;
-        let mut child = Command::new("docker")
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("Failed to run docker. Is the Docker CLI installed and on PATH?")?;
-        child.stdin.take().context("docker has no stdin")?.write_all(input)?;
-        let output = child.wait_with_output()?;
-        Ok(DockerOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        docker_cli(args, Some(input))
     }
+}
+
+/// Runs the Docker CLI, with `input` on its stdin when there is one.
+fn docker_cli(args: &[&str], input: Option<&[u8]>) -> Result<DockerOutput> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("docker")
+        .args(args)
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to run docker. Is the Docker CLI installed and on PATH?")?;
+    if let Some(input) = input {
+        // Dropped at the end of the statement, which closes docker's stdin.
+        child.stdin.take().context("docker has no stdin")?.write_all(input)?;
+    }
+    let output = child.wait_with_output()?;
+    Ok(DockerOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// Runs a command that must succeed, and returns its stdout.
@@ -352,13 +353,7 @@ pub fn import_acme_json(
                     continue;
                 }
             };
-            let pem = format!(
-                "{}
-{}",
-                chain.trim_end(),
-                key.trim_end()
-            ) + "
-";
+            let pem = crate::gateway_tls::certificate_pem(&chain, &key);
             for name in wanted {
                 if expires <= now {
                     report.skipped.push((name, "expired".to_string()));
@@ -1233,7 +1228,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let holder = r#"{"simpled.lock.deployment":"blog","simpled.lock.host":"ci-3","simpled.lock.since":"100","simpled.lock.token":"x"}"#;
         let docker = FakeDocker::with_stderr(&[
-            ("config create", false, "", "Error response from controller: rpc error: code = AlreadyExists desc = config simpled_deploy_lock already exists"),
+            ("config create", false, "", "Error response from daemon: rpc error: code = AlreadyExists desc = config simpled_deploy_lock already exists"),
             ("config inspect simpled_deploy_lock", true, holder, ""),
         ]);
         // Held for 10 minutes: not stale yet.

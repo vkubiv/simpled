@@ -74,3 +74,18 @@ fn standalone_containers_carry_the_labels() {
     let set = script.find("export SIMPLED_DEPLOYED_AT=").expect(&script);
     assert!(set < script.find("docker run").unwrap(), "{}", script);
 }
+
+#[test]
+fn standalone_removes_the_containers_of_retired_services() {
+    let dir = prepare(&envspec("docker", "", ""));
+    let script = read(&dir.path().join("docker-deploy").join("deploy.sh"));
+    let start = script
+        .find("docker ps -a --filter 'label=simpled.deployment=prod' --filter 'label=simpled.service'")
+        .unwrap_or_else(|| panic!("no cleanup of retired services:\n{}", script));
+    let cleanup = &script[start..];
+    // The labelled services are kept; the job is not labelled, so not listed.
+    assert!(cleanup.contains("    'api'|'primary-db') ;;"), "{}", cleanup);
+    assert!(cleanup.contains("docker rm -f \"$id\""), "{}", cleanup);
+    // After the services are started, so a failed start leaves the old ones.
+    assert!(script.rfind("docker run -d --name api ").unwrap() < start, "{}", script);
+}

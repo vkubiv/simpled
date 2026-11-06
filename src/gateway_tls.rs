@@ -109,6 +109,12 @@ pub fn domains(ingress: &IngressResolvedSpec) -> Vec<String> {
     domains
 }
 
+/// The PEM the gateway reads for a domain: the chain, then the key, each ending
+/// in a newline whatever the source gave, so Traefik finds both blocks.
+pub fn certificate_pem(chain: &str, key: &str) -> String {
+    format!("{}\n{}\n", chain.trim_end(), key.trim_end())
+}
+
 /// Where a gateway task finds a domain's PEM, which is both its `certFile` and
 /// its `keyFile`: Go's TLS loader takes the certificates from one and the key
 /// from the other, skipping the other blocks.
@@ -130,7 +136,7 @@ pub fn self_signed(domain: &str) -> Result<String> {
         .distinguished_name
         .push(rcgen::DnType::CommonName, format!("{} (simpled placeholder)", domain));
     let cert = params.self_signed(&key).context("Cannot sign the placeholder")?;
-    Ok(format!("{}{}", cert.pem(), key.serialize_pem()))
+    Ok(certificate_pem(&cert.pem(), &key.serialize_pem()))
 }
 
 #[cfg(test)]
@@ -142,6 +148,17 @@ mod tests {
         let pem = self_signed("shop.example.com").unwrap();
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"), "{}", pem);
         assert!(pem.contains("-----BEGIN PRIVATE KEY-----"), "{}", pem);
+    }
+
+    #[test]
+    fn the_key_starts_on_its_own_line() {
+        let chain = "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----";
+        let key = "-----BEGIN PRIVATE KEY-----\nBB\n-----END PRIVATE KEY-----\n\n";
+        assert_eq!(
+            certificate_pem(chain, key),
+            "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----\n\
+             -----BEGIN PRIVATE KEY-----\nBB\n-----END PRIVATE KEY-----\n"
+        );
     }
 
     #[test]
