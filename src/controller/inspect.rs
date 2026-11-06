@@ -42,10 +42,15 @@ pub fn task_json(task: &Task, nodes: &HashMap<String, String>) -> Value {
 /// A service's tasks, newest first, at most `MAX_TASKS`.
 pub fn tasks_json(tasks: &[Task], nodes: &HashMap<String, String>) -> Vec<Value> {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
-    // Swarm's timestamps are RFC 3339 in UTC with a fixed width per controller, so
-    // they order as text.
     sorted.sort_by(|a, b| {
-        let at = |t: &Task| t.status.as_ref().and_then(|s| s.timestamp.clone()).unwrap_or_default();
+        let at = |t: &Task| {
+            timestamp_key(
+                t.status
+                    .as_ref()
+                    .and_then(|s| s.timestamp.as_deref())
+                    .unwrap_or_default(),
+            )
+        };
         at(b).cmp(&at(a))
     });
     sorted
@@ -53,6 +58,18 @@ pub fn tasks_json(tasks: &[Task], nodes: &HashMap<String, String>) -> Vec<Value>
         .take(MAX_TASKS)
         .map(|t| task_json(t, nodes))
         .collect()
+}
+
+/// A Swarm timestamp as a string that orders as the time does. Swarm writes RFC
+/// 3339 in UTC, but drops trailing zeros of the fraction (`...:00Z`,
+/// `...:00.5Z`, `...:00.123456789Z`), so as written they do not order as text:
+/// `Z` sorts after `.`. Here the fraction is always nine digits.
+fn timestamp_key(timestamp: &str) -> String {
+    let Some(utc) = timestamp.strip_suffix('Z') else {
+        return timestamp.to_string();
+    };
+    let (seconds, fraction) = utc.split_once('.').unwrap_or((utc, ""));
+    format!("{}.{:0<9}Z", seconds, fraction)
 }
 
 /// One standalone container, in the shape of a task where it has one.
@@ -177,6 +194,32 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tasks_order_by_time_even_where_swarm_dropped_the_fractions_zeros() {
+        // As text, `Z` sorts after `.`, so the task from the whole second would
+        // come out newest.
+        let tasks = vec![
+            task("older", "2026-11-06T10:00:00Z", TaskState::FAILED, None, None),
+            task("newer", "2026-11-06T10:00:00.5Z", TaskState::RUNNING, None, None),
+            task(
+                "oldest",
+                "2026-11-06T09:59:59.999999999Z",
+                TaskState::FAILED,
+                None,
+                None,
+            ),
+        ];
+        let out = tasks_json(&tasks, &HashMap::new());
+        let ids: Vec<&str> = out.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["newer", "older", "oldest"]);
+        assert_eq!(timestamp_key("2026-11-06T10:00:00Z"), "2026-11-06T10:00:00.000000000Z");
+        assert_eq!(
+            timestamp_key("2026-11-06T10:00:00.5Z"),
+            "2026-11-06T10:00:00.500000000Z"
+        );
+        assert_eq!(timestamp_key("not a time"), "not a time");
     }
 
     #[test]

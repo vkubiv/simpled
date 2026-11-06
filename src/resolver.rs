@@ -826,7 +826,12 @@ fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppS
 fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolvedSpec> {
     let rules = build_ingress_rules(env_spec);
     check_route_conflicts(&rules)?;
-    let rules_for_controller = rules.clone();
+    let controller = env_spec
+        .ingress
+        .controller
+        .as_ref()
+        .map(|d| resolve_controller(env_spec, d, &rules))
+        .transpose()?;
 
     let tls = env_spec.ingress.tls.as_ref().map(|tls_spec| IngressTlsResolvedSpec {
         secret: tls_spec.secret.clone(),
@@ -864,12 +869,7 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         trusted_proxies: env_spec.ingress.trusted_proxies.clone(),
         global: env_spec.ingress.global,
         placement: env_spec.ingress.placement.clone(),
-        controller: env_spec
-            .ingress
-            .controller
-            .as_ref()
-            .map(|d| resolve_controller(env_spec, d, &rules_for_controller))
-            .transpose()?,
+        controller,
     })
 }
 

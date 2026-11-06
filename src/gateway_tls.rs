@@ -18,6 +18,10 @@ pub mod labels {
     pub const ISSUER: &str = "simpled.tls.issuer";
     /// Unix seconds; `0` for the placeholder, which nothing renews by date.
     pub const NOT_AFTER: &str = "simpled.tls.not_after";
+    /// On the config holding the controller's ACME account: the directory it
+    /// was created at, and the e-mail it was registered with.
+    pub const ACME_DIRECTORY: &str = "simpled.acme.directory";
+    pub const ACME_EMAIL: &str = "simpled.acme.email";
 }
 
 pub const ISSUER_ACME: &str = "acme";

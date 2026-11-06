@@ -45,7 +45,7 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
+pub(crate) fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (
         status,
         [

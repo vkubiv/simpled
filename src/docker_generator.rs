@@ -31,6 +31,8 @@ const TRAEFIK_RESOLVER: &str = "myresolver";
 const TRAEFIK_REDIRECT_SERVICE: &str = "redirect-noop";
 /// The gateway's plan, relative to the deploy directory.
 const INGRESS_PLAN: &str = "gateway/plan.json";
+/// The gateway's stack file (Swarm), relative to the deploy directory.
+pub const GATEWAY_STACK_FILE: &str = "gateway/docker-compose.yaml";
 /// Stack file holding only the services the jobs depend on (phase 1 of a deploy).
 const DEPS_COMPOSE_FILE: &str = "docker-compose.deps.yaml";
 /// Default seconds to wait for one job to reach a terminal state.
@@ -718,7 +720,8 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     // longer in the file, e.g. after the ingress type was switched.
     writeln!(
         deploy_sh,
-        "docker stack deploy -c gateway/docker-compose.yaml {} --prune --detach=false",
+        "docker stack deploy -c {} {} --prune --detach=false",
+        GATEWAY_STACK_FILE,
         crate::deploy_steps::STACK
     )?;
 

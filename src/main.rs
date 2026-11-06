@@ -685,13 +685,52 @@ fn step_command(command: &StepCommands) -> Result<()> {
             let token = std::env::var("SIMPLED_LOCK_TOKEN").ok();
             deploy_steps::unlock(&docker, token.as_deref(), *force)?;
         }
-        StepCommands::TlsImport { plan, file } => {
-            let plan = read_plan(plan)?;
+        StepCommands::TlsImport { plan: plan_path, file } => {
+            let plan = read_plan(plan_path)?;
             let domains: Vec<String> = plan.tls.iter().map(|t| t.domain.clone()).collect();
-            let text = std::fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
+            let done = file.with_extension("json.imported");
+            // Traefik wrote the file as root, mode 0600, and often its directory
+            // too; a deploy user that is only in the docker group can neither
+            // read it nor rename it. Both are checked before anything is
+            // imported, so the way out is one command, not a half-done import.
+            let as_root = format!(
+                "sudo ./simpled step tls-import {} {}",
+                plan_path.display(),
+                file.display()
+            );
+            let text = match std::fs::read_to_string(file) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
+                    "Cannot read {}: {}. Traefik (simpled 2.0.x) wrote it as root. Import it once with `{}`, which \
+                     also renames it to {}; or move the file away to start with new certificates. Then run deploy.sh \
+                     again.",
+                    file.display(),
+                    e,
+                    as_root,
+                    done.display()
+                ),
+                Err(e) => return Err(e).with_context(|| format!("Cannot read {}", file.display())),
+            };
+            if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
+                let probe = dir.join(".simpled-write-check");
+                match std::fs::write(&probe, b"") {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&probe);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
+                        "{} is readable, but {} cannot be written, so the file could not be renamed to {} after the \
+                         import, and every deploy would import it again. Import it once with `{}`, then run deploy.sh \
+                         again.",
+                        file.display(),
+                        dir.display(),
+                        done.display(),
+                        as_root
+                    ),
+                    Err(_) => {}
+                }
+            }
             let report = deploy_steps::import_acme_json(&docker, &text, Some(&domains), controller::unix_now())?;
             print_import_report(&report);
-            let done = file.with_extension("json.imported");
             std::fs::rename(file, &done)
                 .with_context(|| format!("Cannot rename {} to {}", file.display(), done.display()))?;
             eprintln!("Renamed {} to {}", file.display(), done.display());
@@ -703,8 +742,16 @@ fn step_command(command: &StepCommands) -> Result<()> {
             }
         }
         StepCommands::RetireLegacyStack => {
+            // The new stack's images are pulled while the old gateway still
+            // serves; a stack file that is not there yet means nothing to pull.
+            let compose = deploy_dir.join(docker_generator::GATEWAY_STACK_FILE);
+            let images = match std::fs::read_to_string(&compose) {
+                Ok(text) => deploy_steps::stack_images(&text, &|name| std::env::var(name).ok()),
+                Err(_) => vec![],
+            };
             deploy_steps::retire_legacy_stack(
                 &docker,
+                &images,
                 std::time::Duration::from_secs(120),
                 std::time::Duration::from_secs(2),
             )?;

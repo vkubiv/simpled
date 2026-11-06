@@ -333,10 +333,12 @@ redeploy that kept both certificates and restarted nothing.
    the ingress stack, so a redeploy keeps it. On the first deploy there is no secret
    yet, so the gateway starts with Traefik's default certificate until the first
    certificate is issued.
-4. **No state to keep.** The controller never reads a certificate back: the domains and
-   the expiry date are in the labels, which the API returns. The ACME account is not
-   kept either. A new account on each controller start is fine, because the rate limits
-   that matter are on certificates, not on accounts.
+4. **Little state to keep.** The controller never reads a certificate back: the domains
+   and the expiry date are in the labels, which the API returns. The ACME account's
+   credentials are kept in a Swarm config, named after the directory and the e-mail:
+   Let's Encrypt allows 10 new accounts per IP every 3 hours, which a controller that
+   restarts a few times while a domain still waits for its certificate would use up.
+   An account the CA no longer accepts is replaced.
 5. **Renewal** happens 30 days before expiry, with a jittered retry. Expiry shows up
    in `GET /api/v1/gateway`, and `/health` reports `degraded` when a certificate is
    within 7 days of expiry.

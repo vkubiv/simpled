@@ -11,11 +11,12 @@
 use crate::gateway_tls::{self, labels, ISSUER_ACME};
 pub use crate::gateway_tls::{current, CertSecret};
 use anyhow::{anyhow, bail, Context, Result};
-use bollard::models::{SecretSpec, ServiceSpec};
-use bollard::query_parameters::{ListSecretsOptions, UpdateServiceOptions};
+use bollard::models::{ConfigSpec, SecretSpec, ServiceSpec};
+use bollard::query_parameters::{ListConfigsOptions, ListSecretsOptions, UpdateServiceOptions};
 use bollard::Docker;
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+    RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,6 +41,9 @@ pub type Challenges = Arc<RwLock<HashMap<String, String>>>;
 
 pub const GATEWAY_SERVICE: &str = crate::deploy_steps::GATEWAY_SERVICE;
 pub const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+/// The Swarm config holding the ACME account, before the hash of the directory
+/// and the e-mail.
+pub const ACCOUNT_CONFIG_BASE: &str = "simpled_acme_account";
 const RENEW_BEFORE_SECONDS: u64 = 30 * 24 * 3600;
 /// How often the certificates are checked. Issuing waits for nothing else, so
 /// this only bounds how late a renewal or a new domain is noticed.
@@ -131,16 +135,124 @@ pub fn not_after(chain_pem: &str) -> Result<u64> {
     Ok(cert.validity().not_after.timestamp().max(0) as u64)
 }
 
-async fn account(config: &AcmeConfig) -> Result<Account> {
-    let builder = match &config.ca_file {
-        Some(ca) => Account::builder_with_root(ca),
-        None => Account::builder(),
+/// The Swarm config the ACME account's credentials are kept in, named after the
+/// directory and the e-mail: a change of either is a new account.
+pub fn account_config_name(config: &AcmeConfig) -> String {
+    crate::deploy_steps::object_name(
+        ACCOUNT_CONFIG_BASE,
+        format!("{}\n{}", config.directory, config.email).as_bytes(),
+    )
+}
+
+/// The saved account, as (config id, credentials), when there is one.
+async fn saved_account(docker: &Docker, name: &str) -> Result<Option<(String, AccountCredentials)>> {
+    use base64::Engine;
+    let configs = docker
+        .list_configs(Some(ListConfigsOptions {
+            filters: Some(HashMap::from([("name".to_string(), vec![name.to_string()])])),
+        }))
+        .await
+        .context("Cannot list the configs")?;
+    // The name filter matches prefixes too.
+    let Some(found) = configs
+        .into_iter()
+        .find(|c| c.spec.as_ref().and_then(|s| s.name.as_deref()) == Some(name))
+    else {
+        return Ok(None);
+    };
+    let id = found.id.context("The saved ACME account has no id")?;
+    let data = found
+        .spec
+        .and_then(|s| s.data)
+        .with_context(|| format!("The saved ACME account {} has no data", name))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .with_context(|| format!("The saved ACME account {} is not base64", name))?;
+    let credentials =
+        serde_json::from_slice(&bytes).with_context(|| format!("The saved ACME account {} does not parse", name))?;
+    Ok(Some((id, credentials)))
+}
+
+async fn save_account(
+    docker: &Docker,
+    name: &str,
+    config: &AcmeConfig,
+    credentials: &AccountCredentials,
+) -> Result<()> {
+    use base64::Engine;
+    let json = serde_json::to_vec(credentials).context("Cannot serialize the ACME account")?;
+    docker
+        .create_config(ConfigSpec {
+            name: Some(name.to_string()),
+            labels: Some(HashMap::from([
+                (labels::ACME_DIRECTORY.to_string(), config.directory.clone()),
+                (labels::ACME_EMAIL.to_string(), config.email.clone()),
+            ])),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(json)),
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("Cannot save the ACME account as the config {}", name))?;
+    Ok(())
+}
+
+/// Removes the saved account, so the next `account` creates one.
+async fn forget_account(docker: &Docker, config: &AcmeConfig) {
+    let name = account_config_name(config);
+    match saved_account(docker, &name).await {
+        Ok(Some((id, _))) => {
+            if let Err(e) = docker.delete_config(&id).await {
+                eprintln!("acme: cannot remove the config {}: {}", name, e);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("acme: {:#}", e),
     }
-    .context("Cannot set up the ACME client")?;
+}
+
+/// Whether an order failed because the CA does not know the account any more
+/// (deactivated, or a test CA that was reset).
+fn account_is_gone(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<instant_acme::Error>().is_some_and(|e| {
+            matches!(e, instant_acme::Error::Api(problem)
+                if problem.r#type.as_deref() == Some("urn:ietf:params:acme:error:accountDoesNotExist"))
+        })
+    })
+}
+
+/// The controller's account at the CA. Its credentials live in a Swarm config, so
+/// every start is the same account: Let's Encrypt allows 10 new accounts per IP
+/// every 3 hours, which a controller that restarts a few times would use up, and
+/// then no certificate could be issued until the limit lifts. A saved account the
+/// CA no longer accepts is replaced.
+async fn account(docker: &Docker, config: &AcmeConfig) -> Result<Account> {
+    let builder = || {
+        match &config.ca_file {
+            Some(ca) => Account::builder_with_root(ca),
+            None => Account::builder(),
+        }
+        .context("Cannot set up the ACME client")
+    };
+    let name = account_config_name(config);
+    match saved_account(docker, &name).await {
+        Ok(Some((id, credentials))) => match builder()?.from_credentials(credentials).await {
+            Ok(account) => return Ok(account),
+            Err(e) => {
+                eprintln!(
+                    "acme: the saved account {} is not accepted by {}: {}. Creating a new one.",
+                    name, config.directory, e
+                );
+                if let Err(e) = docker.delete_config(&id).await {
+                    eprintln!("acme: cannot remove the config {}: {}", name, e);
+                }
+            }
+        },
+        Ok(None) => {}
+        Err(e) => eprintln!("acme: {:#}. Creating a new account.", e),
+    }
     let contact = format!("mailto:{}", config.email);
-    // A new account on each start: Let's Encrypt's limits that matter are on
-    // certificates, not accounts, and the controller then keeps no state.
-    let (account, _) = builder
+    let (account, credentials) = builder()?
         .create(
             &NewAccount {
                 contact: &[contact.as_str()],
@@ -152,6 +264,14 @@ async fn account(config: &AcmeConfig) -> Result<Account> {
         )
         .await
         .with_context(|| format!("Cannot create an ACME account at {}", config.directory))?;
+    match save_account(docker, &name, config, &credentials).await {
+        Ok(()) => eprintln!(
+            "acme: created an account at {}, saved as the config {}",
+            config.directory, name
+        ),
+        // The account works for this run; the next start creates another one.
+        Err(e) => eprintln!("acme: {:#}", e),
+    }
     Ok(account)
 }
 
@@ -288,6 +408,15 @@ async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Resu
         .await
         .with_context(|| format!("Cannot inspect {}", GATEWAY_SERVICE))?;
     let version = service.version.and_then(|v| v.index).unwrap_or_default();
+    // Docker's version is a u64; the client sends it as an i32, so a wrapped
+    // value would be refused as a mismatch on every try, without saying why.
+    let version = i32::try_from(version).map_err(|_| {
+        anyhow!(
+            "the Swarm object version of {} is {}, more than the Docker client can send",
+            GATEWAY_SERVICE,
+            version
+        )
+    })?;
     let mut spec = service.spec.context("The gateway service has no spec")?;
     let repointed = repoint(&mut spec, current);
     if repointed.mounted == 0 {
@@ -301,7 +430,7 @@ async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Resu
             GATEWAY_SERVICE,
             spec,
             UpdateServiceOptions {
-                version: version as i32,
+                version,
                 ..Default::default()
             },
             None,
@@ -355,22 +484,42 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
             if let Some(best) = best.filter(|b| b.acme) {
                 issued.push((domain.clone(), best.id.clone(), best.name.clone()));
             }
-            if account.is_none() {
-                match self::account(&config).await {
-                    Ok(a) => account = Some(a),
-                    Err(e) => {
-                        eprintln!("acme: {:#}", e);
-                        break;
+            eprintln!("acme: requesting a certificate for {}", domain);
+            let mut result = None;
+            // Twice at most: once more, with a new account, when the saved one
+            // turns out to be gone at the CA, which only an order reveals.
+            for attempt in 0..2 {
+                if account.is_none() {
+                    match self::account(&docker, &config).await {
+                        Ok(a) => account = Some(a),
+                        Err(e) => {
+                            eprintln!("acme: {:#}", e);
+                            break;
+                        }
                     }
                 }
+                let Some(acct) = account.as_ref() else { break };
+                let attempted = async {
+                    let pem = issue(acct, domain, &challenges).await?;
+                    create_secret(&docker, domain, &pem).await
+                }
+                .await;
+                if let Err(e) = &attempted {
+                    if attempt == 0 && account_is_gone(e) {
+                        eprintln!(
+                            "acme: {} no longer knows the saved account. Creating a new one.",
+                            config.directory
+                        );
+                        account = None;
+                        forget_account(&docker, &config).await;
+                        continue;
+                    }
+                }
+                result = Some(attempted);
+                break;
             }
-            let Some(acct) = account.as_ref() else { break };
-            eprintln!("acme: requesting a certificate for {}", domain);
-            let result = async {
-                let pem = issue(acct, domain, &challenges).await?;
-                create_secret(&docker, domain, &pem).await
-            }
-            .await;
+            // No account: nothing can be issued this round; the next one tries again.
+            let Some(result) = result else { break };
             match result {
                 Ok((id, name)) => {
                     eprintln!("acme: issued {} into {}", domain, name);
