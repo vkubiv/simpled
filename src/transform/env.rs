@@ -45,6 +45,7 @@ pub fn convert_env_spec(
     };
     let ingress_type_str = gateway_yaml.ingress_type.clone();
     let has_trusted_proxies = gateway_yaml.trusted_proxies.as_ref().is_some_and(|p| !p.is_empty());
+    let global_opt = gateway_yaml.global;
     let mut ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
     ingress.controller = yaml
         .controller
@@ -195,6 +196,30 @@ pub fn convert_env_spec(
                     "gateway global cannot be combined with multi_node: false: a gateway task on every node, \
                      while multi_node: false keeps everything on the node that runs deploy.sh"
                 ));
+            }
+            // The gateway publishes 80/443 in host mode, so it answers only on the
+            // nodes running it. On a multi_node swarm it runs on every node unless the
+            // env spec pins its single task with a placement constraint.
+            if multi_node {
+                let constrained = ingress.placement.as_ref().is_some_and(|p| !p.constraints.is_empty());
+                let spread = ingress.placement.as_ref().is_some_and(|p| !p.spread.is_empty());
+                match global_opt {
+                    None if spread => {
+                        return Err(anyhow!(
+                            "gateway placement.preferences cannot be combined with global, the default on a \
+                             multi_node swarm: set gateway.global: false with a placement constraint to run one gateway task"
+                        ))
+                    }
+                    None => ingress.global = true,
+                    Some(false) if !constrained => {
+                        return Err(anyhow!(
+                            "gateway global: false needs a gateway.placement constraint on a multi_node swarm: \
+                             the gateway answers 80/443 only on the node running it, so pin it to a node \
+                             (e.g. node.hostname == <node>), or leave global unset to run it on every node"
+                        ))
+                    }
+                    Some(_) => {}
+                }
             }
             DeploymentEnvType::Docker(DockerSpecificSpec {
                 swarm_mode,
@@ -2928,5 +2953,33 @@ deployments:
 
         let ok = SWARM_ROLLOUT.replace("    upstream: true\n", "    upstream: true\n  global: true\n");
         assert!(convert_raw(&ok).unwrap().ingress.global);
+    }
+
+    #[test]
+    fn a_multi_node_gateway_is_global_unless_pinned() {
+        assert!(convert_raw(SWARM_ROLLOUT).unwrap().ingress.global);
+
+        let single = SWARM_ROLLOUT.replace("swarm_mode: true\n", "swarm_mode: true\nmulti_node: false\n");
+        assert!(!convert_raw(&single).unwrap().ingress.global);
+
+        let unpinned = SWARM_ROLLOUT.replace("    upstream: true\n", "    upstream: true\n  global: false\n");
+        let err = convert_raw(&unpinned).unwrap_err().to_string();
+        assert!(
+            err.contains("global: false needs a gateway.placement constraint"),
+            "{err}"
+        );
+
+        let pinned = SWARM_ROLLOUT.replace(
+            "    upstream: true\n",
+            "    upstream: true\n  global: false\n  placement:\n    constraints: [\"node.hostname == edge-1\"]\n",
+        );
+        assert!(!convert_raw(&pinned).unwrap().ingress.global);
+
+        let spread = SWARM_ROLLOUT.replace(
+            "    upstream: true\n",
+            "    upstream: true\n  placement:\n    preferences:\n      - spread: node.labels.az\n",
+        );
+        let err = convert_raw(&spread).unwrap_err().to_string();
+        assert!(err.contains("the default on a multi_node swarm"), "{err}");
     }
 }

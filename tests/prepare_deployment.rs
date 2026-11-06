@@ -615,12 +615,13 @@ fn without_update_or_placement_the_swarm_stack_has_neither() {
         "{:?}",
         args
     );
-    // The gateway service; the controller next to it is always placed on a manager.
+    // The gateway service, global by default on a multi_node swarm; the controller
+    // next to it is always placed on a manager.
     let ingress: serde_yaml::Value =
         serde_yaml::from_str(&read(&out.join("gateway").join("docker-compose.yaml"))).unwrap();
     let gateway = &ingress["services"]["gateway"]["deploy"];
     assert!(
-        gateway["mode"].is_null() && gateway["placement"].is_null(),
+        gateway["mode"].as_str() == Some("global") && gateway["placement"].is_null(),
         "{:?}",
         gateway
     );
