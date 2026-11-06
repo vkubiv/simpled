@@ -877,40 +877,39 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
 /// socket's view of the environment, logs included.
 const MIN_TOKEN_LENGTH: usize = 32;
 
-/// `controller`: each host alias's domains, and the tokens' values, which
-/// are read here like a deployment's secrets, or deferred to the deploy target.
+/// `controller`: the domains of its host, and the tokens' values, which are
+/// read here like a deployment's secrets, or deferred to the deploy target.
 fn resolve_controller(
     env_spec: &DeploymentEnvironmentSpec,
     controller: &crate::spec::ControllerSpec,
     rules: &[IngressRule],
 ) -> Result<crate::resolved_spec::ControllerResolvedSpec> {
-    let mut routes = Vec::new();
-    for (alias, prefix) in &controller.hosts {
-        for host in env_spec.ingress.hosts.iter().filter(|h| &h.name == alias) {
-            for domain in &host.domain_names {
-                let taken = rules
-                    .iter()
-                    .filter(|r| &r.domain_name == domain)
-                    .flat_map(|r| r.services.iter())
-                    .find(|s| s.prefix.trim_end_matches('/') == prefix.trim_end_matches('/'));
-                if let Some(service) = taken {
-                    return Err(anyhow!(
-                        "controller.hosts.{} routes {}{} to the controller, but service '{}' of deployment '{}' is routed there too",
-                        alias,
-                        domain,
-                        prefix,
-                        service.service_name,
-                        service.deployment_name
-                    ));
-                }
-                routes.push((domain.clone(), prefix.clone()));
+    let prefix = crate::controller::PREFIX;
+    let mut domains = Vec::new();
+    for host in env_spec.ingress.hosts.iter().filter(|h| h.name == controller.host) {
+        for domain in &host.domain_names {
+            // A service routed under the prefix (or under a longer prefix that
+            // starts with it) would be shadowed by, or shadow, the controller.
+            let taken = rules
+                .iter()
+                .filter(|r| &r.domain_name == domain)
+                .flat_map(|r| r.services.iter())
+                .find(|s| {
+                    let p = s.prefix.trim_end_matches('/');
+                    p == prefix || p.starts_with(&format!("{}/", prefix))
+                });
+            if let Some(service) = taken {
+                return Err(anyhow!(
+                    "controller.host '{}' serves the controller under {}{}/, but service '{}' of deployment '{}' is routed there too",
+                    controller.host,
+                    domain,
+                    prefix,
+                    service.service_name,
+                    service.deployment_name
+                ));
             }
+            domains.push(domain.clone());
         }
-    }
-    // Without a token the controller serves no API: routing to it would only
-    // answer 404 on every path under the prefix (a whole host for `/`).
-    if controller.read_token.is_none() && controller.manage_token.is_none() {
-        routes.clear();
     }
     let mut documents = HashMap::new();
     let mut token = |spec: &Option<crate::spec::DeploymentSecretSpec>| -> Result<Option<SecretResolvedSpec>> {
@@ -932,7 +931,7 @@ fn resolve_controller(
         }))
     };
     Ok(crate::resolved_spec::ControllerResolvedSpec {
-        routes,
+        domains,
         read_token: token(&controller.read_token)?,
         manage_token: token(&controller.manage_token)?,
     })

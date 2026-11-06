@@ -204,17 +204,12 @@ pub struct IngressSpecYaml {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerSpecYaml {
-    // Where the private API is routed: host alias to the path it is served under.
-    pub hosts: Option<HashMap<String, ControllerHostYaml>>,
+    // The host alias the controller is served on, under `/simpled/`. Required on
+    // Docker.
+    pub host: String,
     // Secret sources, the same shapes a deployment secret takes.
     pub read_token: Option<DeploymentSecretSpecExYaml>,
     pub manage_token: Option<DeploymentSecretSpecExYaml>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct ControllerHostYaml {
-    pub prefix: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

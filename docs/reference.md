@@ -600,44 +600,49 @@ A domain may not appear under both `hosts` and `redirects`, and a source may not
 
 #### version endpoint
 
-Every gateway host answers `GET /.well-known/simpled/version` with what was last deployed behind it:
+On Kubernetes and locally, every gateway host answers `GET /.well-known/simpled/version` with what was last deployed behind it:
 
 ```json
 {"application":"shop","version":"1.2.3","deployment":"prod","deployed_at":1790945826}
 ```
 
-On Docker, `deployed_at` is when `deploy.sh` ran; on Kubernetes, when `prepare-deployment` ran (Unix seconds). Either way a redeploy of the same version is visible too.
-
-On Docker the host also answers `GET /.well-known/simpled/health`, with status 200 only when the deployment is healthy, so an uptime check needs no JSON:
-
-```json
-{"status":"healthy","converged":true,"version":"1.2.3"}
-```
-
-| `status` | When |
-|---|---|
-| `down` | a service that should run has no task (Swarm) or container (standalone) running, or the deployment has no services |
-| `degraded` | a service runs fewer tasks than it should, or a container fails its healthcheck |
-| `healthy` | neither |
-
-On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`; `services_status` then has the status of the services alone. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
-
-`converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped, which [`simpled wait`](#simpled-wait) does. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
-
-There is nothing to configure. A host belongs to a deployment:
+On Kubernetes `deployed_at` is when `prepare-deployment` ran (Unix seconds), so a redeploy of the same version is visible too. A host belongs to a deployment:
 
 - a host only one deployment routes to belongs to that deployment;
 - a host several deployments route to belongs to the one whose `primary_host` it is, and gets no endpoint when that is none of them or more than one.
 
 | Target | Who answers |
 |---|---|
-| Docker | the environment's controller, `simpled controller`, next to the gateway. Traefik routes both paths on each host to it with a `Host() && (Path() \|\| Path())` router. See [The simpled controller](#the-simpled-controller-docker). |
 | Kubernetes | every deployment ships `simpled-version-<deployment>` (nginx, a few MB of memory), routed by a separate Ingress, `<gateway>--simpled-version`, so the main Ingress's `rewrite-target` does not apply to it. No `health`. |
 | Local | the local gateway itself, with no extra container |
+| Docker | nothing on the app's hosts: the [controller](#the-simpled-controller-docker) answers versions and health under `/simpled/` on `controller.host`. |
 
 #### The simpled controller (Docker)
 
 The gateway is shared by every deployment of an env spec and rewritten by each of their deploys, so it cannot hold the versions itself. On Docker, one controller per environment answers for all of them. It reads the state of the running services through the Docker API, and finds a deployment's services by the labels `prepare-deployment` puts on each of them: `simpled.deployment`, `simpled.application`, `simpled.version`, `simpled.deployed_at` and `simpled.service`. On Swarm these are service labels, so a deploy that only moves `deployed_at` restarts nothing.
+
+Every Docker env spec names the host the controller is served on, with the top-level `controller` block. It sits beside `gateway`, not under it: the controller belongs to the environment. `host` is an alias from `gateway.hosts`, and everything the controller serves is under `/simpled/` on each of that host's domains. The gateway strips the prefix before forwarding.
+
+```yaml
+gateway:
+  hosts:
+    web: shop.example.com
+    ops: ops.example.com
+
+controller:
+  host: ops                     # required on Docker
+  read_token:                   # optional: the private API
+    aws: prod/simpled/tokens    # any source a deployment secret takes
+    jq: .read
+  manage_token:
+    env: SIMPLED_MANAGE_TOKEN
+```
+
+| Field | Description |
+|-------|-------------|
+| `host` | Required on Docker. The host alias the controller is served on, under `/simpled/`. It may be an app's host too: a service routed at `/simpled` or below on the same domain fails validation, anything else is left alone. |
+| `read_token` | Reads the private API. Every source a deployment secret takes (`env`, `file`, `aws`, `json_env`, …); an `aws` token is fetched on the deploy target by `fetch-secrets.sh`. At least 32 characters, for example `openssl rand -hex 32`. |
+| `manage_token` | Everything the read token can, and the write routes when they come. |
 
 | | Swarm | Standalone |
 |---|---|---|
@@ -649,52 +654,67 @@ The gateway is shared by every deployment of an env spec and rewritten by each o
 
 App containers are not on `simpled_control` and reach the controller only through the gateway's routes. The Docker socket is effectively root on the host. On Swarm with `tls.letsencrypt` the controller also writes through it: it creates the certificate secrets and updates the gateway service.
 
-#### controller (private API)
+##### Health and versions (public)
 
-The controller also has a private API, which reports every deployment's services. It is off until the env spec's top-level `controller` routes it and gives it a token. The block sits beside `gateway`, not under it: the controller belongs to the environment, and its `hosts` name aliases from `gateway.hosts`.
+| Route | Returns |
+|---|---|
+| `GET /simpled/health` | The whole environment: the gateway, every certificate, and every deployment that has services. |
+| `GET /simpled/health/{deployment}` | One deployment. |
+| `GET /simpled/version/{deployment}` | `{"application","version","deployment","deployed_at"}`; `deployed_at` is when `deploy.sh` ran (Unix seconds), so a redeploy of the same version is visible too. |
 
-```yaml
-gateway:
-  hosts:
-    web: shop.example.com
-    ops: ops.example.com
+Both health routes answer 200 only when `status` is `healthy` and 503 otherwise, with the same body, so an uptime check needs no JSON. A deployment the env spec does not name and Docker does not run is a 404.
 
-controller:
-  hosts:
-    ops:
-      prefix: /                 # or e.g.  web: { prefix: /_simpled }
-  read_token:
-    aws: prod/simpled/tokens    # any source a deployment secret takes
-    jq: .read
-  manage_token:
-    env: SIMPLED_MANAGE_TOKEN
+```json
+{"status":"healthy","converged":true,"version":"1.2.3"}
 ```
 
-| Field | Description |
-|-------|-------------|
-| `hosts` | Host alias to `{ prefix }`: where the API is served. The gateway strips the prefix, so `/_simpled/api/v1/status` reaches the controller as `/api/v1/status`. A prefix that a service already has on the same domain fails validation. |
-| `read_token` | Reads state. Every source a deployment secret takes (`env`, `file`, `aws`, `json_env`, …); an `aws` token is fetched on the deploy target by `fetch-secrets.sh`. At least 32 characters, for example `openssl rand -hex 32`. |
-| `manage_token` | Everything the read token can, and the write routes when they come. |
+| `status` | When |
+|---|---|
+| `down` | a service that should run has no task (Swarm) or container (standalone) running, or the deployment has no services |
+| `degraded` | a service runs fewer tasks than it should, or a container fails its healthcheck |
+| `healthy` | neither |
 
-Without `hosts` the API is not routed; without a token its routes do not exist. Docker only. The tokens reach the controller as gateway Swarm secrets on Swarm, so every manager has them, and as files under `controller/` on standalone Docker; `controller.json` only says where they are.
+`converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll the deployment's health until it reports `converged`, `healthy` and the version it just shipped, which [`simpled wait`](#simpled-wait) does. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
 
-**The read token is a credential**, not a viewer password: what the API returns, and the logs it will serve, can be as sensitive as the secrets that leak into them.
+On Swarm with `tls.letsencrypt`, a deployment's health also has `tls`, the worst certificate of the domains its services are routed on: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`; `services_status` then has the status of the services alone. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
+
+The environment's health is the worst of its parts:
+
+```json
+{
+  "status": "degraded",
+  "gateway": {"status": "healthy", "desired": 3, "running": 3},
+  "tls": "self-signed",
+  "deployments": {
+    "prod": {"status": "healthy", "converged": true, "version": "1.2.3"},
+    "admin": {"status": "degraded", "converged": true, "version": "0.4.0"}
+  }
+}
+```
+
+`gateway` is `down` with nothing running and `degraded` with fewer tasks than wanted, as a global gateway missing a node. `tls`, with Let's Encrypt on Swarm, is the worst certificate of every domain, and anything but `valid` degrades the environment.
+
+##### Private API
+
+The private API reports every deployment's services. Its routes exist only when `controller` has a token.
+
+**The read token is a credential**, not a viewer password: what the API returns, and the logs it will serve, can be as sensitive as the secrets that leak into them. The tokens reach the controller as gateway Swarm secrets on Swarm, so every manager has them, and as files under `controller/` on standalone Docker; `controller.json` only says where they are.
 
 Every request needs `Authorization: Bearer <token>`. A missing or wrong token gets 401 and a token without enough rights 403. A client that fails 10 times within a minute gets 429 until the minute is over; the client is the address the gateway forwards.
 
 | Route | Returns |
 |---|---|
-| `GET /api/v1/status` | Every deployment: its version document, its health (as `/health`), and its services with desired and running counts. |
-| `GET /api/v1/deployments/{deployment}/services` | Per service: name, image, version, desired, running, unhealthy and whether an update is in progress. A deployment the controller does not know is a 404. |
-| `GET /api/v1/deployments/{deployment}/services/{service}/tasks` | Swarm: the service's last 20 tasks, newest first, each with its node, state, desired state, since when, exit code and error, which say why a service does not converge. Standalone: its containers with state, status and health. |
-| `GET /api/v1/deployments/{deployment}/services/{service}/logs` | The service's log as `text/plain`, streamed; on Swarm aggregated across nodes. `tail=200` (default; `all`, at most 10000; on Swarm Docker applies it to each task), `since=10m` (`30s`, `2h`, `1d`, or Unix seconds), `follow=1` to keep streaming, `timestamps=1`. |
-| `GET /api/v1/gateway` | The gateway's tasks per node, or its container; with Let's Encrypt on Swarm, each domain's certificate: `issuer` (`acme`, `self-signed` or `none`) and `expires_at` (Unix seconds). |
-| `GET /api/v1/nodes` | Swarm: every node's hostname, role, availability, state, address, labels and whether it leads. A 404 on standalone Docker. |
+| `GET /simpled/api/v1/status` | Every deployment: its version document, its health (as `/simpled/health/{deployment}`), and its services with desired and running counts. |
+| `GET /simpled/api/v1/deployments/{deployment}/services` | Per service: name, image, version, desired, running, unhealthy and whether an update is in progress. A deployment the controller does not know is a 404. |
+| `GET /simpled/api/v1/deployments/{deployment}/services/{service}/tasks` | Swarm: the service's last 20 tasks, newest first, each with its node, state, desired state, since when, exit code and error, which say why a service does not converge. Standalone: its containers with state, status and health. |
+| `GET /simpled/api/v1/deployments/{deployment}/services/{service}/logs` | The service's log as `text/plain`, streamed; on Swarm aggregated across nodes. `tail=200` (default; `all`, at most 10000; on Swarm Docker applies it to each task), `since=10m` (`30s`, `2h`, `1d`, or Unix seconds), `follow=1` to keep streaming, `timestamps=1`. |
+| `GET /simpled/api/v1/gateway` | The gateway's tasks per node, or its container; with Let's Encrypt on Swarm, each domain's certificate: `issuer` (`acme`, `self-signed` or `none`) and `expires_at` (Unix seconds). |
+| `GET /simpled/api/v1/nodes` | Swarm: every node's hostname, role, availability, state, address, labels and whether it leads. A 404 on standalone Docker. |
 
 `{deployment}` and `{service}` are the names from the specs (`prod`, `api`), not Swarm's. A name the controller does not own is a 404 either way, so names cannot be probed.
 
 ```bash
-curl -H "Authorization: Bearer $SIMPLED_TOKEN" https://ops.example.com/api/v1/status
+curl -H "Authorization: Bearer $SIMPLED_TOKEN" https://ops.example.com/simpled/api/v1/status
 ```
 
 #### body_limit
@@ -791,6 +811,8 @@ CloudFront → an internal ALB that terminates TLS with an ACM certificate → p
 ```yaml
 type: docker
 swarm_mode: true
+controller:
+  host: web
 gateway:
   type: traefik
   hosts:
@@ -1642,14 +1664,14 @@ into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
 ### `simpled status`
 
 Every deployment's version, health and services, from the
-[controller's private API](#controller-private-api). Run it next to the env spec: the API's
-address comes from `controller.hosts`, the token from `SIMPLED_TOKEN` (the read
+[controller's private API](#private-api). Run it next to the env spec: the API's
+address comes from `controller.host`, the token from `SIMPLED_TOKEN` (the read
 or the manage token).
 
 ```
 simpled status [--url <API>] [--json]
 
-  --url   The API's base instead, e.g. https://ops.example.com/api/v1
+  --url   The API's base instead, e.g. https://ops.example.com/simpled/api/v1
   --json  Print the API's answer as it is
 ```
 
@@ -1679,7 +1701,7 @@ simpled logs <DEPLOYMENT> <SERVICE> [-f] [--tail <N|all>] [--since <TIME>] [--ti
 ### `simpled wait`
 
 Waits until a deployment reports a version as healthy and converged: it polls the
-public [`/.well-known/simpled/health`](#version-endpoint) of the deployment's primary
+public [`/simpled/health/<deployment>`](#health-and-versions-public) on the controller's
 host, so it needs no token. For CI, right after `deploy.sh`; it fails when the time
 is up, with the last state it saw.
 
@@ -1688,7 +1710,7 @@ simpled wait <DEPLOYMENT> --version <VERSION> [--timeout 10m] [--interval 5s] [-
 ```
 
 The services decide: a deployment that is `degraded` only by its certificate (see
-`services_status` in [the health endpoint](#version-endpoint)) counts as done, and
+`services_status` in [the health endpoint](#health-and-versions-public)) counts as done, and
 the certificate's state is printed as a warning. `--insecure` accepts any
 certificate, for a Let's Encrypt staging or private ACME server.
 

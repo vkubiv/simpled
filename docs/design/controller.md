@@ -135,32 +135,32 @@ gateway:
     web: shop.example.com
     ops: ops.example.com
 
-controller:                     # optional block; the controller runs regardless
-  hosts:                        # where the private API is routed, by gateway host alias
-    ops: { prefix: / }          # or e.g.  web: { prefix: /_simpled }
-  read_token:                   # a secret source, same shapes as deployment secrets
+controller:                     # required on Docker
+  host: ops                     # gateway host alias; served under /simpled/
+  read_token:                   # optional; a secret source, same shapes as deployment secrets
     aws: prod/simpled/tokens
     jq: .read
   manage_token:
     env: SIMPLED_MANAGE_TOKEN
 ```
 
-- `controller.hosts` uses the same shape and validation as a service's `hosts`
-  (`prefix`, `prefixes`, `strip` and `body_limit`, with `strip` defaulting to true). A
-  path that collides with an app route on the same domain fails validation with the
-  usual error.
-- **Without `controller.hosts`, the private API is not routed**, even when tokens are
-  set. Without `read_token`, the read routes do not exist. Without `manage_token`,
-  the manage routes do not exist. Every combination is valid. Setting a token without
-  `hosts` gets a warning, because the token would be unusable.
+- **`controller.host` is required on Docker.** Everything the controller serves is on
+  that host's domains under the fixed prefix `/simpled/`, which the gateway strips.
+  Nothing of the controller is served on app paths of other hosts, so there is no
+  question which deployment a host belongs to.
+- The host may also carry app routes. A service routed at `/simpled` or below on the
+  same domain fails validation; a service at `/` is fine, since Traefik prefers the
+  longer `PathPrefix(/simpled/)` rule.
+- Without `read_token`, the read routes do not exist. Without `manage_token`, the
+  manage routes do not exist. The public health and version routes exist regardless.
 - Tokens use every secret source a deployment secret accepts (`env`, `file`, `aws`,
   `json_env`, ...), resolved by the same code. `aws` is deferred to
   `fetch-secrets.sh` as usual. Validation requires at least 32 characters.
 - The block sits at the top level, beside `gateway` and not on a deployment: the
   controller belongs to the environment (§2), and it is more than the gateway's
-  helper. Its `hosts` name aliases from `gateway.hosts`.
-- As built (step 6a), a host takes only `prefix`, which the gateway strips; there is
-  no `image` field yet, `SIMPLED_CONTROLLER_IMAGE` on `deploy.sh` overrides the image.
+  helper.
+- There is no `image` field yet; `SIMPLED_CONTROLLER_IMAGE` on `deploy.sh` overrides
+  the image.
 
 How the tokens reach the controller:
 
@@ -168,20 +168,28 @@ How the tokens reach the controller:
 |---|---|
 | Swarm | Content-addressed Swarm secrets (§8.2). **Not** a bind mount: the controller may run on another manager than the one that ran `deploy.sh`. |
 | Standalone | A bind mount of a file under `secrets/`, the same as deployment secrets today. |
-| Local | Read in-process. In `localenv.yaml` the tokens are optional while the gateway binds a loopback address. With `--bind 0.0.0.0` they are required, if `controller.hosts` is set. |
+| Local | Read in-process. In `localenv.yaml` the tokens are optional while the gateway binds a loopback address. With `--bind 0.0.0.0` they are required, if `controller.host` is set. |
 
 ---
 
 ## 4. HTTP API
 
-### Public, on every gateway host
+All routes are under `/simpled/` on `controller.host`. The paths below are as the
+controller sees them, after the gateway strips the prefix.
+
+### Public
 
 | Route | Answer |
 |---|---|
-| `GET /.well-known/simpled/version` | Unchanged: `{"application","version","deployment","deployed_at"}` for the deployment that owns the host (`version_endpoint::routes`). |
-| `GET /.well-known/simpled/health` | `{"status":"healthy\|degraded\|down","converged":bool,"version":"1.2.3"}`, with status 200 when `healthy` and 503 otherwise, so uptime checks need no JSON parsing. |
+| `GET /health` | The whole environment: `{"status","gateway":{"status","desired","running"},"tls"?,"deployments":{"<d>":<health>}}`. The worst of the gateway, every certificate (with Let's Encrypt on Swarm) and every deployment that has labelled services. |
+| `GET /health/{d}` | `{"status":"healthy\|degraded\|down","converged":bool,"version":"1.2.3"}`, plus `tls` and `services_status` with Let's Encrypt on Swarm. |
+| `GET /version/{d}` | `{"application","version","deployment","deployed_at"}`. |
 
-Health is computed for the deployment that owns the host:
+Both health routes answer 200 when `healthy` and 503 otherwise, so uptime checks need
+no JSON parsing. A `{d}` that the env spec does not name and Docker does not run is a
+404; one the env spec names but that has no services yet is `down`.
+
+A deployment's health:
 
 - `down`: some service has zero running tasks while it should have at least one.
 - `degraded`: some service runs fewer tasks than desired, or has a task that is
@@ -190,11 +198,18 @@ Health is computed for the deployment that owns the host:
 - `converged`: every running task of the deployment carries this deployment's
   `simpled.version` label, and no update is in progress (`UpdateStatus.State` is not
   `updating` or `rollback_started`).
+- `tls`: the worst certificate of the domains the deployment's services are routed
+  on; anything but `valid` degrades a healthy deployment.
 
-`converged` closes the gap the reference states today: *"the answer says the
+The gateway is `down` with no task running and `degraded` with fewer than desired.
+
+`converged` closes the gap the reference stated before: *"the answer says the
 deployment's stack was updated, not that every service in it is healthy."*
 
-### Private, under `controller.hosts`, with `Authorization: Bearer <token>`
+Kubernetes keeps the per-deployment nginx sidecar answering
+`/.well-known/simpled/version` on every host it owns (`version_endpoint::routes`).
+
+### Private, with `Authorization: Bearer <token>`
 
 | Route | Token | Returns |
 |---|---|---|
@@ -223,12 +238,11 @@ Rules:
 
 ### CLI client
 
-`simpled status` and `simpled logs <deployment> <service> [-f]` find the URL from
-the env spec (`controller.hosts`) and the token from `SIMPLED_TOKEN`. For CI there is
-`simpled wait --version 1.2.3 --timeout 10m`, which polls `/health` on the
-deployment's primary host until it reports `converged` and `healthy` at that version.
-Today the docs suggest polling `/version` for this, which only proves the stack was
-updated.
+`simpled status` and `simpled logs <deployment> <service> [-f]` use
+`https://<first domain of controller.host>/simpled/api/v1` and the token from
+`SIMPLED_TOKEN`. For CI there is `simpled wait <d> --version 1.2.3 --timeout 10m`,
+which polls `/simpled/health/<d>` until it reports `converged` and `healthy` at that
+version.
 
 ---
 
@@ -244,9 +258,9 @@ updated.
 
 - `simpled_control` contains only the gateway and the controller. App containers sit on
   `common_network` and cannot reach the controller except through gateway routes.
-- The gateway routes `/.well-known/simpled/{version,health}` on each owned host, the
-  `controller.hosts` paths, and, from Phase 3, `/.well-known/acme-challenge/` on every
-  domain to the controller.
+- The gateway routes `/simpled/` on each domain of `controller.host` (prefix
+  stripped) and, from Phase 3, `/.well-known/acme-challenge/` on every domain to the
+  controller. Nothing else of the controller is routed on app hosts.
 - Standalone Docker uses a bridge network named `simpled_control`, with the same
   layout.
 
@@ -261,7 +275,7 @@ updated.
 - `version` and `health` are added on every local port (`version` is already there).
   Health reads the compose project's containers through the local Docker API, so the
   local stack is filtered by `com.docker.compose.project`, not by Swarm labels.
-- The private API is mounted under `controller.hosts` when `localenv.yaml` sets it, with
+- The private API is mounted under `controller.host` when `localenv.yaml` sets it, with
   the auth relaxation described in §3.
 - No ACME locally.
 
@@ -724,5 +738,6 @@ and the release notes are `docs/releases/2.0.0.md`.
    (§8.2).
 4. **Health of excluded or zero-replica services.** These probably do not count
    toward health, but some services are scaled to 0 on purpose.
-5. **Several deployments on one domain.** `/health` follows `/version`'s ownership
-   rule. A shared domain that no deployment owns answers neither.
+5. ~~**Several deployments on one domain.**~~ Resolved: health and versions are
+   addressed by deployment name on `controller.host`, not by the Host header, so a
+   shared domain no longer decides which deployment answers.

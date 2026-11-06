@@ -1,13 +1,12 @@
-//! `/.well-known/simpled/version` and `/health` on every gateway host. On Docker
-//! the environment's controller answers them, next to the gateway; on Kubernetes
-//! every deployment ships a tiny nginx service that answers with its version.
+//! Versions and health. On Docker the environment's controller answers them under
+//! `/simpled/` on `controller.host`; on Kubernetes every deployment ships a tiny
+//! nginx service that answers `/.well-known/simpled/version` on its hosts.
 
 mod common;
 
 use common::{envspec, prepare, read};
 
 const PATH: &str = "/.well-known/simpled/version";
-const HEALTH: &str = "/.well-known/simpled/health";
 
 #[test]
 fn the_swarm_gateway_stack_runs_the_controller_and_no_deployment_ships_a_sidecar() {
@@ -70,26 +69,24 @@ fn the_swarm_gateway_stack_runs_the_controller_and_no_deployment_ships_a_sidecar
     let config: serde_json::Value =
         serde_json::from_str(&read(&out.join("gateway").join("controller").join("controller.json"))).unwrap();
     assert_eq!(config["mode"], "swarm");
-    assert_eq!(
-        config["owners"],
-        serde_json::json!([{"domain": "shop.example.com", "deployment": "prod"}])
-    );
+    assert_eq!(config["domains"], serde_json::json!({"prod": ["shop.example.com"]}));
 }
 
 #[test]
-fn traefik_routes_version_and_health_to_the_controller() {
+fn traefik_routes_the_controller_host_under_simpled_and_nothing_on_app_paths() {
     let dir = prepare(&envspec("docker", "", "type: traefik"));
     let out = dir.path().join("docker-deploy");
 
     let traefik = read(&out.join("traefik").join("dynamic_conf.yml"));
     let parsed: serde_yaml::Value = serde_yaml::from_str(&traefik).unwrap();
-    let router = &parsed["http"]["routers"]["simpled-version-shop-example-com"];
+    let router = &parsed["http"]["routers"]["simpled-controller-0"];
     assert_eq!(
         router["rule"].as_str(),
-        Some(format!("Host(`shop.example.com`) && (Path(`{}`) || Path(`{}`))", PATH, HEALTH).as_str()),
+        Some("Host(`shop.example.com`) && PathPrefix(`/simpled/`)"),
         "{}",
         traefik
     );
+    assert!(!traefik.contains(".well-known/simpled"), "{}", traefik);
     assert_eq!(router["service"].as_str(), Some("simpled-controller"));
     assert_eq!(
         parsed["http"]["services"]["simpled-controller"]["loadBalancer"]["servers"][0]["url"].as_str(),

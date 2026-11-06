@@ -1,4 +1,4 @@
-//! The controller's private API, under `controller.hosts`
+//! The controller's private API, under `/simpled/api/v1` on `controller.host`
 //! (`docs/design/controller.md` §4). Every route needs `Authorization: Bearer
 //! <token>`. The read token reads state; the manage token can do everything the
 //! read token can, and the write routes later. Without a token the routes do

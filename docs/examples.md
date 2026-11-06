@@ -293,6 +293,9 @@ swarm_mode: true
 registry:
   allimb: allimbacr.azurecr.io
 
+controller:
+  host: clinic        # health, versions and the private API under /simpled/
+
 gateway:
   hosts:
     clinic: clinic.mycompany.com

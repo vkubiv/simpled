@@ -1,24 +1,26 @@
-//! The controller's routes. The gateway forwards the public paths of every host
-//! here unchanged, so the Host header says which deployment is asked about.
+//! The controller's routes. The gateway serves them under
+//! `crate::controller::PREFIX` on `controller.host` and strips the prefix, so
+//! the controller sees `/health`, `/api/v1/...`. ACME challenges reach it
+//! unchanged, on every host.
 
 use super::model::{self, Status};
 use super::source::Source;
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-pub const VERSION_PATH: &str = crate::version_endpoint::PATH;
-pub const HEALTH_PATH: &str = "/.well-known/simpled/health";
+/// The whole environment's health, public.
+pub const HEALTH_PATH: &str = "/health";
 
-/// The certificates the controller issues, which a deployment's health reports on.
+/// The certificates the controller issues, which health reports on.
 pub struct Certs {
     pub source: Box<dyn super::source::CertSource>,
-    /// Deployment to the domains it owns that have a certificate.
+    /// Deployment to the domains it is routed on that have a certificate.
     pub domains_of: HashMap<String, Vec<String>>,
     /// Every domain the gateway holds a certificate for.
     pub domains: Vec<String>,
@@ -30,16 +32,17 @@ pub struct App {
     pub certs: Option<Certs>,
     /// Answers to pending ACME challenges, which the ACME task fills in.
     pub challenges: super::acme::Challenges,
-    /// Domain (lower case) to the deployment that answers for it, as
-    /// `version_endpoint::routes` decided when the deployment was prepared.
-    pub owners: HashMap<String, String>,
+    /// The deployments of the env spec, as the controller's config names them:
+    /// one of them with no services yet is `down`, any other name is a 404.
+    pub deployments: Vec<String>,
     pub source: Box<dyn Source>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route(VERSION_PATH, get(version))
-        .route(HEALTH_PATH, get(health))
+        .route(HEALTH_PATH, get(stack_health))
+        .route("/health/{deployment}", get(deployment_health))
+        .route("/version/{deployment}", get(version))
         .route("/.well-known/acme-challenge/{token}", get(challenge))
         .merge(super::api::routes())
         .with_state(app)
@@ -57,45 +60,50 @@ pub(crate) fn json_response(status: StatusCode, body: serde_json::Value) -> Resp
         .into_response()
 }
 
-/// The deployment that answers on the request's host, without the port.
-fn owner<'a>(app: &'a App, headers: &HeaderMap) -> Option<&'a String> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let domain = host.rsplit_once(':').map_or(host, |(name, port)| {
-        if port.chars().all(|c| c.is_ascii_digit()) {
-            name
-        } else {
-            host
-        }
-    });
-    app.owners.get(&domain.to_ascii_lowercase())
+fn no_such_deployment() -> Response {
+    json_response(StatusCode::NOT_FOUND, json!({"error": "no such deployment"}))
 }
 
-fn not_found() -> Response {
-    json_response(
-        StatusCode::NOT_FOUND,
-        json!({"error": "no deployment answers on this host"}),
-    )
-}
-
-async fn version(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let Some(deployment) = owner(&app, &headers) else {
-        return not_found();
+/// 200 only when healthy, so an uptime check needs no JSON parsing.
+fn health_response<T: serde::Serialize>(status: Status, health: &T) -> Response {
+    let code = if status == Status::Healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     };
+    json_response(code, serde_json::to_value(health).unwrap_or_default())
+}
+
+/// A deployment's services. `Ok(None)` for a name the controller neither runs
+/// nor knows from the env spec; `Err` when Docker cannot be read.
+async fn known_services(app: &App, deployment: &str) -> Result<Option<Vec<model::ServiceState>>, ()> {
     match app.source.services(deployment).await {
-        Ok(services) => match model::version_document(deployment, &services) {
-            Some(document) => json_response(StatusCode::OK, document),
-            None => json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "the deployment has no services running", "deployment": deployment}),
-            ),
-        },
+        Ok(services) if services.is_empty() && !app.deployments.iter().any(|d| d == deployment) => Ok(None),
+        Ok(services) => Ok(Some(services)),
         Err(e) => {
-            eprintln!("version for {}: {:#}", deployment, e);
-            json_response(
+            eprintln!("{}: {:#}", deployment, e);
+            Err(())
+        }
+    }
+}
+
+async fn version(State(app): State<Arc<App>>, Path(deployment): Path<String>) -> Response {
+    let services = match known_services(&app, &deployment).await {
+        Ok(Some(services)) => services,
+        Ok(None) => return no_such_deployment(),
+        Err(()) => {
+            return json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 json!({"error": "cannot read the deployment's state"}),
             )
         }
+    };
+    match model::version_document(&deployment, &services) {
+        Some(document) => json_response(StatusCode::OK, document),
+        None => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "the deployment has no services running", "deployment": deployment}),
+        ),
     }
 }
 
@@ -115,9 +123,90 @@ pub async fn health_with_tls(app: &App, deployment: &str, health: model::Health)
     model::with_tls(health, &states)
 }
 
+/// One deployment's health, certificates included. Services that cannot be
+/// read make it `down`.
+async fn read_health(app: &App, deployment: &str, services: Option<Vec<model::ServiceState>>) -> model::Health {
+    let health = match services {
+        Some(services) => model::health(&services),
+        None => model::Health {
+            status: Status::Down,
+            converged: false,
+            version: None,
+            tls: None,
+            services_status: None,
+        },
+    };
+    health_with_tls(app, deployment, health).await
+}
+
+async fn deployment_health(State(app): State<Arc<App>>, Path(deployment): Path<String>) -> Response {
+    let services = match known_services(&app, &deployment).await {
+        Ok(Some(services)) => Some(services),
+        Ok(None) => return no_such_deployment(),
+        Err(()) => None,
+    };
+    let health = read_health(&app, &deployment, services).await;
+    health_response(health.status, &health)
+}
+
+/// The gateway, every certificate and every deployment that has services, all
+/// read at once, so one slow Docker call does not add to the next.
+async fn stack_health(State(app): State<Arc<App>>) -> Response {
+    let deployments = match app.source.deployments().await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("health: {:#}", e);
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"status": "down", "error": "cannot read the deployments"}),
+            );
+        }
+    };
+    let gateway = async {
+        match app.source.gateway_replicas().await {
+            Ok((desired, running)) => model::gateway_health(desired, running),
+            Err(e) => {
+                eprintln!("health: gateway: {:#}", e);
+                model::gateway_health(1, 0)
+            }
+        }
+    };
+    let certificates = async {
+        let Some(certs) = &app.certs else {
+            return vec![];
+        };
+        let now = super::unix_now();
+        let mut states = Vec::new();
+        for domain in &certs.domains {
+            match certs.source.current(domain).await {
+                Ok(current) => states.push(model::tls_state(current, now)),
+                Err(e) => eprintln!("health: certificate of {}: {:#}", domain, e),
+            }
+        }
+        states
+    };
+    let each = futures_util::future::join_all(deployments.into_iter().map(|deployment| {
+        let app = app.clone();
+        async move {
+            let services = match app.source.services(&deployment).await {
+                Ok(services) => Some(services),
+                Err(e) => {
+                    eprintln!("health: {}: {:#}", deployment, e);
+                    None
+                }
+            };
+            let health = read_health(&app, &deployment, services).await;
+            (deployment, health)
+        }
+    }));
+    let (gateway, certificates, each) = tokio::join!(gateway, certificates, each);
+    let health = model::stack_health(gateway, &certificates, each.into_iter().collect::<BTreeMap<_, _>>());
+    health_response(health.status, &health)
+}
+
 /// The key authorization of a pending HTTP-01 challenge, on any host: the
 /// token is the secret, and it is only known while the order is pending.
-async fn challenge(State(app): State<Arc<App>>, axum::extract::Path(token): axum::extract::Path<String>) -> Response {
+async fn challenge(State(app): State<Arc<App>>, Path(token): Path<String>) -> Response {
     let answer = app.challenges.read().ok().and_then(|m| m.get(&token).cloned());
     match answer {
         Some(key_authorization) => (
@@ -128,33 +217,6 @@ async fn challenge(State(app): State<Arc<App>>, axum::extract::Path(token): axum
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-/// 200 only when healthy, so an uptime check needs no JSON parsing.
-async fn health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let Some(deployment) = owner(&app, &headers) else {
-        return not_found();
-    };
-    let health = match app.source.services(deployment).await {
-        Ok(services) => model::health(&services),
-        Err(e) => {
-            eprintln!("health for {}: {:#}", deployment, e);
-            model::Health {
-                status: Status::Down,
-                converged: false,
-                version: None,
-                tls: None,
-                services_status: None,
-            }
-        }
-    };
-    let health = health_with_tls(&app, deployment, health).await;
-    let status = if health.status == Status::Healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    json_response(status, serde_json::to_value(&health).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -194,24 +256,33 @@ mod tests {
         }
     }
 
-    async fn get(services: Vec<ServiceState>, host: &str, path: &str) -> (StatusCode, serde_json::Value) {
-        let app = Arc::new(App {
-            owners: HashMap::from([
-                ("shop.example.com".to_string(), "prod".to_string()),
-                ("blog.example.com".to_string(), "blog".to_string()),
-            ]),
+    fn app_with(services: Vec<ServiceState>) -> App {
+        App {
+            deployments: vec!["prod".to_string(), "blog".to_string()],
             source: Box::new(Fake(services)),
             challenges: Default::default(),
             certs: None,
             api: None,
-        });
-        let response = router(app)
-            .oneshot(Request::get(path).header("host", host).body(Body::empty()).unwrap())
+        }
+    }
+
+    async fn ask(app: App, path: &str) -> (StatusCode, serde_json::Value) {
+        let response = router(Arc::new(app))
+            .oneshot(
+                Request::get(path)
+                    .header("host", "ops.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = response.status();
         let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn get(services: Vec<ServiceState>, path: &str) -> (StatusCode, serde_json::Value) {
+        ask(app_with(services), path).await
     }
 
     fn run<F: std::future::Future>(f: F) -> F::Output {
@@ -222,8 +293,8 @@ mod tests {
     }
 
     #[test]
-    fn version_answers_for_the_deployment_that_owns_the_host() {
-        let (status, body) = run(get(vec![api(2)], "Shop.Example.com:443", VERSION_PATH));
+    fn version_answers_for_the_named_deployment() {
+        let (status, body) = run(get(vec![api(2)], "/version/prod"));
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body,
@@ -232,24 +303,42 @@ mod tests {
     }
 
     #[test]
-    fn health_is_200_only_when_healthy() {
-        let (status, body) = run(get(vec![api(2)], "shop.example.com", HEALTH_PATH));
+    fn a_deployments_health_is_200_only_when_healthy() {
+        let (status, body) = run(get(vec![api(2)], "/health/prod"));
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body,
             json!({"status": "healthy", "converged": true, "version": "1.2.3"})
         );
 
-        let (status, body) = run(get(vec![api(1)], "shop.example.com", HEALTH_PATH));
+        let (status, body) = run(get(vec![api(1)], "/health/prod"));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "degraded");
     }
 
     #[test]
-    fn an_unknown_host_or_a_deployment_without_services_is_not_answered() {
-        let (status, _) = run(get(vec![api(2)], "other.example.com", VERSION_PATH));
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, body) = run(get(vec![api(2)], "blog.example.com", HEALTH_PATH));
+    fn an_unknown_deployment_is_a_404_and_a_known_one_without_services_is_down() {
+        assert_eq!(run(get(vec![api(2)], "/version/other")).0, StatusCode::NOT_FOUND);
+        assert_eq!(run(get(vec![api(2)], "/health/other")).0, StatusCode::NOT_FOUND);
+        let (status, body) = run(get(vec![api(2)], "/health/blog"));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "down");
+    }
+
+    #[test]
+    fn the_stack_health_covers_the_gateway_and_every_deployment() {
+        let (status, body) = run(get(vec![api(2)], "/health"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "status": "healthy",
+                "gateway": {"status": "healthy", "desired": 1, "running": 1},
+                "deployments": {"prod": {"status": "healthy", "converged": true, "version": "1.2.3"}},
+            })
+        );
+
+        let (status, body) = run(get(vec![api(0)], "/health"));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "down");
     }
@@ -257,7 +346,7 @@ mod tests {
     #[test]
     fn a_pending_challenge_is_answered_on_any_host_and_nothing_else() {
         let app = Arc::new(App {
-            owners: HashMap::new(),
+            deployments: vec![],
             source: Box::new(Fake(vec![])),
             challenges: Default::default(),
             certs: None,
@@ -304,7 +393,7 @@ mod tests {
     fn health_reports_the_certificates_of_the_deployments_domains() {
         let ask = |current: Option<(bool, u64)>| {
             let app = Arc::new(App {
-                owners: HashMap::from([("shop.example.com".to_string(), "prod".to_string())]),
+                deployments: vec!["prod".to_string()],
                 source: Box::new(Fake(vec![api(2)])),
                 challenges: Default::default(),
                 api: None,
@@ -317,8 +406,8 @@ mod tests {
             run(async move {
                 let response = router(app)
                     .oneshot(
-                        Request::get(HEALTH_PATH)
-                            .header("host", "shop.example.com")
+                        Request::get("/health/prod")
+                            .header("host", "ops.example.com")
                             .body(Body::empty())
                             .unwrap(),
                     )
@@ -352,7 +441,7 @@ mod tests {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
         let call = |api: Option<super::super::api::Api>, path: &'static str, token: Option<&'static str>| {
             let app = Arc::new(App {
-                owners: HashMap::new(),
+                deployments: vec![],
                 source: Box::new(Fake(vec![api_service()])),
                 challenges: Default::default(),
                 certs: None,
@@ -435,7 +524,7 @@ mod tests {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
         let call = |path: &'static str| {
             let app = Arc::new(App {
-                owners: HashMap::new(),
+                deployments: vec![],
                 source: Box::new(WithLogs),
                 challenges: Default::default(),
                 certs: None,

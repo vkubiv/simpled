@@ -1,7 +1,7 @@
 //! `simpled controller`: the environment's control-plane service, next to the
-//! gateway. It answers `/.well-known/simpled/version` and `/health` on every
-//! gateway host from the labels of the running services
-//! (`docs/design/controller.md`).
+//! gateway. It is served under `/simpled/` on the env spec's `controller.host`,
+//! and answers health, versions and the private API from the labels of the
+//! running services (`docs/design/controller.md`).
 
 pub mod acme;
 pub mod api;
@@ -20,20 +20,16 @@ use std::sync::Arc;
 pub struct Config {
     pub simpled_version: String,
     pub mode: source::Mode,
-    /// Which deployment answers on each domain.
-    pub owners: Vec<Owner>,
+    /// Each deployment of the env spec, to the domains its services are routed
+    /// on: the certificates its health reports on.
+    #[serde(default)]
+    pub domains: std::collections::BTreeMap<String, Vec<String>>,
     /// `controller` with a token: the private API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
     /// Swarm with `tls.letsencrypt`: the controller issues the gateway's certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme: Option<acme::AcmeConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Owner {
-    pub domain: String,
-    pub deployment: String,
 }
 
 /// The private API's tokens, as files the controller reads at start.
@@ -97,6 +93,10 @@ pub fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
+/// The path the gateway serves the controller under on `controller.host`, and
+/// strips before forwarding.
+pub const PREFIX: &str = "/simpled";
+
 /// Where the controller listens, inside its container.
 pub const PORT: u16 = 8080;
 /// The network only the gateway and the controller are on: app containers cannot
@@ -120,20 +120,33 @@ pub fn image_reference() -> String {
     format!("${{{}:-{}}}", IMAGE_VAR, image())
 }
 
-/// The controller's config for an environment: which deployment answers on each domain.
+/// Each deployment to the domains its services are routed on, sorted.
+pub fn deployment_domains(
+    spec: &crate::resolved_spec::EnvironmentResolvedSpec,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut domains: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for rule in &spec.ingress.rules {
+        for service in &rule.services {
+            let list = domains.entry(service.deployment_name.clone()).or_default();
+            if !list.contains(&rule.domain_name) {
+                list.push(rule.domain_name.clone());
+            }
+        }
+    }
+    // A deployment with no routes is still one of the env spec's.
+    domains.entry(spec.current_deployment.name.clone()).or_default();
+    for list in domains.values_mut() {
+        list.sort();
+    }
+    domains
+}
+
+/// The controller's config for an environment.
 pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: source::Mode) -> Config {
     Config {
         simpled_version: env!("CARGO_PKG_VERSION").to_string(),
         mode,
-        owners: spec
-            .ingress
-            .version_routes
-            .iter()
-            .map(|r| Owner {
-                domain: r.domain_name.clone(),
-                deployment: r.deployment_name.clone(),
-            })
-            .collect(),
+        domains: deployment_domains(spec),
         api: spec.ingress.controller.as_ref().and_then(|d| {
             let path =
                 |t: &Option<crate::resolved_spec::SecretResolvedSpec>, name: &str| t.as_ref().map(|_| token_path(name));
@@ -194,15 +207,14 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
         let docker = source::connect_docker()?;
         let certs = match &config.acme {
             Some(acme_config) => {
-                let mut domains_of: std::collections::HashMap<String, Vec<String>> = Default::default();
-                for owner in &config.owners {
-                    if acme_config.domains.contains(&owner.domain) {
-                        domains_of
-                            .entry(owner.deployment.clone())
-                            .or_default()
-                            .push(owner.domain.clone());
-                    }
-                }
+                let domains_of = config
+                    .domains
+                    .iter()
+                    .map(|(deployment, domains)| {
+                        let with_cert = domains.iter().filter(|d| acme_config.domains.contains(d)).cloned();
+                        (deployment.clone(), with_cert.collect())
+                    })
+                    .collect();
                 Some(http::Certs {
                     source: Box::new(source::CachedCerts::new(docker.clone())),
                     domains_of,
@@ -226,27 +238,23 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
             )
         });
         if api.is_some() {
-            eprintln!("Serving the private API under /api/v1");
+            eprintln!("Serving the private API under {}/api/v1", PREFIX);
         }
         let app = Arc::new(http::App {
             api,
             certs,
             challenges,
-            owners: config
-                .owners
-                .iter()
-                .map(|o| (o.domain.to_ascii_lowercase(), o.deployment.clone()))
-                .collect(),
+            deployments: config.domains.keys().cloned().collect(),
             source: Box::new(source::DockerSource::new(docker, config.mode)),
         });
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .with_context(|| format!("Cannot listen on {}", listen))?;
         eprintln!(
-            "simpled controller {} listening on {}, answering for {} domain(s)",
+            "simpled controller {} listening on {}, served under {}/",
             env!("CARGO_PKG_VERSION"),
             listen,
-            app.owners.len()
+            PREFIX
         );
         axum::serve(listener, http::router(app))
             .with_graceful_shutdown(shutdown())

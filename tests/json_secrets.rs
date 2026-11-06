@@ -13,6 +13,8 @@ fn two_deployments(prod_secret: &str) -> String {
     format!(
         r#"
 type: docker
+controller:
+  host: web
 gateway:
   hosts:
     web: shop.example.com

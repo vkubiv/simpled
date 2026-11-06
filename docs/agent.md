@@ -261,11 +261,13 @@ one inline with `extends:`.
   developer. Keep it out of version control.
 - A service override is validated strictly: an unknown field is an error, not something
   quietly dropped. A `prefixes` typo used to produce wrong routing in silence.
-- Every gateway host answers `/.well-known/simpled/version` with the deployed
-  application, version and deployment, and on Docker `/.well-known/simpled/health`
-  (200 only when healthy, plus `converged`). On Docker the environment's controller, next
-  to the gateway, answers them; on Kubernetes a `simpled-version-<deployment>`
-  service. Do not route those paths to an app service.
+- On Docker every env spec needs `controller: { host: <alias> }`. The environment's
+  controller is served under `/simpled/` on that host: `/simpled/health` (the whole
+  environment), `/simpled/health/<deployment>` (200 only when healthy, plus
+  `converged`), `/simpled/version/<deployment>`, and with a token the private API
+  under `/simpled/api/v1`. Do not route an app service at `/simpled` on that host. On
+  Kubernetes a `simpled-version-<deployment>` service answers
+  `/.well-known/simpled/version` on every host instead.
 - Several copies of one local stack need named ports: `ports:` at the top of
   `localenv.yaml`, `$port(name)` wherever a host port is written, and `--instance N`
   (or `.simpled-instance`) per copy. Above instance 0 a literal host port is an error.
