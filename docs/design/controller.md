@@ -230,7 +230,10 @@ Rules:
   A name the controller does not own is a 404, not a 403, so names cannot be probed.
 - A wrong or missing token gets 401 and a token without enough rights gets 403.
   Tokens are compared in constant time. Failed attempts are rate-limited per client
-  IP, using the real client IP that the gateway already forwards (`trusted_proxies`).
+  IP, using the real client IP that the gateway already forwards (`trusted_proxies`):
+  past the limit, every answer to that IP is delayed, growing with the failures, but a
+  valid token still passes, since behind a proxy the IP is everyone's and failing
+  attempts from there must not lock the token's holders out.
 - Logs are as sensitive as the secrets that leak into them. The reference must say
   that the read token is a credential, not a "viewer" password.
 - Rotation means redeploying with a new value. One token of each kind is enough for

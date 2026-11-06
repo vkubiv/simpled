@@ -700,7 +700,7 @@ The private API reports every deployment's services. Its routes exist only when 
 
 **The read token is a credential**, not a viewer password: what the API returns, and the logs it will serve, can be as sensitive as the secrets that leak into them. The tokens reach the controller as gateway Swarm secrets on Swarm, so every manager has them, and as files under `controller/` on standalone Docker; `controller.json` only says where they are.
 
-Every request needs `Authorization: Bearer <token>`. A missing or wrong token gets 401 and a token without enough rights 403. A client that fails 10 times within a minute gets 429 until the minute is over; the client is the address the gateway forwards.
+Every request needs `Authorization: Bearer <token>`. A missing or wrong token gets 401 and a token without enough rights 403. A client that fails 10 times within a minute gets 429 instead of 401 until the minute is over, and every answer to it, whatever token it presents, is delayed by a second per failure past the tenth, up to ten seconds; the client is the address the gateway forwards, so a valid token still passes, since behind a proxy the address is everyone's.
 
 | Route | Returns |
 |---|---|
@@ -1714,6 +1714,10 @@ The services decide: a deployment that is `degraded` only by its certificate (se
 the certificate's state is printed as a warning. `--insecure` accepts any
 certificate, for a Let's Encrypt staging or private ACME server.
 
+A deployment the controller does not know (its 404, `no such deployment`) fails the
+wait at once: waiting would not change it. Any other answer, including the gateway's
+own 404 before it routes the controller right after a deploy, is waited out.
+
 ### `simpled tls import`
 
 Turns the certificates in a Traefik `acme.json` into the Swarm gateway's certificate
@@ -1930,7 +1934,8 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
    then after an hour, doubling up to a day: the first failures are usually a gateway
    that is not routing the challenges yet, right after a deploy. The gateway is not
    updated while a deploy holds the deploy lock; the controller tries again 5 minutes
-   later. Once
+   later. A lock older than 30 minutes, or without the time it was taken, is one a
+   crashed deploy left and does not count, as for `deploy.sh`. Once
    a domain has an issued certificate, its placeholder and all but the two newest
    certificates are removed.
 

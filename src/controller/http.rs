@@ -60,8 +60,12 @@ pub(crate) fn json_response(status: StatusCode, body: serde_json::Value) -> Resp
         .into_response()
 }
 
+/// The `error` of the 404 for a deployment the controller does not know, which
+/// `simpled wait` tells from the gateway's own 404.
+pub const NO_SUCH_DEPLOYMENT: &str = "no such deployment";
+
 fn no_such_deployment() -> Response {
-    json_response(StatusCode::NOT_FOUND, json!({"error": "no such deployment"}))
+    json_response(StatusCode::NOT_FOUND, json!({"error": NO_SUCH_DEPLOYMENT}))
 }
 
 /// 200 only when healthy, so an uptime check needs no JSON parsing.
@@ -226,8 +230,9 @@ mod tests {
             Box::pin(async move { Ok(services) })
         }
 
-        fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
-            Box::pin(async move { Ok(vec!["prod".to_string()]) })
+        fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>> {
+            let all = BTreeMap::from([("prod".to_string(), self.0.clone())]);
+            Box::pin(async move { Ok(all) })
         }
     }
 
@@ -486,8 +491,8 @@ mod tests {
         fn services<'a>(&'a self, _d: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>> {
             Box::pin(async { Ok(vec![]) })
         }
-        fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
-            Box::pin(async { Ok(vec![]) })
+        fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>> {
+            Box::pin(async { Ok(BTreeMap::new()) })
         }
         fn logs<'a>(
             &'a self,

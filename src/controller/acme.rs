@@ -103,9 +103,10 @@ pub fn backoff(failures: u32, jitter: f64) -> Duration {
 /// stack deploy` of the gateway's stack, which an update of the gateway from
 /// here would race. One of the two would fail with "update out of sequence";
 /// for deploy.sh that is the end of the deploy. A lock older than deploy.sh's
-/// own stale limit is one a crashed deploy left behind, and does not count.
+/// own stale limit is one a crashed deploy left behind, and does not count; so
+/// does one without a readable `simpled.lock.since`, which deploy.sh replaces.
 async fn deploy_in_progress(docker: &Docker) -> bool {
-    use crate::deploy_steps::{LOCK_NAME, LOCK_SINCE_LABEL, LOCK_STALE_AFTER};
+    use crate::deploy_steps::LOCK_NAME;
     let configs = docker
         .list_configs(Some(ListConfigsOptions {
             filters: Some(HashMap::from([("name".to_string(), vec![LOCK_NAME.to_string()])])),
@@ -118,7 +119,13 @@ async fn deploy_in_progress(docker: &Docker) -> bool {
             return false;
         }
     };
-    let now = super::unix_now();
+    lock_held(&configs, super::unix_now())
+}
+
+/// Whether one of the configs is the deploy lock, taken less than the stale
+/// limit ago. Without a readable time it is as old as it gets, as for deploy.sh.
+fn lock_held(configs: &[bollard::models::Config], now: u64) -> bool {
+    use crate::deploy_steps::{LOCK_NAME, LOCK_SINCE_LABEL, LOCK_STALE_AFTER};
     configs.iter().any(|c| {
         let Some(spec) = c.spec.as_ref() else { return false };
         if spec.name.as_deref() != Some(LOCK_NAME) {
@@ -129,7 +136,7 @@ async fn deploy_in_progress(docker: &Docker) -> bool {
             .as_ref()
             .and_then(|l| l.get(LOCK_SINCE_LABEL))
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(now);
+            .unwrap_or(0);
         now.saturating_sub(since) < LOCK_STALE_AFTER.as_secs()
     })
 }
@@ -458,10 +465,23 @@ pub fn repoint(spec: &mut ServiceSpec, current: &[(String, String, String)]) -> 
     result
 }
 
+/// What `roll_out` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollOut {
+    /// The gateway is on every current certificate already.
+    Current,
+    /// This many mounts were moved.
+    Moved(usize),
+    /// Mounts have to move, but a deploy is running; tried again soon.
+    Deferred,
+}
+
 /// Moves the gateway onto each domain's current certificate where it is not on
 /// it yet. Every round checks this, not only a round that issued, so an update
-/// that failed is made in a later one. Returns how many mounts moved.
-async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Result<usize> {
+/// that failed is made in a later one. The deploy lock is read only once the
+/// update is known to be needed, and right before it, so a lock taken in
+/// between has the smallest window there can be without a retry in deploy.sh.
+async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Result<RollOut> {
     let service = docker
         .inspect_service(GATEWAY_SERVICE, None)
         .await
@@ -482,7 +502,10 @@ async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Resu
         bail!("the gateway mounts none of the issued certificates; is the simpled stack deployed?");
     }
     if repointed.changed == 0 {
-        return Ok(0);
+        return Ok(RollOut::Current);
+    }
+    if deploy_in_progress(docker).await {
+        return Ok(RollOut::Deferred);
     }
     docker
         .update_service(
@@ -496,7 +519,7 @@ async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Resu
         )
         .await
         .context("Cannot update the gateway")?;
-    Ok(repointed.changed)
+    Ok(RollOut::Moved(repointed.changed))
 }
 
 async fn prune(docker: &Docker, domain: &str) {
@@ -534,6 +557,8 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
             };
             let best = current(&secrets);
             if !needs_certificate(best, now) {
+                // Issued meanwhile, by another controller: its retries are over.
+                failures.remove(domain);
                 if let Some(best) = best {
                     issued.push((domain.clone(), best.id.clone(), best.name.clone()));
                 }
@@ -605,24 +630,23 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
         }
         let mut next_check = CHECK_EVERY;
         if !issued.is_empty() {
-            if deploy_in_progress(&docker).await {
-                eprintln!(
-                    "acme: a deploy is running; the gateway is checked against the certificates in {} minutes",
-                    ROLL_OUT_RETRY.as_secs() / 60
-                );
-                next_check = ROLL_OUT_RETRY;
-            } else {
-                match roll_out(&docker, &issued).await {
-                    Ok(0) => {}
-                    Ok(moved) => eprintln!("acme: rolling the gateway onto {} new certificate(s)", moved),
-                    Err(e) => {
-                        eprintln!(
-                            "acme: {:#}. Trying again in {} minutes.",
-                            e,
-                            ROLL_OUT_RETRY.as_secs() / 60
-                        );
-                        next_check = ROLL_OUT_RETRY;
-                    }
+            match roll_out(&docker, &issued).await {
+                Ok(RollOut::Current) => {}
+                Ok(RollOut::Moved(moved)) => eprintln!("acme: rolling the gateway onto {} new certificate(s)", moved),
+                Ok(RollOut::Deferred) => {
+                    eprintln!(
+                        "acme: a deploy is running; the gateway is moved onto the new certificate(s) in {} minutes",
+                        ROLL_OUT_RETRY.as_secs() / 60
+                    );
+                    next_check = ROLL_OUT_RETRY;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "acme: {:#}. Trying again in {} minutes.",
+                        e,
+                        ROLL_OUT_RETRY.as_secs() / 60
+                    );
+                    next_check = ROLL_OUT_RETRY;
                 }
             }
         }
@@ -634,9 +658,17 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
             next_check = next_check.min(ACCOUNT_RETRY);
         }
         // A domain whose retry is due before the next check is not kept waiting.
+        // A retry already due belongs to a domain this round could not get to
+        // (its secrets did not list, or there was no account): it waits for the
+        // check that handles that, not a round every second.
         let now = super::unix_now();
-        if let Some(due) = failures.values().map(|(_, at)| at.saturating_sub(now)).min() {
-            next_check = next_check.min(Duration::from_secs(due.max(1)));
+        if let Some(due) = failures
+            .values()
+            .filter(|(_, at)| *at > now)
+            .map(|(_, at)| at - now)
+            .min()
+        {
+            next_check = next_check.min(Duration::from_secs(due));
         }
         tokio::time::sleep(next_check).await;
     }
@@ -658,6 +690,29 @@ mod tests {
     }
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_deploy_lock_counts_while_fresh_and_only_with_its_time() {
+        use crate::deploy_steps::{LOCK_NAME, LOCK_SINCE_LABEL, LOCK_STALE_AFTER};
+        let lock = |name: &str, since: Option<&str>| bollard::models::Config {
+            spec: Some(ConfigSpec {
+                name: Some(name.to_string()),
+                labels: since.map(|s| HashMap::from([(LOCK_SINCE_LABEL.to_string(), s.to_string())])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fresh = (NOW - 60).to_string();
+        let stale = (NOW - LOCK_STALE_AFTER.as_secs()).to_string();
+        assert!(lock_held(&[lock(LOCK_NAME, Some(&fresh))], NOW));
+        assert!(!lock_held(&[lock(LOCK_NAME, Some(&stale))], NOW));
+        // Without its time, or with one that does not parse: left by something
+        // older, and replaced by deploy.sh; it does not hold the gateway back.
+        assert!(!lock_held(&[lock(LOCK_NAME, None)], NOW));
+        assert!(!lock_held(&[lock(LOCK_NAME, Some("soon"))], NOW));
+        // The name filter matches prefixes too.
+        assert!(!lock_held(&[lock("simpled_deploy_lock_other", Some(&fresh))], NOW));
+    }
     const DAY: u64 = 24 * 3600;
 
     #[test]

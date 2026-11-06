@@ -19,6 +19,14 @@ use std::time::{Duration, Instant};
 /// Failed attempts a client may make in `FAILURE_WINDOW` before it is refused.
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// How long a client past `MAX_FAILURES` waits for each answer, per failure
+/// beyond the limit, and at most. A valid token still passes after the wait:
+/// the client is the address the gateway saw, which behind a proxy is
+/// everyone's, and the token's holders must not be locked out. The wait is
+/// what makes the failures cost anything; the length of the token is what
+/// makes guessing hopeless.
+const PENALTY_PER_FAILURE: Duration = Duration::from_secs(1);
+const MAX_PENALTY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Access {
@@ -120,11 +128,21 @@ impl IntoResponse for Denied {
     }
 }
 
+/// How long a client past `MAX_FAILURES` waits before its request is looked
+/// at; `None` for one within the limit. Taken before `authorize`, by the
+/// handler, since the wait is async.
+pub fn penalty(api: &Api, headers: &HeaderMap) -> Option<Duration> {
+    let now = Instant::now();
+    let mut failures = api.failures.lock().ok()?;
+    failures.retain(|_, (_, since)| now.duration_since(*since) < FAILURE_WINDOW);
+    let (count, _) = failures.get(&client(headers))?;
+    let beyond = count.checked_sub(MAX_FAILURES)?;
+    Some((PENALTY_PER_FAILURE * (beyond + 1)).min(MAX_PENALTY))
+}
+
 /// 401 without a valid token, 403 with one that does not reach `needed`, and
 /// 429 instead of 401 for a client whose attempts keep failing. A valid token
-/// always passes: the client is the address the gateway saw, which behind a
-/// proxy is everyone's, and failing attempts from there must not lock the
-/// token's holders out.
+/// always passes, after the `penalty` the handler made the client wait.
 pub fn authorize(api: &Api, headers: &HeaderMap, needed: Access) -> Result<Access, Denied> {
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -189,7 +207,7 @@ async fn tasks(
     headers: HeaderMap,
     Path((deployment, service)): Path<(String, String)>,
 ) -> Response {
-    if let Err(denied) = guard(&app, &headers) {
+    if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
     match app.source.tasks(&deployment, &service).await {
@@ -207,7 +225,7 @@ async fn logs(
     Path((deployment, service)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(denied) = guard(&app, &headers) {
+    if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
     let now = i64::try_from(super::unix_now()).unwrap_or(i64::MAX);
@@ -233,7 +251,7 @@ async fn logs(
 /// The gateway's tasks per node, and, where the controller issues them, the
 /// certificates of its domains with their expiry.
 async fn gateway(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(denied) = guard(&app, &headers) {
+    if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
     let mut body = match app.source.gateway().await {
@@ -259,7 +277,7 @@ async fn gateway(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 /// The swarm's nodes: role, availability, state and labels. 404 on standalone
 /// Docker, which has none.
 async fn nodes(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(denied) = guard(&app, &headers) {
+    if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
     match app.source.nodes().await {
@@ -269,15 +287,18 @@ async fn nodes(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     }
 }
 
-fn guard(app: &App, headers: &HeaderMap) -> Result<(), Denied> {
+async fn guard(app: &App, headers: &HeaderMap) -> Result<(), Denied> {
     let api = app.api.as_ref().ok_or(Denied(StatusCode::NOT_FOUND, "not found"))?;
+    if let Some(wait) = penalty(api, headers) {
+        tokio::time::sleep(wait).await;
+    }
     authorize(api, headers, Access::Read).map(|_| ())
 }
 
 /// Every deployment: its version, health and services, for a dashboard or
 /// `simpled status`.
 async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(denied) = guard(&app, &headers) {
+    if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
     // One listing of every service; the certificates are read at once after it,
@@ -312,7 +333,7 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 /// One deployment's services. A deployment the controller does not know is a 404,
 /// the same as a name it may not see, so names cannot be probed.
 async fn services(State(app): State<Arc<App>>, headers: HeaderMap, Path(deployment): Path<String>) -> Response {
-    if let Err(denied) = guard(&app, &headers) {
+    if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
     let services = match app.source.services(&deployment).await {
@@ -394,6 +415,33 @@ mod tests {
         assert!(authorize(&api, &headers(Some(READ), "2.2.2.2"), Access::Read).is_ok());
         // Another client is not affected.
         assert!(authorize(&api, &headers(Some(READ), "3.3.3.3"), Access::Read).is_ok());
+    }
+
+    #[test]
+    fn a_client_past_the_limit_waits_longer_for_each_answer() {
+        let api = Api::new(Some(READ.to_string()), None).unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert_eq!(penalty(&api, &headers(Some("wrong"), "2.2.2.2")), None);
+            let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
+        }
+        // Whatever it presents, including the valid token.
+        assert_eq!(
+            penalty(&api, &headers(Some(READ), "2.2.2.2")),
+            Some(PENALTY_PER_FAILURE)
+        );
+        for _ in 0..3 {
+            let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
+        }
+        assert_eq!(
+            penalty(&api, &headers(Some("wrong"), "2.2.2.2")),
+            Some(PENALTY_PER_FAILURE * 4)
+        );
+        for _ in 0..20 {
+            let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
+        }
+        assert_eq!(penalty(&api, &headers(Some("wrong"), "2.2.2.2")), Some(MAX_PENALTY));
+        // Another client is not affected.
+        assert_eq!(penalty(&api, &headers(Some(READ), "3.3.3.3")), None);
     }
 
     #[test]
