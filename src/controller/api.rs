@@ -20,13 +20,22 @@ use std::time::{Duration, Instant};
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// How long a client past `MAX_FAILURES` waits for each answer, per failure
-/// beyond the limit, and at most. A valid token still passes after the wait:
-/// the client is the address the gateway saw, which behind a proxy is
-/// everyone's, and the token's holders must not be locked out. The wait is
-/// what makes the failures cost anything; the length of the token is what
-/// makes guessing hopeless.
+/// beyond the limit, and at most. The client's requests wait one at a time, so
+/// the wait bounds its guesses however many connections it opens. A valid
+/// token still passes after the wait: the client is the address the gateway
+/// saw, which behind a proxy is everyone's, and the token's holders must not be
+/// locked out. The wait is what makes the failures cost anything; the length
+/// of the token is what makes guessing hopeless.
 const PENALTY_PER_FAILURE: Duration = Duration::from_secs(1);
 const MAX_PENALTY: Duration = Duration::from_secs(10);
+
+/// A client's failed attempts, from the first in the window.
+struct Failing {
+    count: u32,
+    since: Instant,
+    /// Held by one of its requests at a time, while that one waits.
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Access {
@@ -37,8 +46,7 @@ pub enum Access {
 pub struct Api {
     read_token: Option<String>,
     manage_token: Option<String>,
-    /// Client to (failures, start of the window).
-    failures: Mutex<HashMap<String, (u32, Instant)>>,
+    failures: Mutex<HashMap<String, Failing>>,
 }
 
 impl Api {
@@ -129,15 +137,16 @@ impl IntoResponse for Denied {
 }
 
 /// How long a client past `MAX_FAILURES` waits before its request is looked
-/// at; `None` for one within the limit. Taken before `authorize`, by the
-/// handler, since the wait is async.
-pub fn penalty(api: &Api, headers: &HeaderMap) -> Option<Duration> {
+/// at, and the gate its requests wait at one at a time; `None` for a client
+/// within the limit. Taken before `authorize`, by the handler, since the wait
+/// is async.
+pub fn penalty(api: &Api, headers: &HeaderMap) -> Option<(Duration, Arc<tokio::sync::Mutex<()>>)> {
     let now = Instant::now();
     let mut failures = api.failures.lock().ok()?;
-    failures.retain(|_, (_, since)| now.duration_since(*since) < FAILURE_WINDOW);
-    let (count, _) = failures.get(&client(headers))?;
-    let beyond = count.checked_sub(MAX_FAILURES)?;
-    Some((PENALTY_PER_FAILURE * (beyond + 1)).min(MAX_PENALTY))
+    failures.retain(|_, f| now.duration_since(f.since) < FAILURE_WINDOW);
+    let failing = failures.get(&client(headers))?;
+    let beyond = failing.count.checked_sub(MAX_FAILURES).filter(|b| *b > 0)?;
+    Some(((PENALTY_PER_FAILURE * beyond).min(MAX_PENALTY), failing.gate.clone()))
 }
 
 /// 401 without a valid token, 403 with one that does not reach `needed`, and
@@ -167,10 +176,14 @@ pub fn authorize(api: &Api, headers: &HeaderMap, needed: Access) -> Result<Acces
                 .failures
                 .lock()
                 .map_err(|_| Denied(StatusCode::INTERNAL_SERVER_ERROR, "locked"))?;
-            failures.retain(|_, (_, since)| now.duration_since(*since) < FAILURE_WINDOW);
-            let entry = failures.entry(client(headers)).or_insert((0, now));
-            entry.0 += 1;
-            if entry.0 > MAX_FAILURES {
+            failures.retain(|_, f| now.duration_since(f.since) < FAILURE_WINDOW);
+            let failing = failures.entry(client(headers)).or_insert_with(|| Failing {
+                count: 0,
+                since: now,
+                gate: Default::default(),
+            });
+            failing.count += 1;
+            if failing.count > MAX_FAILURES {
                 return Err(Denied(
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many failed attempts; try again in a minute",
@@ -289,7 +302,8 @@ async fn nodes(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 
 async fn guard(app: &App, headers: &HeaderMap) -> Result<(), Denied> {
     let api = app.api.as_ref().ok_or(Denied(StatusCode::NOT_FOUND, "not found"))?;
-    if let Some(wait) = penalty(api, headers) {
+    if let Some((wait, gate)) = penalty(api, headers) {
+        let _one_at_a_time = gate.lock().await;
         tokio::time::sleep(wait).await;
     }
     authorize(api, headers, Access::Read).map(|_| ())
@@ -420,28 +434,33 @@ mod tests {
     #[test]
     fn a_client_past_the_limit_waits_longer_for_each_answer() {
         let api = Api::new(Some(READ.to_string()), None).unwrap();
+        let wait = |ip: &str| penalty(&api, &headers(Some("wrong"), ip)).map(|(wait, _)| wait);
+        // Up to and including the tenth failure: no wait.
         for _ in 0..MAX_FAILURES {
-            assert_eq!(penalty(&api, &headers(Some("wrong"), "2.2.2.2")), None);
+            assert_eq!(wait("2.2.2.2"), None);
             let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
         }
-        // Whatever it presents, including the valid token.
+        assert_eq!(wait("2.2.2.2"), None);
+        let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
+        // From the eleventh: a second per failure past the tenth, whatever the
+        // client presents, including the valid token.
         assert_eq!(
-            penalty(&api, &headers(Some(READ), "2.2.2.2")),
+            penalty(&api, &headers(Some(READ), "2.2.2.2")).map(|(wait, _)| wait),
             Some(PENALTY_PER_FAILURE)
         );
         for _ in 0..3 {
             let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
         }
-        assert_eq!(
-            penalty(&api, &headers(Some("wrong"), "2.2.2.2")),
-            Some(PENALTY_PER_FAILURE * 4)
-        );
+        assert_eq!(wait("2.2.2.2"), Some(PENALTY_PER_FAILURE * 4));
         for _ in 0..20 {
             let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
         }
-        assert_eq!(penalty(&api, &headers(Some("wrong"), "2.2.2.2")), Some(MAX_PENALTY));
-        // Another client is not affected.
-        assert_eq!(penalty(&api, &headers(Some(READ), "3.3.3.3")), None);
+        assert_eq!(wait("2.2.2.2"), Some(MAX_PENALTY));
+        // Its requests share one gate; another client is not affected.
+        let (_, gate) = penalty(&api, &headers(Some("wrong"), "2.2.2.2")).unwrap();
+        let (_, again) = penalty(&api, &headers(Some(READ), "2.2.2.2")).unwrap();
+        assert!(Arc::ptr_eq(&gate, &again));
+        assert_eq!(wait("3.3.3.3"), None);
     }
 
     #[test]

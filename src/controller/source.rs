@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -66,16 +67,26 @@ pub trait CertSource: Send + Sync {
 /// Domain to its current certificate: whether it was issued, and its expiry.
 type CurrentCerts = HashMap<String, (bool, u64)>;
 
+/// The one listing in flight, which every lookup that arrives meanwhile awaits.
+type Listing = futures_util::future::Shared<BoxFuture<'static, Result<Arc<CurrentCerts>, Arc<anyhow::Error>>>>;
+
 /// Every domain's current certificate from one listing of the certificate
 /// secrets, kept for `CACHE_FOR`: they change at most once a round of the ACME
 /// task, and `/health` may be polled often, for many domains.
 pub struct CachedCerts {
     docker: Docker,
+    /// Locked only to read or replace what is here, never across the listing:
+    /// lookups that arrive together, as one `/health` makes for every domain,
+    /// share the one listing in flight, and when it fails they all fail at once
+    /// instead of each listing in turn.
+    state: std::sync::Mutex<CertsState>,
+}
+
+#[derive(Default)]
+struct CertsState {
     /// Shared, so each lookup takes a reference rather than a copy of the map.
-    /// Held while the secrets are listed: lookups that arrive together, as one
-    /// `/health` makes for every domain, wait for that one listing instead of
-    /// each making their own.
-    cache: tokio::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<CurrentCerts>)>>,
+    cached: Option<(std::time::Instant, Arc<CurrentCerts>)>,
+    listing: Option<Listing>,
 }
 
 impl CachedCerts {
@@ -84,32 +95,61 @@ impl CachedCerts {
     pub fn new(docker: Docker) -> Self {
         CachedCerts {
             docker,
-            cache: tokio::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(CertsState::default()),
         }
     }
 
-    async fn all(&self) -> Result<std::sync::Arc<CurrentCerts>> {
-        let mut cache = self.cache.lock().await;
-        if let Some((at, map)) = cache.as_ref() {
-            if at.elapsed() < Self::CACHE_FOR {
-                return Ok(map.clone());
+    fn state(&self) -> std::sync::MutexGuard<'_, CertsState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn all(&self) -> Result<Arc<CurrentCerts>> {
+        use futures_util::FutureExt;
+        let listing = {
+            let mut state = self.state();
+            if let Some((at, map)) = state.cached.as_ref() {
+                if at.elapsed() < Self::CACHE_FOR {
+                    return Ok(map.clone());
+                }
+            }
+            match &state.listing {
+                Some(listing) => listing.clone(),
+                None => {
+                    let docker = self.docker.clone();
+                    let listing: Listing = async move { Self::list(docker).await.map(Arc::new).map_err(Arc::new) }
+                        .boxed()
+                        .shared();
+                    state.listing = Some(listing.clone());
+                    listing
+                }
+            }
+        };
+        let result = listing.clone().await;
+        let mut state = self.state();
+        // The first lookup back from this listing records it; a later listing
+        // another lookup started meanwhile is left alone.
+        if state.listing.as_ref().is_some_and(|l| l.ptr_eq(&listing)) {
+            state.listing = None;
+            if let Ok(map) = &result {
+                state.cached = Some((std::time::Instant::now(), map.clone()));
             }
         }
-        let found = super::acme::list_cert_secrets(&self.docker, crate::gateway_tls::labels::DOMAIN).await?;
+        result.map_err(|e| anyhow::anyhow!("{:#}", e))
+    }
+
+    async fn list(docker: Docker) -> Result<CurrentCerts> {
+        let found = super::acme::list_cert_secrets(&docker, crate::gateway_tls::labels::DOMAIN).await?;
         let mut by_domain: HashMap<String, Vec<crate::gateway_tls::CertSecret>> = HashMap::new();
         for (domain, secret) in found {
             by_domain.entry(domain).or_default().push(secret);
         }
-        let map: CurrentCerts = by_domain
+        Ok(by_domain
             .into_iter()
             .filter_map(|(domain, secrets)| {
                 let current = crate::gateway_tls::current(&secrets).map(|c| (c.acme, c.not_after))?;
                 Some((domain, current))
             })
-            .collect();
-        let map = std::sync::Arc::new(map);
-        *cache = Some((std::time::Instant::now(), map.clone()));
-        Ok(map)
+            .collect())
     }
 }
 

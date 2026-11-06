@@ -55,9 +55,6 @@ const FIRST_CHECK_AFTER: Duration = Duration::from_secs(20);
 /// sooner than the next check, since the certificate is ready and only has to
 /// be mounted.
 const ROLL_OUT_RETRY: Duration = Duration::from_secs(300);
-/// After the CA could not be reached for the account: sooner than the next
-/// check, since right after a deploy the network may just not be up yet.
-const ACCOUNT_RETRY: Duration = Duration::from_secs(300);
 
 pub fn needs_certificate(current: Option<&CertSecret>, now: u64) -> bool {
     match current {
@@ -88,7 +85,9 @@ pub fn stale(secrets: &[CertSecret]) -> Vec<&CertSecret> {
 /// retry in step. The first failures are mostly a gateway that does not route
 /// the challenges yet, right after a deploy, so they are retried soon; five
 /// tries in the first hour stay within Let's Encrypt's limit of five failed
-/// validations per hour.
+/// validations per hour. The account's failures follow the same ladder: seven
+/// tries in three hours stay within its limit of ten new accounts per IP, when
+/// each try made one at the CA that could not be saved.
 pub fn backoff(failures: u32, jitter: f64) -> Duration {
     let n = failures.max(1);
     let seconds = if n <= 5 {
@@ -137,7 +136,7 @@ fn lock_held(configs: &[bollard::models::Config], now: u64) -> bool {
             .and_then(|l| l.get(LOCK_SINCE_LABEL))
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-        now.saturating_sub(since) < LOCK_STALE_AFTER.as_secs()
+        !crate::deploy_steps::lock_is_stale(since, now, LOCK_STALE_AFTER)
     })
 }
 
@@ -538,8 +537,10 @@ async fn prune(docker: &Docker, domain: &str) {
 pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
     let mut account: Option<Account> = None;
     let mut failures: HashMap<String, (u32, u64)> = HashMap::new();
+    let mut account_failures: u32 = 0;
     tokio::time::sleep(FIRST_CHECK_AFTER).await;
     loop {
+        let round_started = super::unix_now();
         // Each domain's issued certificate, as (domain, secret id, secret name).
         let mut issued = Vec::new();
         let mut account_failed = false;
@@ -569,6 +570,11 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
             if let Some(best) = best.filter(|b| b.acme) {
                 issued.push((domain.clone(), best.id.clone(), best.name.clone()));
             }
+            // Without an account nothing is issued this round; the gateway is
+            // still moved onto what every domain has.
+            if account_failed {
+                continue;
+            }
             eprintln!("acme: requesting a certificate for {}", domain);
             let mut result = None;
             // Twice at most: once more, with a new account, when the saved one
@@ -576,7 +582,10 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
             for attempt in 0..2 {
                 if account.is_none() {
                     match self::account(&docker, &config).await {
-                        Ok(a) => account = Some(a),
+                        Ok(a) => {
+                            account = Some(a);
+                            account_failures = 0;
+                        }
                         Err(e) => {
                             eprintln!("acme: {:#}", e);
                             break;
@@ -603,10 +612,9 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
                 result = Some(attempted);
                 break;
             }
-            // No account: nothing can be issued this round; it is tried again soon.
             let Some(result) = result else {
                 account_failed = true;
-                break;
+                continue;
             };
             match result {
                 Ok((id, name)) => {
@@ -651,21 +659,24 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
             }
         }
         if account_failed {
+            account_failures += 1;
+            let wait = backoff(account_failures, jitter());
             eprintln!(
                 "acme: without an account nothing is issued; trying again in {} minutes",
-                ACCOUNT_RETRY.as_secs() / 60
+                wait.as_secs() / 60
             );
-            next_check = next_check.min(ACCOUNT_RETRY);
+            next_check = next_check.min(wait);
         }
-        // A domain whose retry is due before the next check is not kept waiting.
-        // A retry already due belongs to a domain this round could not get to
-        // (its secrets did not list, or there was no account): it waits for the
-        // check that handles that, not a round every second.
+        // A domain whose retry is due before the next check is not kept waiting,
+        // nor one whose retry came due while the round was busy with the others.
+        // A retry that was due before the round began belongs to a domain the
+        // round could not get to (its secrets did not list): it waits for the
+        // next check, not a round every second.
         let now = super::unix_now();
         if let Some(due) = failures
             .values()
-            .filter(|(_, at)| *at > now)
-            .map(|(_, at)| at - now)
+            .filter(|(_, at)| *at > round_started)
+            .map(|(_, at)| at.saturating_sub(now).max(1))
             .min()
         {
             next_check = next_check.min(Duration::from_secs(due));

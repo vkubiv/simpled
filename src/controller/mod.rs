@@ -148,7 +148,6 @@ pub fn deployment_domains(
     for deployment in &spec.ingress.deployments {
         domains.entry(deployment.clone()).or_default();
     }
-    domains.entry(spec.current_deployment.name.clone()).or_default();
     for list in domains.values_mut() {
         list.sort();
     }
@@ -291,4 +290,79 @@ async fn shutdown() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolved_spec::{
+        DeploymentResolvedSpec, EnvironmentResolvedSpec, IngressResolvedSpec, IngressRule, IngressToServiceRule,
+    };
+    use crate::spec::{DeploymentEnvType, DockerSpecificSpec};
+
+    #[test]
+    fn every_deployment_is_listed_with_the_domains_its_services_are_routed_on() {
+        let to = |deployment: &str, service: &str| IngressToServiceRule {
+            service_name: service.to_string(),
+            deployment_name: deployment.to_string(),
+            port: 80,
+            prefix: "/".to_string(),
+            strip_prefix: false,
+            body_limit: None,
+        };
+        let rule = |domain: &str, services: Vec<IngressToServiceRule>| IngressRule {
+            domain_name: domain.to_string(),
+            services,
+        };
+        let spec = EnvironmentResolvedSpec {
+            ports: Default::default(),
+            env_type: DeploymentEnvType::Docker(DockerSpecificSpec {
+                swarm_mode: true,
+                multi_node: false,
+                target_platform: Default::default(),
+            }),
+            ingress: IngressResolvedSpec {
+                // Every deployment of the env spec, workers (no routes) included.
+                deployments: vec!["prod".to_string(), "staging".to_string(), "workers".to_string()],
+                version_routes: vec![],
+                version_document: None,
+                controller: None,
+                trusted_proxies: Vec::new(),
+                global: false,
+                placement: None,
+                name: "gateway".to_string(),
+                tls: None,
+                domains: vec![],
+                rules: vec![
+                    rule("www.example.com", vec![to("prod", "web"), to("prod", "api")]),
+                    rule("api.example.com", vec![to("prod", "api")]),
+                    rule("staging.example.com", vec![to("staging", "web")]),
+                ],
+                redirects: vec![],
+            },
+            current_deployment: DeploymentResolvedSpec {
+                name: "workers".to_string(),
+                application_name: "shop".to_string(),
+                application_version: "1.0.0".to_string(),
+                configs: vec![],
+                secrets: vec![],
+                services: vec![],
+                volumes: vec![],
+                volume_bindings: Default::default(),
+                host_environment: vec![],
+            },
+        };
+        let domains = deployment_domains(&spec);
+        assert_eq!(
+            domains,
+            std::collections::BTreeMap::from([
+                (
+                    "prod".to_string(),
+                    vec!["api.example.com".to_string(), "www.example.com".to_string()]
+                ),
+                ("staging".to_string(), vec!["staging.example.com".to_string()]),
+                ("workers".to_string(), vec![]),
+            ])
+        );
+    }
 }
