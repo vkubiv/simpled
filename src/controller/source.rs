@@ -26,6 +26,19 @@ pub trait Source: Send + Sync {
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>>;
     /// Every deployment with a labelled service, sorted.
     fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>>;
+    /// Every deployment's services, keyed by deployment: what `/health` and
+    /// `/api/v1/status` read, from one listing where the source can. Here, one
+    /// per deployment.
+    fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>> {
+        Box::pin(async move {
+            let mut all = BTreeMap::new();
+            for deployment in self.deployments().await? {
+                let services = self.services(&deployment).await?;
+                all.insert(deployment, services);
+            }
+            Ok(all)
+        })
+    }
 
     /// A service's tasks (Swarm) or containers (standalone). `None` when the
     /// deployment has no such service.
@@ -71,7 +84,10 @@ type CurrentCerts = HashMap<String, (bool, u64)>;
 pub struct CachedCerts {
     docker: Docker,
     /// Shared, so each lookup takes a reference rather than a copy of the map.
-    cache: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<CurrentCerts>)>>,
+    /// Held while the secrets are listed: lookups that arrive together, as one
+    /// `/health` makes for every domain, wait for that one listing instead of
+    /// each making their own.
+    cache: tokio::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<CurrentCerts>)>>,
 }
 
 impl CachedCerts {
@@ -80,21 +96,16 @@ impl CachedCerts {
     pub fn new(docker: Docker) -> Self {
         CachedCerts {
             docker,
-            cache: std::sync::Mutex::new(None),
+            cache: tokio::sync::Mutex::new(None),
         }
     }
 
-    fn cached(&self) -> Option<std::sync::Arc<CurrentCerts>> {
-        let cache = self.cache.lock().ok()?;
-        cache
-            .as_ref()
-            .filter(|(at, _)| at.elapsed() < Self::CACHE_FOR)
-            .map(|(_, map)| map.clone())
-    }
-
     async fn all(&self) -> Result<std::sync::Arc<CurrentCerts>> {
-        if let Some(map) = self.cached() {
-            return Ok(map);
+        let mut cache = self.cache.lock().await;
+        if let Some((at, map)) = cache.as_ref() {
+            if at.elapsed() < Self::CACHE_FOR {
+                return Ok(map.clone());
+            }
         }
         let found = super::acme::list_cert_secrets(&self.docker, crate::gateway_tls::labels::DOMAIN).await?;
         let mut by_domain: HashMap<String, Vec<crate::gateway_tls::CertSecret>> = HashMap::new();
@@ -109,9 +120,7 @@ impl CachedCerts {
             })
             .collect();
         let map = std::sync::Arc::new(map);
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = Some((std::time::Instant::now(), map.clone()));
-        }
+        *cache = Some((std::time::Instant::now(), map.clone()));
         Ok(map)
     }
 }
@@ -236,6 +245,51 @@ impl DockerSource {
             .context("Cannot list the nodes")?;
         Ok(inspect::tasks_json(&tasks, &inspect::hostnames(&nodes)))
     }
+}
+
+/// Every labelled service: the filter of `all_services` and `deployments`.
+fn any_service_filter() -> HashMap<String, Vec<String>> {
+    HashMap::from([("label".to_string(), vec![labels::SERVICE.to_string()])])
+}
+
+/// The deployment a labelled object belongs to.
+fn deployment_of(labels_map: &HashMap<String, String>) -> Option<&String> {
+    labels_map.get(labels::DEPLOYMENT)
+}
+
+/// Standalone: one state per (deployment, service) from its containers. Every
+/// labelled container is meant to be running: jobs, which exit, are not
+/// labelled.
+fn standalone_states(containers: &[bollard::models::ContainerSummary]) -> BTreeMap<(String, String), ServiceState> {
+    let mut by_service: BTreeMap<(String, String), ServiceState> = BTreeMap::new();
+    for container in containers {
+        let Some(labels_map) = container.labels.as_ref() else {
+            continue;
+        };
+        let Some((name, application, version, deployed_at)) = labelled(labels_map) else {
+            continue;
+        };
+        let deployment = deployment_of(labels_map).cloned().unwrap_or_default();
+        let state = by_service.entry((deployment, name.clone())).or_insert(ServiceState {
+            service: name,
+            application,
+            version,
+            deployed_at,
+            desired: 0,
+            running: 0,
+            unhealthy: 0,
+            updating: false,
+            image: container.image.clone().unwrap_or_default(),
+        });
+        state.desired += 1;
+        if container.state == Some(ContainerSummaryStateEnum::RUNNING) {
+            state.running += 1;
+            if container.health.as_ref().and_then(|h| h.status) == Some(ContainerSummaryHealthStatusEnum::UNHEALTHY) {
+                state.unhealthy += 1;
+            }
+        }
+    }
+    by_service
 }
 
 fn label_filter(deployment: &str) -> HashMap<String, Vec<String>> {
@@ -421,9 +475,47 @@ impl Source for DockerSource {
         })
     }
 
+    fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>> {
+        Box::pin(async move {
+            let mut all: BTreeMap<String, Vec<ServiceState>> = BTreeMap::new();
+            match self.mode {
+                Mode::Swarm => {
+                    let services = self
+                        .docker
+                        .list_services(Some(ListServicesOptions {
+                            filters: Some(any_service_filter()),
+                            status: Some(true),
+                        }))
+                        .await
+                        .context("Cannot list the swarm's services")?;
+                    for service in &services {
+                        let deployment = service
+                            .spec
+                            .as_ref()
+                            .and_then(|s| s.labels.as_ref())
+                            .and_then(deployment_of);
+                        if let (Some(deployment), Some(state)) = (deployment, swarm_service(service)) {
+                            all.entry(deployment.clone()).or_default().push(state);
+                        }
+                    }
+                    for states in all.values_mut() {
+                        states.sort_by(|a, b| a.service.cmp(&b.service));
+                    }
+                }
+                Mode::Standalone => {
+                    let containers = self.containers(any_service_filter()).await?;
+                    for ((deployment, _), state) in standalone_states(&containers) {
+                        all.entry(deployment).or_default().push(state);
+                    }
+                }
+            }
+            Ok(all)
+        })
+    }
+
     fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
         Box::pin(async move {
-            let filters = HashMap::from([("label".to_string(), vec![labels::SERVICE.to_string()])]);
+            let filters = any_service_filter();
             let mut names: Vec<String> = match self.mode {
                 Mode::Swarm => self
                     .docker
@@ -481,37 +573,7 @@ impl Source for DockerSource {
                         }))
                         .await
                         .context("Cannot list the containers")?;
-                    // Every labelled container is meant to be running: jobs,
-                    // which exit, are not labelled.
-                    let mut by_service: BTreeMap<String, ServiceState> = BTreeMap::new();
-                    for container in &containers {
-                        let Some((name, application, version, deployed_at)) =
-                            container.labels.as_ref().and_then(labelled)
-                        else {
-                            continue;
-                        };
-                        let state = by_service.entry(name.clone()).or_insert(ServiceState {
-                            service: name,
-                            application,
-                            version,
-                            deployed_at,
-                            desired: 0,
-                            running: 0,
-                            unhealthy: 0,
-                            updating: false,
-                            image: container.image.clone().unwrap_or_default(),
-                        });
-                        state.desired += 1;
-                        if container.state == Some(ContainerSummaryStateEnum::RUNNING) {
-                            state.running += 1;
-                            if container.health.as_ref().and_then(|h| h.status)
-                                == Some(ContainerSummaryHealthStatusEnum::UNHEALTHY)
-                            {
-                                state.unhealthy += 1;
-                            }
-                        }
-                    }
-                    Ok(by_service.into_values().collect())
+                    Ok(standalone_states(&containers).into_values().collect())
                 }
             }
         })

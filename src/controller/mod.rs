@@ -69,6 +69,16 @@ pub fn write_token_files(
         match token.deferred() {
             Some(reference) => {
                 fetch_script.fetch(token, reference);
+                // What prepare-deployment checks on a literal token, checked here
+                // on the fetched value, before the deploy: the controller would
+                // otherwise refuse the token and the API would not exist.
+                fetch_script.command(format!(
+                    "if [ \"${{#{var}}}\" -lt {min} ]; then echo 'controller.{name} fetched from AWS is '\"${{#{var}}}\"' \
+                     characters long; a token needs at least {min}, for example `openssl rand -hex 32`' >&2; exit 1; fi",
+                    var = token.shell_var(),
+                    min = crate::resolver::MIN_TOKEN_LENGTH,
+                    name = name,
+                ));
                 fetch_script.write_to_file(token, &relative);
             }
             None => {
@@ -120,7 +130,9 @@ pub fn image_reference() -> String {
     format!("${{{}:-{}}}", IMAGE_VAR, image())
 }
 
-/// Each deployment to the domains its services are routed on, sorted.
+/// Each deployment of the env spec to the domains its services are routed on,
+/// sorted. A deployment with no routes, workers only, is still listed: the
+/// controller answers `down` for it until its services run, not 404.
 pub fn deployment_domains(
     spec: &crate::resolved_spec::EnvironmentResolvedSpec,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
@@ -133,7 +145,9 @@ pub fn deployment_domains(
             }
         }
     }
-    // A deployment with no routes is still one of the env spec's.
+    for deployment in &spec.ingress.deployments {
+        domains.entry(deployment.clone()).or_default();
+    }
     domains.entry(spec.current_deployment.name.clone()).or_default();
     for list in domains.values_mut() {
         list.sort();

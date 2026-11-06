@@ -676,7 +676,7 @@ fn step_command(command: &StepCommands) -> Result<()> {
                 &deploy_steps::LockTiming {
                     wait: std::time::Duration::from_secs(wait),
                     poll: std::time::Duration::from_secs(5),
-                    stale_after: std::time::Duration::from_secs(30 * 60),
+                    stale_after: deploy_steps::LOCK_STALE_AFTER,
                 },
             )?;
             println!("{}", export_line("SIMPLED_LOCK_TOKEN", &token));

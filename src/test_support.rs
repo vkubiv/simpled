@@ -84,6 +84,7 @@ pub fn resolved_env(env_type: DeploymentEnvType, deployment: DeploymentResolvedS
         ports: Default::default(),
         env_type,
         ingress: IngressResolvedSpec {
+            deployments: vec![],
             version_routes: vec![],
             version_document: None,
             controller: None,

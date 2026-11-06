@@ -251,7 +251,7 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
 
         write!(deploy_sh, " --env-file $(pwd)/envs/{}", env_file_name)?;
 
-        if crate::controller::model::labels::is_reported(deployment, service) {
+        if crate::controller::model::labels::is_reported(service) {
             for (key, value) in crate::controller::model::labels::for_service(deployment, &service.full_name) {
                 if key == crate::controller::model::labels::DEPLOYED_AT {
                     // Double quotes, so the shell expands the deploy time.
@@ -374,7 +374,7 @@ fn write_remove_retired_containers(
     let current: Vec<String> = deployment
         .services
         .iter()
-        .filter(|s| labels::is_reported(deployment, s))
+        .filter(|s| labels::is_reported(s))
         .map(|s| sh_quote(&s.full_name))
         .collect();
     // Both labels: the gateway carries `simpled.deployment` too, but no service.
@@ -1849,6 +1849,7 @@ mod tests {
                 target_platform: Default::default(),
             }),
             ingress: IngressResolvedSpec {
+                deployments: vec![],
                 version_routes: vec![],
                 version_document: None,
                 controller: None,
@@ -1877,6 +1878,7 @@ mod tests {
 
     fn ingress_with_redirect(tls: Option<IngressTlsResolvedSpec>) -> IngressResolvedSpec {
         IngressResolvedSpec {
+            deployments: vec![],
             version_routes: vec![],
             version_document: None,
             controller: None,
@@ -1907,6 +1909,7 @@ mod tests {
 
     fn ingress_with_limits(limits: &[(&str, &str, Option<u64>)]) -> IngressResolvedSpec {
         IngressResolvedSpec {
+            deployments: vec![],
             version_routes: vec![],
             version_document: None,
             controller: None,

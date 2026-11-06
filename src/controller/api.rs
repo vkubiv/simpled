@@ -53,10 +53,11 @@ impl Api {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let token = text.trim().to_string();
-                if token.chars().count() < 32 {
+                if token.chars().count() < crate::resolver::MIN_TOKEN_LENGTH {
                     eprintln!(
-                        "api: the token in {} is shorter than 32 characters; it is not accepted",
-                        path
+                        "api: the token in {} is shorter than {} characters; it is not accepted",
+                        path,
+                        crate::resolver::MIN_TOKEN_LENGTH
                     );
                     None
                 } else {
@@ -120,23 +121,11 @@ impl IntoResponse for Denied {
 }
 
 /// 401 without a valid token, 403 with one that does not reach `needed`, and
-/// 429 for a client that keeps failing.
+/// 429 instead of 401 for a client whose attempts keep failing. A valid token
+/// always passes: the client is the address the gateway saw, which behind a
+/// proxy is everyone's, and failing attempts from there must not lock the
+/// token's holders out.
 pub fn authorize(api: &Api, headers: &HeaderMap, needed: Access) -> Result<Access, Denied> {
-    let client = client(headers);
-    let now = Instant::now();
-    {
-        let mut failures = api
-            .failures
-            .lock()
-            .map_err(|_| Denied(StatusCode::INTERNAL_SERVER_ERROR, "locked"))?;
-        failures.retain(|_, (_, since)| now.duration_since(*since) < FAILURE_WINDOW);
-        if failures.get(&client).is_some_and(|(count, _)| *count >= MAX_FAILURES) {
-            return Err(Denied(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed attempts; try again in a minute",
-            ));
-        }
-    }
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -155,9 +144,19 @@ pub fn authorize(api: &Api, headers: &HeaderMap, needed: Access) -> Result<Acces
         Some(access) if access >= needed => Ok(access),
         Some(_) => Err(Denied(StatusCode::FORBIDDEN, "this token cannot do that")),
         None => {
-            if let Ok(mut failures) = api.failures.lock() {
-                let entry = failures.entry(client).or_insert((0, now));
-                entry.0 += 1;
+            let now = Instant::now();
+            let mut failures = api
+                .failures
+                .lock()
+                .map_err(|_| Denied(StatusCode::INTERNAL_SERVER_ERROR, "locked"))?;
+            failures.retain(|_, (_, since)| now.duration_since(*since) < FAILURE_WINDOW);
+            let entry = failures.entry(client(headers)).or_insert((0, now));
+            entry.0 += 1;
+            if entry.0 > MAX_FAILURES {
+                return Err(Denied(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many failed attempts; try again in a minute",
+                ));
             }
             Err(Denied(StatusCode::UNAUTHORIZED, "a valid bearer token is required"))
         }
@@ -281,27 +280,20 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if let Err(denied) = guard(&app, &headers) {
         return denied.into_response();
     }
-    let deployments = match app.source.deployments().await {
-        Ok(d) => d,
+    // One listing of every service; the certificates are read at once after it,
+    // so a dashboard's poll stays one round trip long.
+    let all = match app.source.all_services().await {
+        Ok(all) => all,
         Err(e) => {
             eprintln!("api: {:#}", e);
             return error(StatusCode::SERVICE_UNAVAILABLE, "cannot read the deployments");
         }
     };
-    // Every deployment is read at once: one slow Docker call does not add to
-    // the next, and a dashboard's poll stays one round trip long.
-    let read = |deployment: String| {
+    let read = |(deployment, services): (String, Vec<model::ServiceState>)| {
         let app = app.clone();
         async move {
-            let services = match app.source.services(&deployment).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("api: {}: {:#}", deployment, e);
-                    return None;
-                }
-            };
-            let health = super::http::health_with_tls(&app, &deployment, model::health(&services)).await;
-            Some(json!({
+            let health = super::http::read_health(&app, &deployment, Some(&services)).await;
+            json!({
                 "name": deployment,
                 "version": model::version_document(&deployment, &services),
                 "health": health,
@@ -310,14 +302,10 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                     "desired": s.desired,
                     "running": s.running,
                 })).collect::<Vec<_>>(),
-            }))
+            })
         }
     };
-    let out: Vec<_> = futures_util::future::join_all(deployments.into_iter().map(read))
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+    let out: Vec<_> = futures_util::future::join_all(all.into_iter().map(read)).await;
     json_ok(json!({ "deployments": out }))
 }
 
@@ -397,10 +385,13 @@ mod tests {
     fn a_client_that_keeps_failing_is_refused_for_a_while() {
         let api = Api::new(Some(READ.to_string()), None).unwrap();
         for _ in 0..MAX_FAILURES {
-            let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
+            let refused = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read).unwrap_err();
+            assert_eq!(refused.0, StatusCode::UNAUTHORIZED);
         }
-        let refused = authorize(&api, &headers(Some(READ), "2.2.2.2"), Access::Read).unwrap_err();
+        let refused = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read).unwrap_err();
         assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS);
+        // The token's holders behind the same address are not locked out.
+        assert!(authorize(&api, &headers(Some(READ), "2.2.2.2"), Access::Read).is_ok());
         // Another client is not affected.
         assert!(authorize(&api, &headers(Some(READ), "3.3.3.3"), Access::Read).is_ok());
     }

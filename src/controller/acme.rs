@@ -51,9 +51,13 @@ const CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Before the first check: the gateway that routes the challenges to this
 /// controller is deployed in the same stack, and may not be routing yet.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(20);
-/// After a failed update of the gateway: sooner than the next check, since the
-/// certificate is ready and only has to be mounted.
+/// After a failed update of the gateway, or one held back by a running deploy:
+/// sooner than the next check, since the certificate is ready and only has to
+/// be mounted.
 const ROLL_OUT_RETRY: Duration = Duration::from_secs(300);
+/// After the CA could not be reached for the account: sooner than the next
+/// check, since right after a deploy the network may just not be up yet.
+const ACCOUNT_RETRY: Duration = Duration::from_secs(300);
 
 pub fn needs_certificate(current: Option<&CertSecret>, now: u64) -> bool {
     match current {
@@ -79,11 +83,55 @@ pub fn stale(secrets: &[CertSecret]) -> Vec<&CertSecret> {
     secrets.iter().filter(|s| !keep.contains(&s.id.as_str())).collect()
 }
 
-/// After the n-th failure in a row: an hour, doubling up to a day, with up to a
-/// tenth more, so several controllers do not retry in step.
+/// After the n-th failure in a row: 2, 4, 8, 16 and 32 minutes, then an hour,
+/// doubling up to a day; with up to a tenth more, so several controllers do not
+/// retry in step. The first failures are mostly a gateway that does not route
+/// the challenges yet, right after a deploy, so they are retried soon; five
+/// tries in the first hour stay within Let's Encrypt's limit of five failed
+/// validations per hour.
 pub fn backoff(failures: u32, jitter: f64) -> Duration {
-    let hours = 2u64.saturating_pow(failures.saturating_sub(1)).min(24);
-    Duration::from_secs_f64(hours as f64 * 3600.0 * (1.0 + jitter.clamp(0.0, 1.0) / 10.0))
+    let n = failures.max(1);
+    let seconds = if n <= 5 {
+        60 * 2u64.pow(n)
+    } else {
+        3600 * 2u64.saturating_pow(n - 6).min(24)
+    };
+    Duration::from_secs_f64(seconds as f64 * (1.0 + jitter.clamp(0.0, 1.0) / 10.0))
+}
+
+/// Whether deploy.sh holds the swarm's deploy lock: it is about to run `docker
+/// stack deploy` of the gateway's stack, which an update of the gateway from
+/// here would race. One of the two would fail with "update out of sequence";
+/// for deploy.sh that is the end of the deploy. A lock older than deploy.sh's
+/// own stale limit is one a crashed deploy left behind, and does not count.
+async fn deploy_in_progress(docker: &Docker) -> bool {
+    use crate::deploy_steps::{LOCK_NAME, LOCK_SINCE_LABEL, LOCK_STALE_AFTER};
+    let configs = docker
+        .list_configs(Some(ListConfigsOptions {
+            filters: Some(HashMap::from([("name".to_string(), vec![LOCK_NAME.to_string()])])),
+        }))
+        .await;
+    let configs = match configs {
+        Ok(configs) => configs,
+        Err(e) => {
+            eprintln!("acme: cannot read the deploy lock: {}", e);
+            return false;
+        }
+    };
+    let now = super::unix_now();
+    configs.iter().any(|c| {
+        let Some(spec) = c.spec.as_ref() else { return false };
+        if spec.name.as_deref() != Some(LOCK_NAME) {
+            return false;
+        }
+        let since = spec
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(LOCK_SINCE_LABEL))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(now);
+        now.saturating_sub(since) < LOCK_STALE_AFTER.as_secs()
+    })
 }
 
 fn jitter() -> f64 {
@@ -471,6 +519,7 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
     loop {
         // Each domain's issued certificate, as (domain, secret id, secret name).
         let mut issued = Vec::new();
+        let mut account_failed = false;
         for domain in &config.domains {
             let now = super::unix_now();
             if failures.get(domain).is_some_and(|(_, retry_at)| *retry_at > now) {
@@ -529,8 +578,11 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
                 result = Some(attempted);
                 break;
             }
-            // No account: nothing can be issued this round; the next one tries again.
-            let Some(result) = result else { break };
+            // No account: nothing can be issued this round; it is tried again soon.
+            let Some(result) = result else {
+                account_failed = true;
+                break;
+            };
             match result {
                 Ok((id, name)) => {
                     eprintln!("acme: issued {} into {}", domain, name);
@@ -553,18 +605,38 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
         }
         let mut next_check = CHECK_EVERY;
         if !issued.is_empty() {
-            match roll_out(&docker, &issued).await {
-                Ok(0) => {}
-                Ok(moved) => eprintln!("acme: rolling the gateway onto {} new certificate(s)", moved),
-                Err(e) => {
-                    eprintln!(
-                        "acme: {:#}. Trying again in {} minutes.",
-                        e,
-                        ROLL_OUT_RETRY.as_secs() / 60
-                    );
-                    next_check = ROLL_OUT_RETRY;
+            if deploy_in_progress(&docker).await {
+                eprintln!(
+                    "acme: a deploy is running; the gateway is checked against the certificates in {} minutes",
+                    ROLL_OUT_RETRY.as_secs() / 60
+                );
+                next_check = ROLL_OUT_RETRY;
+            } else {
+                match roll_out(&docker, &issued).await {
+                    Ok(0) => {}
+                    Ok(moved) => eprintln!("acme: rolling the gateway onto {} new certificate(s)", moved),
+                    Err(e) => {
+                        eprintln!(
+                            "acme: {:#}. Trying again in {} minutes.",
+                            e,
+                            ROLL_OUT_RETRY.as_secs() / 60
+                        );
+                        next_check = ROLL_OUT_RETRY;
+                    }
                 }
             }
+        }
+        if account_failed {
+            eprintln!(
+                "acme: without an account nothing is issued; trying again in {} minutes",
+                ACCOUNT_RETRY.as_secs() / 60
+            );
+            next_check = next_check.min(ACCOUNT_RETRY);
+        }
+        // A domain whose retry is due before the next check is not kept waiting.
+        let now = super::unix_now();
+        if let Some(due) = failures.values().map(|(_, at)| at.saturating_sub(now)).min() {
+            next_check = next_check.min(Duration::from_secs(due.max(1)));
         }
         tokio::time::sleep(next_check).await;
     }
@@ -629,11 +701,16 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_from_an_hour_to_a_day() {
-        assert_eq!(backoff(1, 0.0), Duration::from_secs(3600));
-        assert_eq!(backoff(3, 0.0), Duration::from_secs(4 * 3600));
-        assert_eq!(backoff(10, 0.0), Duration::from_secs(24 * 3600));
-        assert!(backoff(1, 1.0) <= Duration::from_secs(3960));
+    fn backoff_starts_in_minutes_then_doubles_from_an_hour_to_a_day() {
+        assert_eq!(backoff(1, 0.0), Duration::from_secs(2 * 60));
+        assert_eq!(backoff(3, 0.0), Duration::from_secs(8 * 60));
+        assert_eq!(backoff(5, 0.0), Duration::from_secs(32 * 60));
+        // Five tries fit in the first hour: 0, 2, 6, 14 and 30 minutes in.
+        assert!((1..5).map(|n| backoff(n, 0.0)).sum::<Duration>() < Duration::from_secs(3600));
+        assert_eq!(backoff(6, 0.0), Duration::from_secs(3600));
+        assert_eq!(backoff(7, 0.0), Duration::from_secs(2 * 3600));
+        assert_eq!(backoff(20, 0.0), Duration::from_secs(24 * 3600));
+        assert!(backoff(1, 1.0) <= Duration::from_secs(132));
     }
 
     #[test]

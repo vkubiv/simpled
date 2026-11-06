@@ -858,8 +858,11 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
         .collect();
     domains.extend(redirects.iter().map(|r| r.from_domain.clone()));
 
+    let mut deployments: Vec<String> = env_spec.deployments.iter().map(|d| d.name.clone()).collect();
+    deployments.sort();
     Ok(IngressResolvedSpec {
         name: env_spec.ingress.name.clone(),
+        deployments,
         domains,
         rules,
         redirects,
@@ -875,7 +878,7 @@ fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolv
 
 /// A token shorter than this is refused: it is a credential to the Docker
 /// socket's view of the environment, logs included.
-const MIN_TOKEN_LENGTH: usize = 32;
+pub const MIN_TOKEN_LENGTH: usize = 32;
 
 /// `controller`: the domains of its host, and the tokens' values, which are
 /// read here like a deployment's secrets, or deferred to the deploy target.

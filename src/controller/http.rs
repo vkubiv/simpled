@@ -124,18 +124,13 @@ pub async fn health_with_tls(app: &App, deployment: &str, health: model::Health)
 }
 
 /// One deployment's health, certificates included. Services that cannot be
-/// read make it `down`.
-async fn read_health(app: &App, deployment: &str, services: Option<Vec<model::ServiceState>>) -> model::Health {
-    let health = match services {
-        Some(services) => model::health(&services),
-        None => model::Health {
-            status: Status::Down,
-            converged: false,
-            version: None,
-            tls: None,
-            services_status: None,
-        },
-    };
+/// read (`None`) make it `down`, like no services at all.
+pub(super) async fn read_health(
+    app: &App,
+    deployment: &str,
+    services: Option<&[model::ServiceState]>,
+) -> model::Health {
+    let health = model::health(services.unwrap_or_default());
     health_with_tls(app, deployment, health).await
 }
 
@@ -145,15 +140,16 @@ async fn deployment_health(State(app): State<Arc<App>>, Path(deployment): Path<S
         Ok(None) => return no_such_deployment(),
         Err(()) => None,
     };
-    let health = read_health(&app, &deployment, services).await;
+    let health = read_health(&app, &deployment, services.as_deref()).await;
     health_response(health.status, &health)
 }
 
-/// The gateway, every certificate and every deployment that has services, all
-/// read at once, so one slow Docker call does not add to the next.
+/// The gateway, every certificate and every deployment that has services: one
+/// listing of the services, and the rest read at once, so one slow Docker call
+/// does not add to the next.
 async fn stack_health(State(app): State<Arc<App>>) -> Response {
-    let deployments = match app.source.deployments().await {
-        Ok(d) => d,
+    let all = match app.source.all_services().await {
+        Ok(all) => all,
         Err(e) => {
             eprintln!("health: {:#}", e);
             return json_response(
@@ -185,17 +181,10 @@ async fn stack_health(State(app): State<Arc<App>>) -> Response {
         }
         states
     };
-    let each = futures_util::future::join_all(deployments.into_iter().map(|deployment| {
+    let each = futures_util::future::join_all(all.into_iter().map(|(deployment, services)| {
         let app = app.clone();
         async move {
-            let services = match app.source.services(&deployment).await {
-                Ok(services) => Some(services),
-                Err(e) => {
-                    eprintln!("health: {}: {:#}", deployment, e);
-                    None
-                }
-            };
-            let health = read_health(&app, &deployment, services).await;
+            let health = read_health(&app, &deployment, Some(&services)).await;
             (deployment, health)
         }
     }));
@@ -432,8 +421,10 @@ mod tests {
             ),
             (Some("degraded"), Some("self-signed"), Some("healthy"))
         );
-        let (_, body) = ask(Some((true, 1)));
+        let (_, body) = ask(Some((true, super::super::unix_now() + 24 * 3600)));
         assert_eq!(body["tls"], "expiring");
+        let (_, body) = ask(Some((true, 1)));
+        assert_eq!(body["tls"], "expired");
     }
 
     #[test]

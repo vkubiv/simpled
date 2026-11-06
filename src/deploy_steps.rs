@@ -627,6 +627,11 @@ pub fn run_job(
 /// The Swarm config that is the cluster-wide deploy lock. Creating a config whose
 /// name exists fails, and Raft keeps that consistent across every manager.
 pub const LOCK_NAME: &str = "simpled_deploy_lock";
+/// On the lock: when the deploy took it, in Unix seconds.
+pub const LOCK_SINCE_LABEL: &str = "simpled.lock.since";
+/// A lock older than this is one a crashed deploy left behind: the next deploy
+/// takes it over, and the controller does not wait for it.
+pub const LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Who holds the lock, from its labels.
 struct LockHolder {
@@ -646,7 +651,7 @@ fn lock_holder(docker: &dyn Docker) -> Result<Option<LockHolder>> {
     Ok(Some(LockHolder {
         deployment: label("simpled.lock.deployment"),
         host: label("simpled.lock.host"),
-        since: labels["simpled.lock.since"]
+        since: labels[LOCK_SINCE_LABEL]
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
@@ -695,7 +700,7 @@ pub fn lock(
     let labels = [
         format!("simpled.lock.deployment={}", deployment),
         format!("simpled.lock.host={}", host),
-        format!("simpled.lock.since={}", since),
+        format!("{}={}", LOCK_SINCE_LABEL, since),
         format!("simpled.lock.token={}", token),
     ];
 

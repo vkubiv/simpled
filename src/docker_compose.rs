@@ -501,7 +501,7 @@ pub fn prepare_service_with(
             update_config: update.map(UpdateConfig::from_policy),
             rollback_config: update.and_then(UpdateConfig::rollback_for),
             placement,
-            labels: if is_swarm && crate::controller::model::labels::is_reported(&spec.current_deployment, service) {
+            labels: if is_swarm && crate::controller::model::labels::is_reported(service) {
                 crate::controller::model::labels::for_service(&spec.current_deployment, &service.full_name)
             } else {
                 BTreeMap::new()
