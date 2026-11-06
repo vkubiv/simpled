@@ -4,3 +4,4 @@
 target/
 example/
 **/*.rs.bk
+/server/

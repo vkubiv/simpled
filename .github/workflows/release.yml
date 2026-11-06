@@ -274,9 +274,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download the release files
         uses: actions/download-artifact@v4
         with:
+          # Only the files the release ships: the controller binaries go into the
+          # image, and docker/build-push-action adds a build record
+          # (*.dockerbuild) that download-artifact cannot extract.
+          pattern: simpled_*
           path: artifacts
           merge-multiple: true
 
