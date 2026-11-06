@@ -24,21 +24,9 @@ pub type LogStream = Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::
 
 pub trait Source: Send + Sync {
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>>;
-    /// Every deployment with a labelled service, sorted.
-    fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>>;
     /// Every deployment's services, keyed by deployment: what `/health` and
-    /// `/api/v1/status` read, from one listing where the source can. Here, one
-    /// per deployment.
-    fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>> {
-        Box::pin(async move {
-            let mut all = BTreeMap::new();
-            for deployment in self.deployments().await? {
-                let services = self.services(&deployment).await?;
-                all.insert(deployment, services);
-            }
-            Ok(all)
-        })
-    }
+    /// `/api/v1/status` read, from one listing.
+    fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>>;
 
     /// A service's tasks (Swarm) or containers (standalone). `None` when the
     /// deployment has no such service.
@@ -247,7 +235,7 @@ impl DockerSource {
     }
 }
 
-/// Every labelled service: the filter of `all_services` and `deployments`.
+/// Every labelled service: the filter of `all_services`.
 fn any_service_filter() -> HashMap<String, Vec<String>> {
     HashMap::from([("label".to_string(), vec![labels::SERVICE.to_string()])])
 }
@@ -259,7 +247,7 @@ fn deployment_of(labels_map: &HashMap<String, String>) -> Option<&String> {
 
 /// Standalone: one state per (deployment, service) from its containers. Every
 /// labelled container is meant to be running: jobs, which exit, are not
-/// labelled.
+/// labelled. One without a deployment label is nobody's, as on Swarm.
 fn standalone_states(containers: &[bollard::models::ContainerSummary]) -> BTreeMap<(String, String), ServiceState> {
     let mut by_service: BTreeMap<(String, String), ServiceState> = BTreeMap::new();
     for container in containers {
@@ -269,7 +257,9 @@ fn standalone_states(containers: &[bollard::models::ContainerSummary]) -> BTreeM
         let Some((name, application, version, deployed_at)) = labelled(labels_map) else {
             continue;
         };
-        let deployment = deployment_of(labels_map).cloned().unwrap_or_default();
+        let Some(deployment) = deployment_of(labels_map).cloned() else {
+            continue;
+        };
         let state = by_service.entry((deployment, name.clone())).or_insert(ServiceState {
             service: name,
             application,
@@ -513,40 +503,6 @@ impl Source for DockerSource {
         })
     }
 
-    fn deployments(&self) -> BoxFuture<'_, Result<Vec<String>>> {
-        Box::pin(async move {
-            let filters = any_service_filter();
-            let mut names: Vec<String> = match self.mode {
-                Mode::Swarm => self
-                    .docker
-                    .list_services(Some(ListServicesOptions {
-                        filters: Some(filters),
-                        status: None,
-                    }))
-                    .await
-                    .context("Cannot list the swarm's services")?
-                    .into_iter()
-                    .filter_map(|s| s.spec?.labels?.get(labels::DEPLOYMENT).cloned())
-                    .collect(),
-                Mode::Standalone => self
-                    .docker
-                    .list_containers(Some(ListContainersOptions {
-                        all: true,
-                        filters: Some(filters),
-                        ..Default::default()
-                    }))
-                    .await
-                    .context("Cannot list the containers")?
-                    .into_iter()
-                    .filter_map(|c| c.labels?.get(labels::DEPLOYMENT).cloned())
-                    .collect(),
-            };
-            names.sort();
-            names.dedup();
-            Ok(names)
-        })
-    }
-
     fn services<'a>(&'a self, deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>> {
         Box::pin(async move {
             match self.mode {
@@ -564,15 +520,7 @@ impl Source for DockerSource {
                     Ok(states)
                 }
                 Mode::Standalone => {
-                    let containers = self
-                        .docker
-                        .list_containers(Some(ListContainersOptions {
-                            all: true,
-                            filters: Some(label_filter(deployment)),
-                            ..Default::default()
-                        }))
-                        .await
-                        .context("Cannot list the containers")?;
+                    let containers = self.containers(label_filter(deployment)).await?;
                     Ok(standalone_states(&containers).into_values().collect())
                 }
             }

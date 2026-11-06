@@ -3,6 +3,7 @@
 //! `controller.host`. The first two use the private API, with the token in
 //! `SIMPLED_TOKEN`. `wait` polls a deployment's public health.
 
+use crate::controller::http as controller_http;
 use crate::spec::DeploymentEnvironmentSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -250,16 +251,20 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, ins
     let mut last = String::from("no answer yet");
     loop {
         match client.get(url).send() {
-            // 503 still carries the health document; 404 says the deployment is
-            // not one the controller knows, which waiting does not change.
+            // 503 still carries the health document. The controller's own 404
+            // says the deployment is not one it knows, which waiting does not
+            // change; any other 404 is the gateway before it routes the
+            // controller, right after a deploy, and is waited out.
             Ok(response) => match (response.status(), response.json::<Value>()) {
-                (reqwest::StatusCode::NOT_FOUND, body) => bail!(
-                    "{} is not a deployment the controller knows ({}); check the name against the env spec",
-                    url,
-                    body.ok()
-                        .and_then(|b| b["error"].as_str().map(str::to_string))
-                        .unwrap_or_else(|| "HTTP 404".to_string())
-                ),
+                (reqwest::StatusCode::NOT_FOUND, Ok(body))
+                    if body["error"].as_str() == Some(controller_http::NO_SUCH_DEPLOYMENT) =>
+                {
+                    bail!(
+                        "{} is not a deployment the controller knows ({}); check the name against the env spec",
+                        url,
+                        controller_http::NO_SUCH_DEPLOYMENT
+                    )
+                }
                 (_, Ok(health)) if health.get("status").is_some() => {
                     if reached(&health, version) {
                         eprintln!("{} is healthy at {}", url, version);
@@ -372,6 +377,15 @@ mod tests {
             err
         );
         assert!(err.to_string().contains("no such deployment"), "{}", err);
+    }
+
+    #[test]
+    fn waiting_outlasts_the_gateways_own_not_found() {
+        // Before the gateway routes the controller, right after a deploy.
+        let url = answer_once("404 Not Found", "404 page not found");
+        let err = wait(&url, "1.2.3", Duration::from_secs(1), Duration::from_secs(1), false).unwrap_err();
+        assert!(err.to_string().contains("did not report 1.2.3 as healthy"), "{}", err);
+        assert!(err.to_string().contains("HTTP 404"), "{}", err);
     }
 
     #[test]
