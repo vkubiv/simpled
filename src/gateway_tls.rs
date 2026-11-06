@@ -27,6 +27,70 @@ pub const OWNER_LABEL: &str = "simpled.scope=environment";
 /// `${SIMPLED_TLS_<n>}` in the ingress stack: the secret to mount per domain.
 pub const VAR_PREFIX: &str = "SIMPLED_TLS_";
 
+/// A domain's certificate secret, as its labels describe it. `step tls-secrets`
+/// reads these through the Docker CLI, the controller through the Docker API.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CertSecret {
+    pub id: String,
+    pub name: String,
+    pub acme: bool,
+    pub not_after: u64,
+    /// Swarm's object version: secrets are immutable, so it orders them by
+    /// creation.
+    pub index: u64,
+}
+
+impl CertSecret {
+    /// From the issuer and expiry labels, as Docker reports them.
+    pub fn from_labels(id: String, name: String, issuer: Option<&str>, not_after: Option<&str>, index: u64) -> Self {
+        CertSecret {
+            id,
+            name,
+            acme: issuer == Some(ISSUER_ACME),
+            not_after: not_after.and_then(|v| v.trim().parse().ok()).unwrap_or_default(),
+            index,
+        }
+    }
+
+    /// The order secrets are preferred in: issued over placeholder, then the
+    /// one that lasts longest, then the newest.
+    fn rank(&self) -> (bool, u64, u64) {
+        (self.acme, self.not_after, self.index)
+    }
+}
+
+/// The secret a domain is served with: the issued certificate that lasts
+/// longest, or else the newest placeholder.
+pub fn current(secrets: &[CertSecret]) -> Option<&CertSecret> {
+    secrets.iter().max_by_key(|s| s.rank())
+}
+
+/// The secrets in the order `current` prefers them, best first.
+pub fn by_preference(secrets: &[CertSecret]) -> Vec<&CertSecret> {
+    let mut sorted: Vec<&CertSecret> = secrets.iter().collect();
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.rank()));
+    sorted
+}
+
+/// The labels of a domain's certificate secret, owner included.
+pub fn secret_labels(domain: &str, issuer: &str, not_after: u64) -> Vec<(String, String)> {
+    let (owner_key, owner_value) = OWNER_LABEL.split_once('=').unwrap_or((OWNER_LABEL, ""));
+    vec![
+        (owner_key.to_string(), owner_value.to_string()),
+        (labels::DOMAIN.to_string(), domain.to_string()),
+        (labels::ISSUER.to_string(), issuer.to_string()),
+        (labels::NOT_AFTER.to_string(), not_after.to_string()),
+    ]
+}
+
+/// `secret_labels` as `docker secret create` arguments.
+pub fn secret_label_args(domain: &str, issuer: &str, not_after: u64) -> Vec<String> {
+    secret_labels(domain, issuer, not_after)
+        .into_iter()
+        .flat_map(|(k, v)| ["--label".to_string(), format!("{}={}", k, v)])
+        .collect()
+}
+
 /// The domains the gateway holds a certificate for: every domain it answers on
 /// over TLS, redirect sources included. Empty unless the certificates come
 /// from Let's Encrypt.

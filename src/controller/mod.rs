@@ -89,6 +89,14 @@ pub fn write_token_files(
     Ok(tokens)
 }
 
+/// The time now, in Unix seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
 /// Where the controller listens, inside its container.
 pub const PORT: u16 = 8080;
 /// The network only the gateway and the controller are on: app containers cannot
@@ -194,7 +202,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
                     }
                 }
                 Some(http::Certs {
-                    source: Box::new(source::connect_docker()?),
+                    source: Box::new(source::CachedCerts::new(source::connect_docker()?)),
                     domains_of,
                     domains: acme_config.domains.clone(),
                 })

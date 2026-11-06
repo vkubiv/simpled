@@ -123,7 +123,7 @@ pub fn log_query(params: &HashMap<String, String>, now: i64) -> Result<LogQuery,
     let since = match params.get("since") {
         None => 0,
         Some(v) => match parse_duration(v) {
-            Some(d) => now - d.as_secs() as i64,
+            Some(d) => now.saturating_sub(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             None => v
                 .parse::<i64>()
                 .map_err(|_| format!("since '{}' is neither a duration like 10m nor Unix seconds", v))?,
@@ -137,18 +137,20 @@ pub fn log_query(params: &HashMap<String, String>, now: i64) -> Result<LogQuery,
     })
 }
 
-/// `30s`, `10m`, `2h`, `1d`.
+/// `30s`, `10m`, `2h`, `1d`. `None` for anything else, or a duration too long
+/// to count in seconds.
 pub fn parse_duration(value: &str) -> Option<Duration> {
-    let (number, unit) = value.split_at(value.len().checked_sub(1)?);
+    let unit = value.chars().last()?;
+    let number = &value[..value.len() - unit.len_utf8()];
     let n: u64 = number.parse().ok()?;
-    let seconds = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
+    let per_unit = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
         _ => return None,
     };
-    Some(Duration::from_secs(seconds))
+    Some(Duration::from_secs(n.checked_mul(per_unit)?))
 }
 
 #[cfg(test)]
@@ -259,5 +261,10 @@ mod tests {
         assert_eq!(q(&[("since", "1790000000")]).unwrap().since, 1_790_000_000);
         assert!(q(&[("tail", "lots")]).unwrap_err().contains("tail 'lots'"));
         assert!(q(&[("since", "yesterday")]).is_err());
+        // A multi-byte last character, and a duration too long, are refused.
+        assert!(q(&[("since", "5\u{f6}")]).is_err());
+        assert!(q(&[("since", "999999999999999999d")]).is_err());
+        assert_eq!(parse_duration("10\u{f6}"), None);
+        assert_eq!(parse_duration(""), None);
     }
 }

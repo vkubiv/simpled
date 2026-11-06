@@ -620,7 +620,7 @@ On Docker the host also answers `GET /.well-known/simpled/health`, with status 2
 | `degraded` | a service runs fewer tasks than it should, or a container fails its healthcheck |
 | `healthy` | neither |
 
-On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
+On Swarm with `tls.letsencrypt`, the answer also has `tls`, the worst certificate of the domains the deployment owns: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`; `services_status` then has the status of the services alone. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
 
 `converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll `health` until it reports `converged`, `healthy` and the version it just shipped, which [`simpled wait`](#simpled-wait) does. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
 
@@ -1684,8 +1684,13 @@ host, so it needs no token. For CI, right after `deploy.sh`; it fails when the t
 is up, with the last state it saw.
 
 ```
-simpled wait <DEPLOYMENT> --version <VERSION> [--timeout 10m] [--interval 5s] [--url <HEALTH URL>]
+simpled wait <DEPLOYMENT> --version <VERSION> [--timeout 10m] [--interval 5s] [--url <HEALTH URL>] [--insecure]
 ```
+
+The services decide: a deployment that is `degraded` only by its certificate (see
+`services_status` in [the health endpoint](#version-endpoint)) counts as done, and
+the certificate's state is printed as a warning. `--insecure` accepts any
+certificate, for a Let's Encrypt staging or private ACME server.
 
 ### `simpled tls import`
 

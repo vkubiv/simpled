@@ -87,6 +87,11 @@ pub struct Health {
     /// domains. Anything but `valid` makes a healthy deployment `degraded`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<Tls>,
+    /// With `tls`: the status of the services alone, before the certificates
+    /// counted, so `simpled wait` can tell a rollout that failed from a
+    /// certificate that is not issued yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub services_status: Option<Status>,
 }
 
 /// The state of a domain's certificate, best first.
@@ -118,6 +123,7 @@ pub fn with_tls(mut health: Health, states: &[Tls]) -> Health {
     let Some(worst) = states.iter().copied().max() else {
         return health;
     };
+    health.services_status = Some(health.status);
     if worst != Tls::Valid && health.status == Status::Healthy {
         health.status = Status::Degraded;
     }
@@ -152,6 +158,7 @@ pub fn health(services: &[ServiceState]) -> Health {
             converged: false,
             version: None,
             tls: None,
+            services_status: None,
         };
     };
     let status = if services.iter().any(|s| s.desired > 0 && s.running == 0) {
@@ -167,6 +174,7 @@ pub fn health(services: &[ServiceState]) -> Health {
         converged,
         version: Some(latest.version.clone()),
         tls: None,
+        services_status: None,
     }
 }
 
@@ -198,6 +206,7 @@ mod tests {
                 converged: true,
                 version: Some("1.2.3".to_string()),
                 tls: None,
+                services_status: None,
             }
         );
     }
@@ -231,6 +240,7 @@ mod tests {
                 converged: false,
                 version: None,
                 tls: None,
+                services_status: None,
             }
         );
         assert_eq!(version_document("prod", &[]), None);
@@ -274,6 +284,7 @@ mod tests {
         assert_eq!((valid.status, valid.tls), (Status::Healthy, Some(Tls::Valid)));
         let expiring = with_tls(healthy.clone(), &[Tls::Valid, Tls::Expiring]);
         assert_eq!((expiring.status, expiring.tls), (Status::Degraded, Some(Tls::Expiring)));
+        assert_eq!(expiring.services_status, Some(Status::Healthy));
         // Without certificates to report, nothing changes.
         assert_eq!(with_tls(healthy.clone(), &[]), healthy);
         // Down stays down.

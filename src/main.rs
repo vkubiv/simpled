@@ -123,6 +123,9 @@ enum Commands {
         /// The health URL instead of the one from the env spec
         #[arg(long)]
         url: Option<String>,
+        /// Accept any certificate: for a staging or private ACME server
+        #[arg(long)]
+        insecure: bool,
     },
 
     /// The gateway's certificates on Docker Swarm
@@ -463,6 +466,7 @@ fn main() -> Result<()> {
             timeout,
             interval,
             url,
+            insecure,
         } => {
             let url = match url {
                 Some(url) => url.clone(),
@@ -476,13 +480,14 @@ fn main() -> Result<()> {
                 version,
                 client::parse_duration(timeout)?,
                 client::parse_duration(interval)?,
+                *insecure,
             )?;
         }
         Commands::Tls {
             command: TlsCommands::Import { file },
         } => {
             let text = std::fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
-            let report = deploy_steps::import_acme_json(&deploy_steps::DockerCli, &text, None, unix_now())?;
+            let report = deploy_steps::import_acme_json(&deploy_steps::DockerCli, &text, None, controller::unix_now())?;
             print_import_report(&report);
         }
         Commands::Controller { config, listen } => {
@@ -560,13 +565,6 @@ fn version_command() -> Result<()> {
     let app_spec = spec_loader::load_app_spec(Path::new("."), None)?;
     println!("{}", app_spec.version);
     Ok(())
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
 }
 
 fn print_import_report(report: &deploy_steps::ImportReport) {
@@ -691,7 +689,7 @@ fn step_command(command: &StepCommands) -> Result<()> {
             let plan = read_plan(plan)?;
             let domains: Vec<String> = plan.tls.iter().map(|t| t.domain.clone()).collect();
             let text = std::fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
-            let report = deploy_steps::import_acme_json(&docker, &text, Some(&domains), unix_now())?;
+            let report = deploy_steps::import_acme_json(&docker, &text, Some(&domains), controller::unix_now())?;
             print_import_report(&report);
             let done = file.with_extension("json.imported");
             std::fs::rename(file, &done)

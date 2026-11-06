@@ -70,9 +70,13 @@ fn token() -> Result<String> {
 }
 
 fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::Client::builder().user_agent(concat!("simpled/", env!("CARGO_PKG_VERSION")));
-    builder = builder.timeout(timeout);
-    builder.build().context("Cannot set up the HTTP client")
+    builder(timeout).build().context("Cannot set up the HTTP client")
+}
+
+fn builder(timeout: Option<Duration>) -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("simpled/", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
 }
 
 /// What a refused request means, in words.
@@ -196,9 +200,28 @@ pub fn logs(base: &str, args: &LogArgs) -> Result<()> {
     Ok(())
 }
 
-/// Whether a `/health` answer is the end of a rollout to `version`.
+/// Whether a `/health` answer is the end of a rollout to `version`. The
+/// services decide it: a certificate that is not issued yet, or close to
+/// expiry, degrades `status` but says nothing about the rollout, and is
+/// reported instead.
 pub fn reached(health: &Value, version: &str) -> bool {
-    health["status"] == "healthy" && health["converged"] == Value::Bool(true) && health["version"] == version
+    let services = health
+        .get("services_status")
+        .filter(|s| s.is_string())
+        .unwrap_or(&health["status"]);
+    services == "healthy" && health["converged"] == Value::Bool(true) && health["version"] == version
+}
+
+/// Whether an error is TLS refusing the server's certificate.
+fn certificate_error(e: &reqwest::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = source {
+        if err.to_string().to_ascii_lowercase().contains("certificate") {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn describe(health: &Value) -> String {
@@ -215,9 +238,13 @@ fn describe(health: &Value) -> String {
 }
 
 /// `simpled wait`: polls the deployment's public health until it reports
-/// `version`, converged and healthy, or the time is up.
-pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration) -> Result<()> {
-    let client = client(Some(Duration::from_secs(15)))?;
+/// `version`, converged and healthy, or the time is up. `insecure` accepts any
+/// certificate, for a staging or private ACME server, or the placeholder.
+pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, insecure: bool) -> Result<()> {
+    let client = builder(Some(Duration::from_secs(15)))
+        .danger_accept_invalid_certs(insecure)
+        .build()
+        .context("Cannot set up the HTTP client")?;
     let started = Instant::now();
     let mut last = String::from("no answer yet");
     loop {
@@ -227,6 +254,9 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration) -> 
                 Ok(health) => {
                     if reached(&health, version) {
                         eprintln!("{} is healthy at {}", url, version);
+                        if let Some(tls) = health["tls"].as_str().filter(|t| *t != "valid") {
+                            eprintln!("Warning: its certificate is {}", tls);
+                        }
                         return Ok(());
                     }
                     let now = describe(&health);
@@ -237,9 +267,12 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration) -> 
                 }
                 Err(_) => last = "an answer that is not the health document".to_string(),
             },
+            Err(e) if certificate_error(&e) => {
+                last = format!("its certificate is not trusted ({}); --insecure skips the check", e)
+            }
             Err(e) => last = format!("cannot reach it: {}", e),
         }
-        if started.elapsed() + interval > timeout {
+        if started.elapsed().saturating_add(interval) > timeout {
             bail!(
                 "{} did not report {} as healthy within {} seconds; last: {}",
                 url,
@@ -291,6 +324,11 @@ mod tests {
         assert!(!reached(&health("healthy", true, "1.2.2"), "1.2.3"));
         assert!(!reached(&health("healthy", false, "1.2.3"), "1.2.3"));
         assert!(!reached(&health("degraded", true, "1.2.3"), "1.2.3"));
+        // Degraded only by a certificate: the rollout is done.
+        let tls_only = json!({"status": "degraded", "converged": true, "version": "1.2.3", "tls": "self-signed", "services_status": "healthy"});
+        assert!(reached(&tls_only, "1.2.3"));
+        let both = json!({"status": "degraded", "converged": true, "version": "1.2.3", "tls": "expiring", "services_status": "degraded"});
+        assert!(!reached(&both, "1.2.3"));
         assert_eq!(
             describe(&health("degraded", false, "1.2.3")),
             "degraded at 1.2.3, still updating"

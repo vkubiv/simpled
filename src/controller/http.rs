@@ -104,10 +104,7 @@ pub async fn health_with_tls(app: &App, deployment: &str, health: model::Health)
     let Some(certs) = &app.certs else {
         return health;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+    let now = super::unix_now();
     let mut states = Vec::new();
     for domain in certs.domains_of.get(deployment).into_iter().flatten() {
         match certs.source.current(domain).await {
@@ -147,6 +144,7 @@ async fn health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 converged: false,
                 version: None,
                 tls: None,
+                services_status: None,
             }
         }
     };
@@ -338,8 +336,12 @@ mod tests {
         let (status, body) = ask(Some((false, 0)));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            (body["status"].as_str(), body["tls"].as_str()),
-            (Some("degraded"), Some("self-signed"))
+            (
+                body["status"].as_str(),
+                body["tls"].as_str(),
+                body["services_status"].as_str()
+            ),
+            (Some("degraded"), Some("self-signed"), Some("healthy"))
         );
         let (_, body) = ask(Some((true, 1)));
         assert_eq!(body["tls"], "expiring");

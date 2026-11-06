@@ -58,12 +58,61 @@ pub trait CertSource: Send + Sync {
     fn current<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, Result<Option<(bool, u64)>>>;
 }
 
-impl CertSource for Docker {
+/// Domain to its current certificate: whether it was issued, and its expiry.
+type CurrentCerts = HashMap<String, (bool, u64)>;
+
+/// Every domain's current certificate from one listing of the certificate
+/// secrets, kept for `CACHE_FOR`: they change at most once a round of the ACME
+/// task, and `/health` may be polled often, for many domains.
+pub struct CachedCerts {
+    docker: Docker,
+    cache: std::sync::Mutex<Option<(std::time::Instant, CurrentCerts)>>,
+}
+
+impl CachedCerts {
+    const CACHE_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub fn new(docker: Docker) -> Self {
+        CachedCerts {
+            docker,
+            cache: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn cached(&self) -> Option<HashMap<String, (bool, u64)>> {
+        let cache = self.cache.lock().ok()?;
+        cache
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < Self::CACHE_FOR)
+            .map(|(_, map)| map.clone())
+    }
+
+    async fn all(&self) -> Result<HashMap<String, (bool, u64)>> {
+        if let Some(map) = self.cached() {
+            return Ok(map);
+        }
+        let found = super::acme::list_cert_secrets(&self.docker, crate::gateway_tls::labels::DOMAIN).await?;
+        let mut by_domain: HashMap<String, Vec<crate::gateway_tls::CertSecret>> = HashMap::new();
+        for (domain, secret) in found {
+            by_domain.entry(domain).or_default().push(secret);
+        }
+        let map: HashMap<String, (bool, u64)> = by_domain
+            .into_iter()
+            .filter_map(|(domain, secrets)| {
+                let current = crate::gateway_tls::current(&secrets).map(|c| (c.acme, c.not_after))?;
+                Some((domain, current))
+            })
+            .collect();
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = Some((std::time::Instant::now(), map.clone()));
+        }
+        Ok(map)
+    }
+}
+
+impl CertSource for CachedCerts {
     fn current<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, Result<Option<(bool, u64)>>> {
-        Box::pin(async move {
-            let secrets = super::acme::domain_secrets(self, domain).await?;
-            Ok(super::acme::current(&secrets).map(|c| (c.acme, c.not_after)))
-        })
+        Box::pin(async move { Ok(self.all().await?.get(domain).copied()) })
     }
 }
 
