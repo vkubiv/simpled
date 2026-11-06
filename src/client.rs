@@ -250,9 +250,17 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, ins
     let mut last = String::from("no answer yet");
     loop {
         match client.get(url).send() {
-            // 503 still carries the health document.
-            Ok(response) => match response.json::<Value>() {
-                Ok(health) => {
+            // 503 still carries the health document; 404 says the deployment is
+            // not one the controller knows, which waiting does not change.
+            Ok(response) => match (response.status(), response.json::<Value>()) {
+                (reqwest::StatusCode::NOT_FOUND, body) => bail!(
+                    "{} is not a deployment the controller knows ({}); check the name against the env spec",
+                    url,
+                    body.ok()
+                        .and_then(|b| b["error"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| "HTTP 404".to_string())
+                ),
+                (_, Ok(health)) if health.get("status").is_some() => {
                     if reached(&health, version) {
                         eprintln!("{} is healthy at {}", url, version);
                         if let Some(tls) = health["tls"].as_str().filter(|t| *t != "valid") {
@@ -266,7 +274,21 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, ins
                         last = now;
                     }
                 }
-                Err(_) => last = "an answer that is not the health document".to_string(),
+                (status, Ok(other)) => {
+                    last = format!(
+                        "HTTP {}: {}",
+                        status.as_u16(),
+                        other["error"]
+                            .as_str()
+                            .unwrap_or("an answer that is not the health document")
+                    )
+                }
+                (status, Err(_)) => {
+                    last = format!(
+                        "HTTP {} with an answer that is not the health document",
+                        status.as_u16()
+                    )
+                }
             },
             Err(e) if certificate_error(&e) => {
                 last = format!("its certificate is not trusted ({}); --insecure skips the check", e)
@@ -316,6 +338,40 @@ mod tests {
             render_status(&json!({"deployments": []})),
             "No deployments are running.\n"
         );
+    }
+
+    /// One HTTP answer on a local port, then the listener closes.
+    fn answer_once(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{}/health/prodd", port)
+    }
+
+    #[test]
+    fn waiting_stops_at_once_when_the_deployment_does_not_exist() {
+        let url = answer_once("404 Not Found", r#"{"error":"no such deployment"}"#);
+        let started = Instant::now();
+        let err = wait(&url, "1.2.3", Duration::from_secs(30), Duration::from_secs(1), false).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "did not stop at once");
+        assert!(
+            err.to_string().contains("not a deployment the controller knows"),
+            "{}",
+            err
+        );
+        assert!(err.to_string().contains("no such deployment"), "{}", err);
     }
 
     #[test]

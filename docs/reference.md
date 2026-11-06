@@ -676,7 +676,7 @@ Both health routes answer 200 only when `status` is `healthy` and 503 otherwise,
 
 `converged` is true once the rollout has finished: no Swarm update or rollback is in progress, and every service is at the deployed version. A deploy pipeline can poll the deployment's health until it reports `converged`, `healthy` and the version it just shipped, which [`simpled wait`](#simpled-wait) does. Polling `version` only proves the stack was updated. Jobs and services scaled to zero do not count.
 
-On Swarm with `tls.letsencrypt`, a deployment's health also has `tls`, the worst certificate of the domains its services are routed on: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing) or `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway). Anything but `valid` makes a `healthy` deployment `degraded`; `services_status` then has the status of the services alone. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
+On Swarm with `tls.letsencrypt`, a deployment's health also has `tls`, the worst certificate of the domains its services are routed on: `valid`, `expiring` (within 7 days of expiry, so renewal, which starts at 30 days, has kept failing), `self-signed` (the placeholder: the certificate has not been issued yet, for example because the domain's DNS does not point at the gateway) or `expired` (issued, and past its expiry: browsers fail). Anything but `valid` makes a `healthy` deployment `degraded`; `services_status` then has the status of the services alone. Right after the first deploy, that lasts until the controller has issued the certificates, usually under a minute.
 
 The environment's health is the worst of its parts:
 
@@ -1926,7 +1926,11 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
 4. **Redeploys** keep the current certificate: `step tls-secrets` picks the issued one
    that lasts longest, so the stack does not change and the gateway does not restart.
 5. **Renewal.** The controller checks every hour and renews a certificate 30 days before
-   it expires. A failed request is retried after an hour, doubling up to a day. Once
+   it expires. A failed request is retried after 2 minutes, then 4, 8, 16 and 32,
+   then after an hour, doubling up to a day: the first failures are usually a gateway
+   that is not routing the challenges yet, right after a deploy. The gateway is not
+   updated while a deploy holds the deploy lock; the controller tries again 5 minutes
+   later. Once
    a domain has an issued certificate, its placeholder and all but the two newest
    certificates are removed.
 

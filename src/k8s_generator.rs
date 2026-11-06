@@ -650,6 +650,7 @@ mod tests {
 
     fn ingress(redirects: Vec<RedirectRule>, tls: Option<IngressTlsResolvedSpec>) -> IngressResolvedSpec {
         IngressResolvedSpec {
+            deployments: vec![],
             version_routes: vec![],
             version_document: None,
             controller: None,
@@ -697,6 +698,7 @@ mod tests {
             ports: Default::default(),
             env_type: crate::spec::DeploymentEnvType::K8S,
             ingress: IngressResolvedSpec {
+                deployments: vec![],
                 version_routes: vec![],
                 version_document: None,
                 controller: None,

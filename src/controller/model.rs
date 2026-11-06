@@ -40,13 +40,10 @@ pub mod labels {
     }
 
     /// A deployment's services the controller reports on: the long-running ones.
-    /// Jobs finish, and the nginx version sidecar is not part of the app.
-    pub fn is_reported(
-        deployment: &crate::resolved_spec::DeploymentResolvedSpec,
-        service: &crate::resolved_spec::ServiceResolvedSpec,
-    ) -> bool {
+    /// Jobs finish. (The nginx version sidecar only exists on Kubernetes, which
+    /// has no controller.)
+    pub fn is_reported(service: &crate::resolved_spec::ServiceResolvedSpec) -> bool {
         !matches!(service.service_type, crate::spec::ServiceType::Job)
-            && service.full_name != crate::version_endpoint::service_name(&deployment.name)
     }
 }
 
@@ -105,6 +102,9 @@ pub enum Tls {
     Expiring,
     /// The placeholder, or no certificate at all: browsers warn.
     SelfSigned,
+    /// Issued, and past its expiry: browsers fail, and renewal has been failing
+    /// for over 30 days.
+    Expired,
 }
 
 const EXPIRING_WITHIN_SECONDS: u64 = 7 * 24 * 3600;
@@ -113,7 +113,8 @@ const EXPIRING_WITHIN_SECONDS: u64 = 7 * 24 * 3600;
 pub fn tls_state(current: Option<(bool, u64)>, now: u64) -> Tls {
     match current {
         Some((true, not_after)) if not_after > now + EXPIRING_WITHIN_SECONDS => Tls::Valid,
-        Some((true, _)) => Tls::Expiring,
+        Some((true, not_after)) if not_after > now => Tls::Expiring,
+        Some((true, _)) => Tls::Expired,
         _ => Tls::SelfSigned,
     }
 }
@@ -371,6 +372,13 @@ mod tests {
         const DAY: u64 = 24 * 3600;
         assert_eq!(tls_state(Some((true, NOW + 20 * DAY)), NOW), Tls::Valid);
         assert_eq!(tls_state(Some((true, NOW + 6 * DAY)), NOW), Tls::Expiring);
+        assert_eq!(tls_state(Some((true, NOW)), NOW), Tls::Expired);
+        assert_eq!(tls_state(Some((true, NOW - DAY)), NOW), Tls::Expired);
+        assert!(Tls::Expired > Tls::SelfSigned, "expired is the worst");
+        assert_eq!(
+            serde_json::to_value(Tls::Expired).unwrap(),
+            serde_json::json!("expired")
+        );
         assert_eq!(tls_state(Some((false, 0)), NOW), Tls::SelfSigned);
         assert_eq!(tls_state(None, NOW), Tls::SelfSigned);
 

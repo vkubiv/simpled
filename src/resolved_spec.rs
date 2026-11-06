@@ -34,6 +34,9 @@ pub struct IngressResolvedSpec {
     pub placement: Option<Placement>,
     /// Docker only: the controller, served under `crate::controller::PREFIX`.
     pub controller: Option<ControllerResolvedSpec>,
+    /// Every deployment of the env spec, by name, sorted: routed or not, each
+    /// is one the controller answers for.
+    pub deployments: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -96,6 +96,14 @@ fn an_aws_token_is_fetched_on_the_deploy_target() {
     let fetch = read(&out.join("fetch-secrets.sh"));
     assert!(fetch.contains("'prod/simpled/tokens'"), "{}", fetch);
     assert!(fetch.contains("gateway/controller/read_token"), "{}", fetch);
+    // The fetched value is checked the way a literal one is at prepare time.
+    let check = fetch.find("-lt 32 ]").expect("a length check");
+    assert!(
+        check < fetch.find("gateway/controller/read_token").unwrap(),
+        "{}",
+        fetch
+    );
+    assert!(fetch.contains("a token needs at least 32"), "{}", fetch);
 }
 
 #[test]

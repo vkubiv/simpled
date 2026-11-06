@@ -418,6 +418,7 @@ mod tests {
         let spec = IngressResolvedSpec {
             name: "gateway".to_string(),
             tls: None,
+            deployments: vec![],
             domains: vec![],
             rules: vec![crate::resolved_spec::IngressRule {
                 domain_name: format!("localhost:{}", port),
@@ -496,6 +497,7 @@ mod tests {
         let spec = IngressResolvedSpec {
             name: "gateway".to_string(),
             tls: None,
+            deployments: vec![],
             domains: vec![],
             rules: vec![crate::resolved_spec::IngressRule {
                 domain_name: format!("localhost:{}", gateway_port),
