@@ -509,7 +509,7 @@ mod tests {
                 if !known {
                     return Ok(None);
                 }
-                let line = format!("tail={:?}\n", query.tail);
+                let line = format!("tail={}\n", query.tail);
                 let stream: super::super::source::LogStream = Box::pin(futures_util::stream::iter(vec![
                     Ok(axum::body::Bytes::from("started\n")),
                     Ok(axum::body::Bytes::from(line)),
@@ -549,7 +549,7 @@ mod tests {
         let (status, kind, body) = call("/api/v1/deployments/prod/services/api/logs?tail=5");
         assert_eq!(status, StatusCode::OK);
         assert!(kind.starts_with("text/plain"), "{}", kind);
-        assert_eq!(body, "started\ntail=Some(5)\n");
+        assert_eq!(body, "started\ntail=5\n");
         assert_eq!(
             call("/api/v1/deployments/prod/services/other/logs").0,
             StatusCode::NOT_FOUND

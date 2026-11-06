@@ -144,8 +144,10 @@ pub fn account_config_name(config: &AcmeConfig) -> String {
     )
 }
 
-/// The saved account, as (config id, credentials), when there is one.
-async fn saved_account(docker: &Docker, name: &str) -> Result<Option<(String, AccountCredentials)>> {
+/// The saved account's config id and its credentials, when there is one. Listing
+/// the configs failing is an error; credentials that do not decode are the inner
+/// error, since only those mean the saved account is unusable.
+async fn saved_account(docker: &Docker, name: &str) -> Result<Option<(String, Result<AccountCredentials>)>> {
     use base64::Engine;
     let configs = docker
         .list_configs(Some(ListConfigsOptions {
@@ -161,15 +163,16 @@ async fn saved_account(docker: &Docker, name: &str) -> Result<Option<(String, Ac
         return Ok(None);
     };
     let id = found.id.context("The saved ACME account has no id")?;
-    let data = found
-        .spec
-        .and_then(|s| s.data)
-        .with_context(|| format!("The saved ACME account {} has no data", name))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.trim())
-        .with_context(|| format!("The saved ACME account {} is not base64", name))?;
-    let credentials =
-        serde_json::from_slice(&bytes).with_context(|| format!("The saved ACME account {} does not parse", name))?;
+    let credentials = (|| {
+        let data = found
+            .spec
+            .and_then(|s| s.data)
+            .with_context(|| format!("The saved ACME account {} has no data", name))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .with_context(|| format!("The saved ACME account {} is not base64", name))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("The saved ACME account {} does not parse", name))
+    })();
     Ok(Some((id, credentials)))
 }
 
@@ -235,21 +238,29 @@ async fn account(docker: &Docker, config: &AcmeConfig) -> Result<Account> {
         .context("Cannot set up the ACME client")
     };
     let name = account_config_name(config);
-    match saved_account(docker, &name).await {
-        Ok(Some((id, credentials))) => match builder()?.from_credentials(credentials).await {
+    // Only a saved account that is unusable for good is replaced: an outage of
+    // Docker or of the CA keeps it, and this round fails instead.
+    let unusable = match saved_account(docker, &name).await? {
+        None => None,
+        Some((id, Err(e))) => Some((id, format!("{:#}", e))),
+        Some((id, Ok(credentials))) => match builder()?.from_credentials(credentials).await {
             Ok(account) => return Ok(account),
+            Err(e @ (instant_acme::Error::KeyRejected | instant_acme::Error::Crypto)) => Some((id, e.to_string())),
             Err(e) => {
-                eprintln!(
-                    "acme: the saved account {} is not accepted by {}: {}. Creating a new one.",
-                    name, config.directory, e
-                );
-                if let Err(e) = docker.delete_config(&id).await {
-                    eprintln!("acme: cannot remove the config {}: {}", name, e);
-                }
+                return Err(e)
+                    .with_context(|| format!("Cannot reach {} with the saved account {}", config.directory, name));
             }
         },
-        Ok(None) => {}
-        Err(e) => eprintln!("acme: {:#}. Creating a new account.", e),
+    };
+    if let Some((id, reason)) = unusable {
+        eprintln!(
+            "acme: the saved account {} is unusable ({}). Creating a new one.",
+            name, reason
+        );
+        docker
+            .delete_config(&id)
+            .await
+            .with_context(|| format!("Cannot remove the config {}", name))?;
     }
     let contact = format!("mailto:{}", config.email);
     let (account, credentials) = builder()?
@@ -330,7 +341,7 @@ async fn issue(account: &Account, domain: &str, challenges: &Challenges) -> Resu
         .poll_certificate(&RetryPolicy::default())
         .await
         .context("Cannot download the certificate")?;
-    Ok(format!("{}{}", chain, key))
+    Ok(gateway_tls::certificate_pem(&chain, &key))
 }
 
 fn remove_tokens(challenges: &Challenges, tokens: &[String]) {

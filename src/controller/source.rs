@@ -70,7 +70,8 @@ type CurrentCerts = HashMap<String, (bool, u64)>;
 /// task, and `/health` may be polled often, for many domains.
 pub struct CachedCerts {
     docker: Docker,
-    cache: std::sync::Mutex<Option<(std::time::Instant, CurrentCerts)>>,
+    /// Shared, so each lookup takes a reference rather than a copy of the map.
+    cache: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<CurrentCerts>)>>,
 }
 
 impl CachedCerts {
@@ -83,7 +84,7 @@ impl CachedCerts {
         }
     }
 
-    fn cached(&self) -> Option<HashMap<String, (bool, u64)>> {
+    fn cached(&self) -> Option<std::sync::Arc<CurrentCerts>> {
         let cache = self.cache.lock().ok()?;
         cache
             .as_ref()
@@ -91,7 +92,7 @@ impl CachedCerts {
             .map(|(_, map)| map.clone())
     }
 
-    async fn all(&self) -> Result<HashMap<String, (bool, u64)>> {
+    async fn all(&self) -> Result<std::sync::Arc<CurrentCerts>> {
         if let Some(map) = self.cached() {
             return Ok(map);
         }
@@ -100,13 +101,14 @@ impl CachedCerts {
         for (domain, secret) in found {
             by_domain.entry(domain).or_default().push(secret);
         }
-        let map: HashMap<String, (bool, u64)> = by_domain
+        let map: CurrentCerts = by_domain
             .into_iter()
             .filter_map(|(domain, secrets)| {
                 let current = crate::gateway_tls::current(&secrets).map(|c| (c.acme, c.not_after))?;
                 Some((domain, current))
             })
             .collect();
+        let map = std::sync::Arc::new(map);
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some((std::time::Instant::now(), map.clone()));
         }
@@ -162,6 +164,22 @@ fn one_service_filter(deployment: &str, service: &str) -> HashMap<String, Vec<St
     )])
 }
 
+/// The container whose log a standalone service shows: a running one, else the
+/// one created last. The list includes stopped containers, which would otherwise
+/// be picked as readily as the live one.
+fn log_container(containers: Vec<bollard::models::ContainerSummary>) -> Option<String> {
+    containers
+        .into_iter()
+        .filter(|c| c.id.is_some())
+        .max_by_key(|c| {
+            (
+                c.state == Some(ContainerSummaryStateEnum::RUNNING),
+                c.created.unwrap_or(0),
+            )
+        })
+        .and_then(|c| c.id)
+}
+
 fn logs_options(query: &LogQuery) -> LogsOptions {
     LogsOptions {
         follow: query.follow,
@@ -170,7 +188,7 @@ fn logs_options(query: &LogQuery) -> LogsOptions {
         since: query.since.clamp(0, i32::MAX as i64) as i32,
         until: 0,
         timestamps: query.timestamps,
-        tail: query.tail.map_or_else(|| "all".to_string(), |n| n.to_string()),
+        tail: query.tail.to_string(),
     }
 }
 
@@ -324,7 +342,7 @@ impl Source for DockerSource {
                 },
                 Mode::Standalone => {
                     let containers = self.containers(one_service_filter(deployment, service)).await?;
-                    match containers.into_iter().find_map(|c| c.id) {
+                    match log_container(containers) {
                         Some(id) => self.docker.logs(&id, Some(options)).boxed(),
                         None => return Ok(None),
                     }
@@ -503,6 +521,29 @@ impl Source for DockerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_come_from_the_running_container() {
+        let container = |id: &str, running: bool, created: i64| bollard::models::ContainerSummary {
+            id: Some(id.to_string()),
+            state: Some(if running {
+                ContainerSummaryStateEnum::RUNNING
+            } else {
+                ContainerSummaryStateEnum::EXITED
+            }),
+            created: Some(created),
+            ..Default::default()
+        };
+        assert_eq!(
+            log_container(vec![container("dead", false, 20), container("live", true, 10)]).as_deref(),
+            Some("live")
+        );
+        assert_eq!(
+            log_container(vec![container("old", false, 10), container("new", false, 20)]).as_deref(),
+            Some("new")
+        );
+        assert_eq!(log_container(vec![]), None);
+    }
     use bollard::models::{
         ServiceServiceStatus, ServiceSpec, ServiceSpecMode, ServiceSpecModeReplicatedJob, ServiceUpdateStatus,
     };

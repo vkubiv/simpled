@@ -108,8 +108,8 @@ pub fn hostnames(nodes: &[Node]) -> HashMap<String, String> {
 /// The query of the logs route.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LogQuery {
-    /// Lines from the end; `None` for all of them.
-    pub tail: Option<u32>,
+    /// Lines from the end, at most `MAX_TAIL`.
+    pub tail: u32,
     /// Unix seconds; 0 for no limit.
     pub since: i64,
     pub follow: bool,
@@ -120,7 +120,7 @@ pub struct LogQuery {
 pub const MAX_TAIL: u32 = 10_000;
 pub const DEFAULT_TAIL: u32 = 200;
 
-/// `tail=200|all`, `since=10m|2h|30s|1d|<unix seconds>`, `follow=1`,
+/// `tail=200|all` (`all` is `MAX_TAIL`, so no request reads an unbounded log), `since=10m|2h|30s|1d|<unix seconds>`, `follow=1`,
 /// `timestamps=1`. `now` is Unix seconds.
 pub fn log_query(params: &HashMap<String, String>, now: i64) -> Result<LogQuery, String> {
     let flag = |name: &str| {
@@ -129,13 +129,12 @@ pub fn log_query(params: &HashMap<String, String>, now: i64) -> Result<LogQuery,
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
     };
     let tail = match params.get("tail").map(String::as_str) {
-        None => Some(DEFAULT_TAIL),
-        Some("all") => None,
-        Some(n) => Some(
-            n.parse::<u32>()
-                .map_err(|_| format!("tail '{}' is not a number of lines or 'all'", n))?
-                .min(MAX_TAIL),
-        ),
+        None => DEFAULT_TAIL,
+        Some("all") => MAX_TAIL,
+        Some(n) => n
+            .parse::<u32>()
+            .map_err(|_| format!("tail '{}' is not a number of lines or 'all'", n))?
+            .min(MAX_TAIL),
     };
     let since = match params.get("since") {
         None => 0,
@@ -284,7 +283,7 @@ mod tests {
         assert_eq!(
             q(&[]).unwrap(),
             LogQuery {
-                tail: Some(200),
+                tail: 200,
                 since: 0,
                 follow: false,
                 timestamps: false
@@ -297,10 +296,10 @@ mod tests {
             ("timestamps", "true"),
         ])
         .unwrap();
-        assert_eq!(full.tail, None);
+        assert_eq!(full.tail, MAX_TAIL);
         assert_eq!(full.since, 1_000_000 - 600);
         assert!(full.follow && full.timestamps);
-        assert_eq!(q(&[("tail", "999999")]).unwrap().tail, Some(MAX_TAIL));
+        assert_eq!(q(&[("tail", "999999")]).unwrap().tail, MAX_TAIL);
         assert_eq!(q(&[("since", "1790000000")]).unwrap().since, 1_790_000_000);
         assert!(q(&[("tail", "lots")]).unwrap_err().contains("tail 'lots'"));
         assert!(q(&[("since", "yesterday")]).is_err());
