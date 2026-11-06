@@ -82,14 +82,18 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// The client as the gateway saw it. Only the gateway reaches the controller, and
-/// it sets these from the connection, or from `trusted_proxies`.
+/// it sets `X-Real-Ip` from the connection, or from `trusted_proxies`. Without
+/// it, the last `X-Forwarded-For` entry, which the gateway appended: the
+/// entries before it are whatever the client sent.
 fn client(headers: &HeaderMap) -> String {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
     header("x-real-ip")
+        .filter(|v| !v.is_empty())
         .or_else(|| {
             header("x-forwarded-for")
-                .and_then(|v| v.split(',').next())
+                .and_then(|v| v.rsplit(',').next())
                 .map(str::trim)
+                .filter(|v| !v.is_empty())
         })
         .unwrap_or("unknown")
         .to_string()
@@ -223,10 +227,7 @@ async fn logs(
     if let Err(denied) = guard(&app, &headers) {
         return denied.into_response();
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default();
+    let now = i64::try_from(super::unix_now()).unwrap_or(i64::MAX);
     let query = match super::inspect::log_query(&params, now) {
         Ok(q) => q,
         Err(message) => {
@@ -416,6 +417,17 @@ mod tests {
         assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS);
         // Another client is not affected.
         assert!(authorize(&api, &headers(Some(READ), "3.3.3.3"), Access::Read).is_ok());
+    }
+
+    #[test]
+    fn the_client_is_the_address_the_gateway_saw() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "6.6.6.6, 4.4.4.4".parse().unwrap());
+        // Without X-Real-Ip, the entry the gateway appended, not the client's own.
+        assert_eq!(client(&h), "4.4.4.4");
+        h.insert("x-real-ip", "5.5.5.5".parse().unwrap());
+        assert_eq!(client(&h), "5.5.5.5");
+        assert_eq!(client(&HeaderMap::new()), "unknown");
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //! every node, routes `/.well-known/acme-challenge/` to it, so it does not matter
 //! which node Let's Encrypt reaches.
 
-use crate::gateway_tls::{self, labels, ISSUER_ACME, OWNER_LABEL};
+use crate::gateway_tls::{self, labels, ISSUER_ACME};
+pub use crate::gateway_tls::{current, CertSecret};
 use anyhow::{anyhow, bail, Context, Result};
 use bollard::models::{SecretSpec, ServiceSpec};
 use bollard::query_parameters::{ListSecretsOptions, UpdateServiceOptions};
@@ -46,25 +47,9 @@ const CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Before the first check: the gateway that routes the challenges to this
 /// controller is deployed in the same stack, and may not be routing yet.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(20);
-
-/// A domain's certificate secret, as its labels describe it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CertSecret {
-    pub id: String,
-    pub name: String,
-    pub acme: bool,
-    pub not_after: u64,
-    /// Swarm's object version: secrets are immutable, so it orders them by
-    /// creation.
-    pub index: u64,
-}
-
-/// The secret a domain is served with: the same rule as `step tls-secrets`.
-pub fn current(secrets: &[CertSecret]) -> Option<&CertSecret> {
-    secrets
-        .iter()
-        .max_by(|a, b| (a.acme, a.not_after, a.index).cmp(&(b.acme, b.not_after, b.index)))
-}
+/// After a failed update of the gateway: sooner than the next check, since the
+/// certificate is ready and only has to be mounted.
+const ROLL_OUT_RETRY: Duration = Duration::from_secs(300);
 
 pub fn needs_certificate(current: Option<&CertSecret>, now: u64) -> bool {
     match current {
@@ -74,15 +59,19 @@ pub fn needs_certificate(current: Option<&CertSecret>, now: u64) -> bool {
 }
 
 /// Secrets of a domain that can go once an issued certificate exists: every
-/// placeholder, and issued ones older than the newest two (the current one and
-/// the previous one, which a `docker service rollback` still mounts).
+/// placeholder, and every issued one but the best two in `current`'s order (the
+/// current one and the one before it, which a `docker service rollback` still
+/// mounts).
 pub fn stale(secrets: &[CertSecret]) -> Vec<&CertSecret> {
-    let mut issued: Vec<&CertSecret> = secrets.iter().filter(|s| s.acme).collect();
-    if issued.is_empty() {
+    if !secrets.iter().any(|s| s.acme) {
         return vec![];
     }
-    issued.sort_by_key(|s| std::cmp::Reverse(s.index));
-    let keep: Vec<&str> = issued.iter().take(2).map(|s| s.id.as_str()).collect();
+    let keep: Vec<&str> = gateway_tls::by_preference(secrets)
+        .into_iter()
+        .filter(|s| s.acme)
+        .take(2)
+        .map(|s| s.id.as_str())
+        .collect();
     secrets.iter().filter(|s| !keep.contains(&s.id.as_str())).collect()
 }
 
@@ -91,13 +80,6 @@ pub fn stale(secrets: &[CertSecret]) -> Vec<&CertSecret> {
 pub fn backoff(failures: u32, jitter: f64) -> Duration {
     let hours = 2u64.saturating_pow(failures.saturating_sub(1)).min(24);
     Duration::from_secs_f64(hours as f64 * 3600.0 * (1.0 + jitter.clamp(0.0, 1.0) / 10.0))
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
 }
 
 fn jitter() -> f64 {
@@ -109,12 +91,15 @@ fn jitter() -> f64 {
 }
 
 pub async fn domain_secrets(docker: &Docker, domain: &str) -> Result<Vec<CertSecret>> {
+    let found = list_cert_secrets(docker, &format!("{}={}", labels::DOMAIN, domain)).await?;
+    Ok(found.into_iter().map(|(_, secret)| secret).collect())
+}
+
+/// The certificate secrets that match a label filter, each with its domain.
+pub async fn list_cert_secrets(docker: &Docker, label_filter: &str) -> Result<Vec<(String, CertSecret)>> {
     let secrets = docker
         .list_secrets(Some(ListSecretsOptions {
-            filters: Some(HashMap::from([(
-                "label".to_string(),
-                vec![format!("{}={}", labels::DOMAIN, domain)],
-            )])),
+            filters: Some(HashMap::from([("label".to_string(), vec![label_filter.to_string()])])),
         }))
         .await
         .context("Cannot list the certificate secrets")?;
@@ -123,16 +108,15 @@ pub async fn domain_secrets(docker: &Docker, domain: &str) -> Result<Vec<CertSec
         .filter_map(|s| {
             let spec = s.spec?;
             let labels_map = spec.labels.unwrap_or_default();
-            Some(CertSecret {
-                id: s.id?,
-                name: spec.name?,
-                acme: labels_map.get(labels::ISSUER).map(String::as_str) == Some(ISSUER_ACME),
-                not_after: labels_map
-                    .get(labels::NOT_AFTER)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_default(),
-                index: s.version.and_then(|v| v.index).unwrap_or_default(),
-            })
+            let domain = labels_map.get(labels::DOMAIN)?.clone();
+            let secret = CertSecret::from_labels(
+                s.id?,
+                spec.name?,
+                labels_map.get(labels::ISSUER).map(String::as_str),
+                labels_map.get(labels::NOT_AFTER).map(String::as_str),
+                s.version.and_then(|v| v.index).unwrap_or_default(),
+            );
+            Some((domain, secret))
         })
         .collect())
 }
@@ -241,16 +225,14 @@ async fn create_secret(docker: &Docker, domain: &str, pem: &str) -> Result<(Stri
     use base64::Engine;
     let expires = not_after(pem)?;
     let name = crate::deploy_steps::object_name(&gateway_tls::secret_base(domain), pem.as_bytes());
-    let (owner_key, owner_value) = OWNER_LABEL.split_once('=').unwrap_or((OWNER_LABEL, ""));
     let id = docker
         .create_secret(SecretSpec {
             name: Some(name.clone()),
-            labels: Some(HashMap::from([
-                (owner_key.to_string(), owner_value.to_string()),
-                (labels::DOMAIN.to_string(), domain.to_string()),
-                (labels::ISSUER.to_string(), ISSUER_ACME.to_string()),
-                (labels::NOT_AFTER.to_string(), expires.to_string()),
-            ])),
+            labels: Some(
+                gateway_tls::secret_labels(domain, ISSUER_ACME, expires)
+                    .into_iter()
+                    .collect(),
+            ),
             data: Some(base64::engine::general_purpose::STANDARD.encode(pem)),
             ..Default::default()
         })
@@ -260,40 +242,59 @@ async fn create_secret(docker: &Docker, domain: &str, pem: &str) -> Result<(Stri
     Ok((id, name))
 }
 
-/// Points the gateway's mount of each domain's PEM at its new secret. One
-/// update, which Swarm rolls out with the gateway's own update policy.
-pub fn repoint(spec: &mut ServiceSpec, new: &[(String, String, String)]) -> usize {
-    let mut changed = 0;
+/// What `repoint` found: mounts of the given domains' PEMs, and how many of
+/// them it pointed at another secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Repointed {
+    pub mounted: usize,
+    pub changed: usize,
+}
+
+/// Points the gateway's mount of each domain's PEM at that domain's current
+/// secret. One update, which Swarm rolls out with the gateway's own update
+/// policy.
+pub fn repoint(spec: &mut ServiceSpec, current: &[(String, String, String)]) -> Repointed {
+    let mut result = Repointed { mounted: 0, changed: 0 };
     let secrets = spec
         .task_template
         .as_mut()
         .and_then(|t| t.container_spec.as_mut())
         .and_then(|c| c.secrets.as_mut());
     let Some(secrets) = secrets else {
-        return 0;
+        return result;
     };
-    for (domain, id, name) in new {
+    for (domain, id, name) in current {
         let target = gateway_tls::cert_path(domain);
         for mount in secrets.iter_mut() {
             if mount.file.as_ref().and_then(|f| f.name.as_deref()) == Some(target.as_str()) {
-                mount.secret_id = Some(id.clone());
-                mount.secret_name = Some(name.clone());
-                changed += 1;
+                result.mounted += 1;
+                if mount.secret_id.as_deref() != Some(id.as_str()) {
+                    mount.secret_id = Some(id.clone());
+                    mount.secret_name = Some(name.clone());
+                    result.changed += 1;
+                }
             }
         }
     }
-    changed
+    result
 }
 
-async fn roll_out(docker: &Docker, new: &[(String, String, String)]) -> Result<()> {
+/// Moves the gateway onto each domain's current certificate where it is not on
+/// it yet. Every round checks this, not only a round that issued, so an update
+/// that failed is made in a later one. Returns how many mounts moved.
+async fn roll_out(docker: &Docker, current: &[(String, String, String)]) -> Result<usize> {
     let service = docker
         .inspect_service(GATEWAY_SERVICE, None)
         .await
         .with_context(|| format!("Cannot inspect {}", GATEWAY_SERVICE))?;
     let version = service.version.and_then(|v| v.index).unwrap_or_default();
     let mut spec = service.spec.context("The gateway service has no spec")?;
-    if repoint(&mut spec, new) == 0 {
-        bail!("the gateway mounts none of the renewed certificates; is the ingress stack deployed?");
+    let repointed = repoint(&mut spec, current);
+    if repointed.mounted == 0 {
+        bail!("the gateway mounts none of the issued certificates; is the simpled stack deployed?");
+    }
+    if repointed.changed == 0 {
+        return Ok(0);
     }
     docker
         .update_service(
@@ -307,7 +308,7 @@ async fn roll_out(docker: &Docker, new: &[(String, String, String)]) -> Result<(
         )
         .await
         .context("Cannot update the gateway")?;
-    Ok(())
+    Ok(repointed.changed)
 }
 
 async fn prune(docker: &Docker, domain: &str) {
@@ -328,9 +329,10 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
     let mut failures: HashMap<String, (u32, u64)> = HashMap::new();
     tokio::time::sleep(FIRST_CHECK_AFTER).await;
     loop {
+        // Each domain's issued certificate, as (domain, secret id, secret name).
         let mut issued = Vec::new();
         for domain in &config.domains {
-            let now = now();
+            let now = super::unix_now();
             if failures.get(domain).is_some_and(|(_, retry_at)| *retry_at > now) {
                 continue;
             }
@@ -341,9 +343,17 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
                     continue;
                 }
             };
-            if !needs_certificate(current(&secrets), now) {
+            let best = current(&secrets);
+            if !needs_certificate(best, now) {
+                if let Some(best) = best {
+                    issued.push((domain.clone(), best.id.clone(), best.name.clone()));
+                }
                 prune(&docker, domain).await;
                 continue;
+            }
+            // Until a new one is issued, the gateway stays on the issued one it has.
+            if let Some(best) = best.filter(|b| b.acme) {
+                issued.push((domain.clone(), best.id.clone(), best.name.clone()));
             }
             if account.is_none() {
                 match self::account(&config).await {
@@ -365,6 +375,7 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
                 Ok((id, name)) => {
                     eprintln!("acme: issued {} into {}", domain, name);
                     failures.remove(domain);
+                    issued.retain(|(d, _, _)| d != domain);
                     issued.push((domain.clone(), id, name));
                 }
                 Err(e) => {
@@ -380,14 +391,22 @@ pub async fn run(config: AcmeConfig, docker: Docker, challenges: Challenges) {
                 }
             }
         }
+        let mut next_check = CHECK_EVERY;
         if !issued.is_empty() {
             match roll_out(&docker, &issued).await {
-                Ok(()) => eprintln!("acme: rolling the gateway onto {} new certificate(s)", issued.len()),
-                // The secrets exist, so the next deploy.sh mounts them anyway.
-                Err(e) => eprintln!("acme: {:#}", e),
+                Ok(0) => {}
+                Ok(moved) => eprintln!("acme: rolling the gateway onto {} new certificate(s)", moved),
+                Err(e) => {
+                    eprintln!(
+                        "acme: {:#}. Trying again in {} minutes.",
+                        e,
+                        ROLL_OUT_RETRY.as_secs() / 60
+                    );
+                    next_check = ROLL_OUT_RETRY;
+                }
             }
         }
-        tokio::time::sleep(CHECK_EVERY).await;
+        tokio::time::sleep(next_check).await;
     }
 }
 
@@ -428,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_the_two_newest_issued_certificates() {
+    fn pruning_keeps_the_two_issued_certificates_that_last_longest() {
         let secrets = [
             cert("p", false, 0, 1),
             cert("a", true, NOW, 2),
@@ -437,6 +456,14 @@ mod tests {
         ];
         let ids: Vec<&str> = stale(&secrets).iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["p", "a"]);
+        // An imported certificate created last but expiring first goes first.
+        let secrets = [
+            cert("a", true, NOW + 60 * DAY, 2),
+            cert("c", true, NOW + 89 * DAY, 3),
+            cert("b", true, NOW + 30 * DAY, 4),
+        ];
+        let ids: Vec<&str> = stale(&secrets).iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["b"]);
         // Without an issued certificate, the placeholder stays.
         assert!(stale(&[cert("p", false, 0, 1)]).is_empty());
     }
@@ -471,9 +498,19 @@ mod tests {
         };
         let changed = repoint(
             &mut spec,
+            &[
+                ("a.example.com".to_string(), "id-new".to_string(), "new-a".to_string()),
+                ("b.example.com".to_string(), "id-old-b".to_string(), "old-b".to_string()),
+            ],
+        );
+        // b is on its current secret already.
+        assert_eq!(changed, Repointed { mounted: 2, changed: 1 });
+        // Once moved, a later round has nothing to roll out.
+        let again = repoint(
+            &mut spec,
             &[("a.example.com".to_string(), "id-new".to_string(), "new-a".to_string())],
         );
-        assert_eq!(changed, 1);
+        assert_eq!(again, Repointed { mounted: 1, changed: 0 });
         let secrets = spec.task_template.unwrap().container_spec.unwrap().secrets.unwrap();
         assert_eq!(secrets[0].secret_name.as_deref(), Some("new-a"));
         assert_eq!(secrets[0].secret_id.as_deref(), Some("id-new"));

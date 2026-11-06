@@ -907,6 +907,11 @@ fn resolve_controller(
             }
         }
     }
+    // Without a token the controller serves no API: routing to it would only
+    // answer 404 on every path under the prefix (a whole host for `/`).
+    if controller.read_token.is_none() && controller.manage_token.is_none() {
+        routes.clear();
+    }
     let mut documents = HashMap::new();
     let mut token = |spec: &Option<crate::spec::DeploymentSecretSpec>| -> Result<Option<SecretResolvedSpec>> {
         let Some(spec) = spec else { return Ok(None) };

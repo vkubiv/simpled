@@ -930,7 +930,7 @@ fn convert_controller(
     }
     if !has_token && !routes.is_empty() {
         eprintln!(
-            "Warning: controller sets hosts but no read_token or manage_token, so the private API has no routes to serve"
+            "Warning: controller sets hosts but no read_token or manage_token, so the private API is not served and the gateway does not route to it"
         );
     }
     Ok(spec::ControllerSpec {
@@ -1323,8 +1323,6 @@ fn convert_nfs(yaml: &NfsBindingYaml, owner: &str) -> Result<NfsVolume> {
     })
 }
 
-/// Every path an env spec names is taken relative to the spec's own directory,
-/// so a spec reads the same wherever `simpled` is run from (`--path`).
 /// One secret's source, from any of the shapes a deployment secret accepts.
 /// `fallbacks` is where a secret with no source of its own is looked for.
 fn convert_secret_source(
@@ -1397,6 +1395,8 @@ fn convert_secret_source(
     }
 }
 
+/// Every path an env spec names is taken relative to the spec's own directory,
+/// so a spec reads the same wherever `simpled` is run from (`--path`).
 fn convert_deployment_app(yaml: &DeploymentAppSpecYaml, root: &Path) -> Result<DeploymentAppSpec> {
     let version = if let Some(v) = &yaml.version {
         Some(semver::VersionReq::parse(v)?)

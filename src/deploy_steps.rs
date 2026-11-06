@@ -181,21 +181,13 @@ pub fn sync_objects(docker: &dyn Docker, plan: &Plan, deploy_dir: &Path) -> Resu
 
 // ---------------------------------------------------------------- tls-secrets
 
-/// A certificate secret of a domain, as its labels describe it.
-#[derive(Debug, Clone, PartialEq)]
-struct TlsSecret {
-    name: String,
-    acme: bool,
-    not_after: u64,
-    created: String,
-}
-
-/// The secret each of the gateway's domains is served with: the issued
-/// certificate that lasts longest, or else the newest placeholder. A domain
-/// with neither gets a self-signed placeholder, which the controller replaces once
-/// it has issued the real one. Exports the names for the ingress stack.
+/// The secret each of the gateway's domains is served with,
+/// `gateway_tls::current`, the same one the controller rolls the gateway onto. A
+/// domain with no secret gets a self-signed placeholder, which the controller
+/// replaces once it has issued the real one. Exports the names for the
+/// gateway's stack.
 pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, String)>> {
-    use crate::gateway_tls::{labels, ISSUER_ACME, ISSUER_SELF_SIGNED, OWNER_LABEL};
+    use crate::gateway_tls::{labels, CertSecret, ISSUER_SELF_SIGNED};
     let mut exports = Vec::new();
     for tls in &plan.tls {
         let ids = checked(
@@ -212,7 +204,7 @@ pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, Stri
         let mut found = Vec::new();
         if !ids.is_empty() {
             let format = format!(
-                "{{{{.Spec.Name}}}}|{{{{index .Spec.Labels \"{}\"}}}}|{{{{index .Spec.Labels \"{}\"}}}}|{{{{.CreatedAt.UTC.Format \"2006-01-02T15:04:05.000000000Z\"}}}}",
+                "{{{{.ID}}}}|{{{{.Spec.Name}}}}|{{{{index .Spec.Labels \"{}\"}}}}|{{{{index .Spec.Labels \"{}\"}}}}|{{{{.Version.Index}}}}",
                 labels::ISSUER,
                 labels::NOT_AFTER
             );
@@ -220,39 +212,27 @@ pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, Stri
             args.extend(ids.iter().copied());
             for line in checked(docker, &args)?.lines() {
                 let parts: Vec<&str> = line.trim().split('|').collect();
-                if let [name, issuer, not_after, created] = parts.as_slice() {
-                    found.push(TlsSecret {
-                        name: name.to_string(),
-                        acme: *issuer == ISSUER_ACME,
-                        not_after: not_after.parse().unwrap_or_default(),
-                        created: created.to_string(),
-                    });
+                if let [id, name, issuer, not_after, index] = parts.as_slice() {
+                    found.push(CertSecret::from_labels(
+                        id.to_string(),
+                        name.to_string(),
+                        Some(*issuer),
+                        Some(*not_after),
+                        index.parse().unwrap_or_default(),
+                    ));
                 }
             }
         }
-        let best = found
-            .into_iter()
-            .max_by(|a, b| (a.acme, a.not_after, &a.created).cmp(&(b.acme, b.not_after, &b.created)));
-        let name = match best {
-            Some(secret) => secret.name,
+        let name = match crate::gateway_tls::current(&found) {
+            Some(secret) => secret.name.clone(),
             None => {
                 let pem = crate::gateway_tls::self_signed(&tls.domain)?;
                 let name = object_name(&crate::gateway_tls::secret_base(&tls.domain), pem.as_bytes());
                 let output = docker.run_input(
-                    &[
-                        "secret",
-                        "create",
-                        "--label",
-                        OWNER_LABEL,
-                        "--label",
-                        &format!("{}={}", labels::DOMAIN, tls.domain),
-                        "--label",
-                        &format!("{}={}", labels::ISSUER, ISSUER_SELF_SIGNED),
-                        "--label",
-                        &format!("{}=0", labels::NOT_AFTER),
-                        &name,
-                        "-",
-                    ],
+                    &secret_create_args(&tls.domain, ISSUER_SELF_SIGNED, 0, &name)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
                     pem.as_bytes(),
                 )?;
                 if !output.success {
@@ -272,6 +252,16 @@ pub fn tls_secrets(docker: &dyn Docker, plan: &Plan) -> Result<Vec<(String, Stri
         exports.push((tls.var.clone(), name));
     }
     Ok(exports)
+}
+
+/// `docker secret create` of a certificate secret, labelled as the controller
+/// reads it, from stdin.
+fn secret_create_args(domain: &str, issuer: &str, not_after: u64, name: &str) -> Vec<String> {
+    let mut args = vec!["secret".to_string(), "create".to_string()];
+    args.extend(crate::gateway_tls::secret_label_args(domain, issuer, not_after));
+    args.push(name.to_string());
+    args.push("-".to_string());
+    args
 }
 
 // ---------------------------------------------------------------- tls import
@@ -296,7 +286,7 @@ pub fn import_acme_json(
     only: Option<&[String]>,
     now: u64,
 ) -> Result<ImportReport> {
-    use crate::gateway_tls::{labels, ISSUER_ACME, OWNER_LABEL};
+    use crate::gateway_tls::ISSUER_ACME;
     use base64::Engine;
     let store: serde_json::Value =
         serde_json::from_str(acme_json).context("This is not a Traefik acme.json: it is not JSON")?;
@@ -360,20 +350,10 @@ pub fn import_acme_json(
                     continue;
                 }
                 let output = docker.run_input(
-                    &[
-                        "secret",
-                        "create",
-                        "--label",
-                        OWNER_LABEL,
-                        "--label",
-                        &format!("{}={}", labels::DOMAIN, name),
-                        "--label",
-                        &format!("{}={}", labels::ISSUER, ISSUER_ACME),
-                        "--label",
-                        &format!("{}={}", labels::NOT_AFTER, expires),
-                        &secret,
-                        "-",
-                    ],
+                    &secret_create_args(&name, ISSUER_ACME, expires, &secret)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
                     pem.as_bytes(),
                 )?;
                 if !output.success {
@@ -1335,9 +1315,9 @@ c
             (
                 "secret inspect",
                 true,
-                "tls_shop.example.com_111|acme|1800000000|2026-11-01T00:00:00.000000000Z
-                 tls_shop.example.com_222|acme|1790000000|2026-11-02T00:00:00.000000000Z
-                 tls_shop.example.com_333|self-signed|0|2026-11-03T00:00:00.000000000Z
+                "a|tls_shop.example.com_111|acme|1800000000|11
+                 b|tls_shop.example.com_222|acme|1790000000|12
+                 c|tls_shop.example.com_333|self-signed|0|13
 ",
             ),
         ]);
