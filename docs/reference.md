@@ -799,10 +799,10 @@ About `/ping`: Traefik's built-in ping router is ``PathPrefix(`/ping`)``, which 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `global` | bool | `deploy.mode: global` on the `simpled_gateway` service: one gateway task on every node (every node matching `placement`). With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled controller](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
-| `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`. |
+| `global` | bool | `deploy.mode: global` on the `simpled_gateway` service: one gateway task on every node (every node matching `placement`). The default with `multi_node: true`; `false` there needs a `placement` constraint that pins the single task, and `multi_node: false` keeps the gateway on its one node. With host-mode ports, each node answers on 80 (and 443) itself, so a load balancer can target all of them. Works with `tls.letsencrypt`: the [simpled controller](#certificates-on-docker-swarm) is the only ACME client, every gateway task forwards the HTTP-01 challenges to it, and every node has the certificate secrets. |
+| `placement` | object | `constraints` (list of `"<attribute> == <value>"` or `!=`) and `preferences` (list of `spread: <label>`), written to `deploy.placement` of the ingress service. `preferences` cannot be combined with `global`, so they need `global: false`. |
 
-Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. Unset, the gateway is unchanged: a single replica placed anywhere.
+Both are Swarm only: set on `k8s`, `local` or standalone Docker they fail validation. The gateway publishes its ports in host mode, so it answers only on the nodes running it; global by default keeps a node loss or a reschedule from moving the one gateway away from the address DNS or the load balancer points at. Use `placement` constraints to keep it off nodes that should not take traffic.
 
 #### Behind a load balancer (AWS ALB)
 
@@ -2026,7 +2026,7 @@ Validation:
 
 | Value | Meaning |
 |-------|---------|
-| `true` (default) | The environment is validated as if the swarm had several nodes, even when it has one, so a spec that passes keeps working when nodes are added. Every mounted volume needs a binding, and relative bind paths are rejected. |
+| `true` (default) | The environment is validated as if the swarm had several nodes, even when it has one, so a spec that passes keeps working when nodes are added. Every mounted volume needs a binding, relative bind paths are rejected, and the gateway is [global](#global-and-placement-swarm) unless pinned. |
 | `false` | The environment lives on one node. Unbound volumes are directories under `<deployment>/volumes/` and relative bind paths are allowed, as in simpled 1.x. |
 
 With `multi_node: false`, `deploy.sh` first counts the nodes that accept tasks
