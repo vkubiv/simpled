@@ -20,7 +20,8 @@ pub struct IngressResolvedSpec {
     pub domains: Vec<String>,
     pub rules: Vec<IngressRule>,
     pub redirects: Vec<RedirectRule>,
-    /// Where `/.well-known/simpled/version` is answered, one entry per domain.
+    /// Kubernetes: where `/.well-known/simpled/version` is answered, one entry
+    /// per domain. Docker serves versions from the controller instead.
     pub version_routes: Vec<VersionRoute>,
     /// Local only: the current deployment's version document, which the local
     /// gateway answers with itself.
@@ -31,14 +32,14 @@ pub struct IngressResolvedSpec {
     pub global: bool,
     /// Swarm only: where the gateway task(s) may run.
     pub placement: Option<Placement>,
-    /// Docker only: the controller's private API.
+    /// Docker only: the controller, served under `crate::controller::PREFIX`.
     pub controller: Option<ControllerResolvedSpec>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ControllerResolvedSpec {
-    /// Domain and path prefix the private API is served under.
-    pub routes: Vec<(String, String)>,
+    /// The domains of `controller.host`, each served under `crate::controller::PREFIX`.
+    pub domains: Vec<String>,
     pub read_token: Option<SecretResolvedSpec>,
     pub manage_token: Option<SecretResolvedSpec>,
 }

@@ -461,16 +461,16 @@ pub struct IngressSpec {
     pub global: bool,
     /// Swarm only: where the gateway task(s) may run.
     pub placement: Option<Placement>,
-    /// Docker only: the controller's private API.
+    /// Docker only, and required there: where the controller is served, and its tokens.
     pub controller: Option<ControllerSpec>,
 }
 
-/// `controller`: where the controller's private API is routed, and its tokens.
+/// `controller`: the host the controller is served on, under
+/// `crate::controller::PREFIX`, and its tokens.
 #[derive(Debug, Clone)]
 pub struct ControllerSpec {
-    /// Host alias and the path prefix the API is served under, which the gateway
-    /// strips.
-    pub hosts: Vec<(String, String)>,
+    /// Host alias under `gateway.hosts`.
+    pub host: String,
     pub read_token: Option<DeploymentSecretSpec>,
     pub manage_token: Option<DeploymentSecretSpec>,
 }

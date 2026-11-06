@@ -166,7 +166,7 @@ mod tests {
     fn owners(blog_primary: &str) -> Vec<(String, String)> {
         let raw = format!(
             r#"
-type: docker
+type: k8s
 gateway:
   tls: {{ disable: true }}
   hosts:

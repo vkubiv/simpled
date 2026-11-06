@@ -285,6 +285,12 @@ pub fn convert_env_spec(
         }
     };
 
+    // Last, so a spec that is wrong in other ways is told about those first.
+    if ingress.controller.is_none() && matches!(env_type_yaml, DeploymentEnvTypeYaml::Docker) {
+        return Err(anyhow!(
+            "'controller.host' is required on Docker: the gateway host alias the simpled controller is served on, under /simpled/ (health, version and the private API)"
+        ));
+    }
     Ok(DeploymentEnvironmentSpec {
         env_type,
         ingress,
@@ -885,24 +891,12 @@ fn convert_controller(
             "controller is only supported on Docker: the simpled controller runs next to the Docker gateway"
         ));
     }
-    let mut routes = Vec::new();
-    for (alias, host) in yaml.hosts.iter().flatten() {
-        if !hosts.iter().any(|h| &h.name == alias) {
-            return Err(anyhow!(
-                "controller.hosts names '{}', which is not a host under gateway.hosts",
-                alias
-            ));
-        }
-        if !host.prefix.starts_with('/') {
-            return Err(anyhow!(
-                "controller.hosts.{}.prefix '{}' must start with /",
-                alias,
-                host.prefix
-            ));
-        }
-        routes.push((alias.clone(), host.prefix.clone()));
+    if !hosts.iter().any(|h| h.name == yaml.host) {
+        return Err(anyhow!(
+            "controller.host '{}' is not a host under gateway.hosts",
+            yaml.host
+        ));
     }
-    routes.sort();
     let no_fallbacks = SecretFallbacks {
         folder: None,
         json_path: None,
@@ -922,19 +916,8 @@ fn convert_controller(
     };
     let read_token = token("read_token", &yaml.read_token)?;
     let manage_token = token("manage_token", &yaml.manage_token)?;
-    let has_token = read_token.is_some() || manage_token.is_some();
-    if has_token && routes.is_empty() {
-        eprintln!(
-            "Warning: controller sets a token but no hosts, so the controller's private API is not routed and the token cannot be used"
-        );
-    }
-    if !has_token && !routes.is_empty() {
-        eprintln!(
-            "Warning: controller sets hosts but no read_token or manage_token, so the private API is not served and the gateway does not route to it"
-        );
-    }
     Ok(spec::ControllerSpec {
-        hosts: routes,
+        host: yaml.host.clone(),
         read_token,
         manage_token,
     })
@@ -2501,6 +2484,8 @@ deployments:
         format!(
             r#"
 type: docker
+controller:
+  host: web
 gateway:
   hosts:
     web: example.com
@@ -2711,9 +2696,16 @@ deployments:
     }
 
     fn trusted_proxies_spec(env_type: &str, entries: &str) -> String {
+        let controller = if env_type == "docker" {
+            "controller:
+  host: web"
+        } else {
+            ""
+        };
         format!(
             r#"
 type: {env_type}
+{controller}
 gateway:
   hosts:
     web: example.com
@@ -2782,6 +2774,8 @@ deployments:
     const SWARM_ROLLOUT: &str = r#"
 type: docker
 swarm_mode: true
+controller:
+  host: web
 gateway:
   hosts:
     web: example.com
@@ -2861,14 +2855,17 @@ deployments:
         );
 
         let local = SWARM_ROLLOUT
-            .replace("type: docker\nswarm_mode: true\n", "type: local\n")
+            .replace(
+                "type: docker\nswarm_mode: true\ncontroller:\n  host: web\n",
+                "type: local\n",
+            )
             .replace("  tls:\n    upstream: true\n", "");
         let err = convert_raw(&local).unwrap_err().to_string();
         assert!(err.contains("cannot be set for Local environment"), "{err}");
 
         // Only on a service, after the defaults are gone.
         let k8s = SWARM_ROLLOUT
-            .replace("type: docker\nswarm_mode: true\n", "type: k8s\n")
+            .replace("type: docker\nswarm_mode: true\ncontroller:\n  host: web\n", "type: k8s\n")
             .replace("    upstream: true", "    disable: true")
             .replace(
                 "    defaults:\n      update:\n        order: start-first\n        failure_action: rollback\n      placement:\n        constraints: [\"node.role == worker\"]\n",

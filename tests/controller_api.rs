@@ -1,5 +1,5 @@
-//! `controller`: the controller's private API is routed under the given hosts,
-//! and its tokens reach the controller as Swarm secrets (or files, standalone).
+//! `controller`: the controller is routed under `/simpled/` on its host, and its
+//! tokens reach the controller as Swarm secrets (or files, standalone).
 
 mod common;
 
@@ -15,10 +15,7 @@ fn with_controller(env_type: &str, extra: &str, controller: &str) -> String {
 }
 
 fn api_on_web(token: &str) -> String {
-    format!(
-        "    hosts:\n      web:\n        prefix: /_simpled\n    read_token: \"{}\"",
-        token
-    )
+    format!("    host: web\n    read_token: \"{}\"", token)
 }
 
 fn fails(env: &str) -> String {
@@ -34,7 +31,7 @@ fn fails(env: &str) -> String {
 }
 
 #[test]
-fn on_swarm_the_token_is_a_gateway_secret_and_the_api_is_routed_under_its_prefix() {
+fn on_swarm_the_token_is_a_gateway_secret_and_the_controller_is_routed_under_simpled() {
     let dir = prepare(&with_controller("docker", "swarm_mode: true", &api_on_web(TOKEN)));
     let out = dir.path().join("docker-deploy");
 
@@ -63,21 +60,24 @@ fn on_swarm_the_token_is_a_gateway_secret_and_the_api_is_routed_under_its_prefix
         config["api"],
         serde_json::json!({"read_token_file": "/run/secrets/simpled_controller_read_token"})
     );
+    assert_eq!(config["domains"], serde_json::json!({"prod": ["shop.example.com"]}));
     // The token is not in the config, only where to find it.
     assert!(!read(&out.join("gateway").join("controller").join("controller.json")).contains(TOKEN));
 
-    let dynamic: serde_yaml::Value =
-        serde_yaml::from_str(&read(&out.join("gateway").join("traefik").join("dynamic_conf.yml"))).unwrap();
-    let router = &dynamic["http"]["routers"]["simpled-controller-api-0"];
+    let dynamic_text = read(&out.join("gateway").join("traefik").join("dynamic_conf.yml"));
+    let dynamic: serde_yaml::Value = serde_yaml::from_str(&dynamic_text).unwrap();
+    let router = &dynamic["http"]["routers"]["simpled-controller-0"];
     assert_eq!(
         router["rule"].as_str(),
-        Some("Host(`shop.example.com`) && PathPrefix(`/_simpled/`)")
+        Some("Host(`shop.example.com`) && PathPrefix(`/simpled/`)")
     );
     assert_eq!(router["service"].as_str(), Some("simpled-controller"));
     assert_eq!(
-        dynamic["http"]["middlewares"]["strip-simpled-controller-0"]["stripPrefix"]["prefixes"][0].as_str(),
-        Some("/_simpled")
+        dynamic["http"]["middlewares"]["strip-simpled-controller"]["stripPrefix"]["prefixes"][0].as_str(),
+        Some("/simpled")
     );
+    // Nothing of the controller is served on the app's own paths.
+    assert!(!dynamic_text.contains(".well-known/simpled"), "{}", dynamic_text);
 
     let plan: serde_json::Value = serde_json::from_str(&read(&out.join("gateway").join("plan.json"))).unwrap();
     assert!(plan["objects"]
@@ -89,7 +89,7 @@ fn on_swarm_the_token_is_a_gateway_secret_and_the_api_is_routed_under_its_prefix
 
 #[test]
 fn an_aws_token_is_fetched_on_the_deploy_target() {
-    let controller = "    hosts:\n      web:\n        prefix: /_simpled\n    read_token:\n      aws: prod/simpled/tokens\n      jq: .read";
+    let controller = "    host: web\n    read_token:\n      aws: prod/simpled/tokens\n      jq: .read";
     let dir = prepare(&with_controller("docker", "swarm_mode: true", controller));
     let out = dir.path().join("docker-deploy");
     assert!(!out.join("gateway").join("controller").join("read_token").exists());
@@ -119,27 +119,18 @@ fn controller_mistakes_fail_validation() {
             "controller.read_token is 5 characters long; a token needs at least 32",
         ),
         (
-            with_controller(
-                "docker",
-                "swarm_mode: true",
-                &format!(
-                    "    hosts:\n      ops:\n        prefix: /\n    read_token: \"{}\"",
-                    TOKEN
-                ),
-            ),
-            "controller.hosts names 'ops', which is not a host under gateway.hosts",
+            with_controller("docker", "swarm_mode: true", "    host: ops"),
+            "controller.host 'ops' is not a host under gateway.hosts",
         ),
         (
-            // The app's `api` already has `/` on this host.
-            with_controller(
-                "docker",
-                "swarm_mode: true",
-                &format!(
-                    "    hosts:\n      web:\n        prefix: /\n    read_token: \"{}\"",
-                    TOKEN
-                ),
-            ),
-            "routes shop.example.com/ to the controller, but service 'api' of deployment 'prod' is routed there too",
+            // The app's `api` takes a path under the controller's prefix.
+            with_controller("docker", "swarm_mode: true", "    host: web")
+                .replace("        prefix: /\n", "        prefix: /simpled/admin\n"),
+            "serves the controller under shop.example.com/simpled/, but service 'api' of deployment 'prod' is routed there too",
+        ),
+        (
+            envspec("docker", "swarm_mode: true", "").replace("controller:\n  host: web\n", ""),
+            "'controller.host' is required on Docker",
         ),
         (
             with_controller("k8s", "", &api_on_web(TOKEN)),
@@ -153,10 +144,12 @@ fn controller_mistakes_fail_validation() {
 }
 
 #[test]
-fn without_a_controller_block_there_is_no_api() {
+fn without_a_token_there_is_no_api_but_the_controller_is_routed() {
     let dir = prepare(&envspec("docker", "swarm_mode: true", ""));
     let out = dir.path().join("docker-deploy");
     let config = read(&out.join("gateway").join("controller").join("controller.json"));
     assert!(!config.contains("\"api\""), "{}", config);
     assert!(!read(&out.join("gateway").join("docker-compose.yaml")).contains("simpled_controller_read_token"));
+    // Health and versions are public, so the controller is routed all the same.
+    assert!(read(&out.join("gateway").join("traefik").join("dynamic_conf.yml")).contains("simpled-controller-0"));
 }

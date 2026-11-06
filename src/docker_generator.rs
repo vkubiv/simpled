@@ -19,8 +19,9 @@ pub const GATEWAY_CONTAINER: &str = "simpled-gateway";
 const LEGACY_ACME_JSON: &str = "letsencrypt/acme.json";
 /// Let's Encrypt's production directory, the default of `letsencrypt.server`.
 const LETSENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
-/// The Traefik service every domain's version and health routes go to.
+/// The Traefik service the controller's routes and ACME challenges go to.
 const TRAEFIK_CONTROLLER_SERVICE: &str = "simpled-controller";
+const TRAEFIK_CONTROLLER_STRIP: &str = "strip-simpled-controller";
 // Pinned, so two deploys of the same spec run the same gateway. A floating tag
 // would change the ingress underneath a deployment that touched nothing else.
 // Traefik stays on v2 because v3 changes the configuration format.
@@ -1513,43 +1514,32 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
         writeln!(file, "        permanent: {}", redirect.permanent)?;
     }
 
-    // The controller's private API: the prefix is stripped, so the controller always
-    // sees `/api/v1/...`.
-    let controller_routes: &[(String, String)] =
-        ingress.controller.as_ref().map(|d| d.routes.as_slice()).unwrap_or(&[]);
-    for (i, (_, prefix)) in controller_routes.iter().enumerate() {
-        if prefix == "/" {
-            continue;
-        }
+    // The controller, under its prefix on `controller.host`: the prefix is
+    // stripped, so the controller sees `/health`, `/api/v1/...`.
+    let controller_domains: &[String] = ingress.controller.as_ref().map(|c| c.domains.as_slice()).unwrap_or(&[]);
+    if !controller_domains.is_empty() {
         if !middlewares_written {
             writeln!(file, "  middlewares:")?;
-            middlewares_written = true;
         }
-        writeln!(file, "    strip-simpled-controller-{}:", i)?;
+        writeln!(file, "    {}:", TRAEFIK_CONTROLLER_STRIP)?;
         writeln!(file, "      stripPrefix:")?;
         writeln!(file, "        prefixes:")?;
         writeln!(
             file,
             "          - {}",
-            serde_json::to_string(prefix.trim_end_matches('/'))?
+            serde_json::to_string(crate::controller::PREFIX)?
         )?;
     }
 
     writeln!(file, "  routers:")?;
-    for (i, (domain, prefix)) in controller_routes.iter().enumerate() {
-        writeln!(file, "    simpled-controller-api-{}:", i)?;
-        let rule = if prefix == "/" {
-            format!("Host(`{}`)", domain)
-        } else {
-            // With the slash, so `/ops` does not also take `/opsboard`.
-            format!("Host(`{}`) && PathPrefix(`{}/`)", domain, prefix.trim_end_matches('/'))
-        };
+    for (i, domain) in controller_domains.iter().enumerate() {
+        writeln!(file, "    simpled-controller-{}:", i)?;
+        // With the slash, so `/simpled` does not also take `/simpledshop`.
+        let rule = format!("Host(`{}`) && PathPrefix(`{}/`)", domain, crate::controller::PREFIX);
         writeln!(file, "      rule: {}", serde_json::to_string(&rule)?)?;
         writeln!(file, "      service: {}", TRAEFIK_CONTROLLER_SERVICE)?;
-        if prefix != "/" {
-            writeln!(file, "      middlewares:")?;
-            writeln!(file, "        - strip-simpled-controller-{}", i)?;
-        }
+        writeln!(file, "      middlewares:")?;
+        writeln!(file, "        - {}", TRAEFIK_CONTROLLER_STRIP)?;
         writeln!(file, "      entryPoints:")?;
         if has_tls {
             writeln!(file, "        - websecure")?;
@@ -1605,26 +1595,6 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
         }
     }
 
-    for route in &ingress.version_routes {
-        writeln!(file, "    {}:", traefik_version_name(&route.domain_name))?;
-        writeln!(
-            file,
-            "      rule: \"Host(`{}`) && (Path(`{}`) || Path(`{}`))\"",
-            route.domain_name,
-            crate::controller::http::VERSION_PATH,
-            crate::controller::http::HEALTH_PATH
-        )?;
-        writeln!(file, "      service: {}", TRAEFIK_CONTROLLER_SERVICE)?;
-        if has_tls {
-            writeln!(file, "      entryPoints:")?;
-            writeln!(file, "        - websecure")?;
-            write_router_tls(&mut file, use_le && cert_domains.is_empty())?;
-        } else {
-            writeln!(file, "      entryPoints:")?;
-            writeln!(file, "        - web")?;
-        }
-    }
-
     for redirect in &ingress.redirects {
         let name = traefik_redirect_name(&redirect.from_domain);
         writeln!(file, "    {}:", name)?;
@@ -1675,7 +1645,7 @@ fn generate_traefik_dynamic_config(ingress: &IngressResolvedSpec, path: &Path, c
 
     // The controller answers for every deployment, by the request's Host, so one
     // service serves every domain's routes.
-    if !ingress.version_routes.is_empty() || !cert_domains.is_empty() || !controller_routes.is_empty() {
+    if !cert_domains.is_empty() || !controller_domains.is_empty() {
         writeln!(file, "    {}:", TRAEFIK_CONTROLLER_SERVICE)?;
         writeln!(file, "      loadBalancer:")?;
         writeln!(file, "        servers:")?;
@@ -1721,10 +1691,6 @@ fn write_router_tls(file: &mut File, resolver: bool) -> Result<()> {
         writeln!(file, "      tls: {{}}")?;
     }
     Ok(())
-}
-
-fn traefik_version_name(domain: &str) -> String {
-    format!("simpled-version-{}", domain.replace(['.', ':'], "-"))
 }
 
 /// Traefik router/middleware names may not contain dots.

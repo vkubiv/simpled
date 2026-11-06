@@ -68,7 +68,8 @@ pub struct ServiceState {
     pub image: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Best first, so the worst of several is their `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Healthy,
@@ -178,9 +179,103 @@ pub fn health(services: &[ServiceState]) -> Health {
     }
 }
 
+/// The gateway's tasks (Swarm) or container (standalone).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GatewayHealth {
+    pub status: Status,
+    pub desired: u64,
+    pub running: u64,
+}
+
+/// `down` with nothing running, `degraded` with fewer tasks than wanted, as
+/// with a global gateway missing a node.
+pub fn gateway_health(desired: u64, running: u64) -> GatewayHealth {
+    let status = if running == 0 {
+        Status::Down
+    } else if running < desired {
+        Status::Degraded
+    } else {
+        Status::Healthy
+    };
+    GatewayHealth {
+        status,
+        desired,
+        running,
+    }
+}
+
+/// The whole environment: the gateway, every certificate, and every deployed
+/// deployment.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StackHealth {
+    pub status: Status,
+    pub gateway: GatewayHealth,
+    /// With certificates the controller issues: the worst of them all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Tls>,
+    pub deployments: std::collections::BTreeMap<String, Health>,
+}
+
+/// The worst of the parts: a certificate that is not valid degrades a healthy
+/// stack, the same as it does a deployment.
+pub fn stack_health(
+    gateway: GatewayHealth,
+    certificates: &[Tls],
+    deployments: std::collections::BTreeMap<String, Health>,
+) -> StackHealth {
+    let tls = certificates.iter().copied().max();
+    let mut status = deployments.values().map(|h| h.status).fold(gateway.status, Status::max);
+    if tls.is_some_and(|t| t != Tls::Valid) {
+        status = status.max(Status::Degraded);
+    }
+    StackHealth {
+        status,
+        gateway,
+        tls,
+        deployments,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stack_is_the_worst_of_its_parts() {
+        let healthy = || health(&[service("api", "1.2.3", 1, 1)]);
+        let all_good = stack_health(
+            gateway_health(1, 1),
+            &[Tls::Valid],
+            [("prod".to_string(), healthy())].into(),
+        );
+        assert_eq!(all_good.status, Status::Healthy);
+
+        let one_down = stack_health(
+            gateway_health(2, 2),
+            &[],
+            [
+                ("prod".to_string(), healthy()),
+                ("admin".to_string(), health(&[service("web", "1.0.0", 1, 0)])),
+            ]
+            .into(),
+        );
+        assert_eq!(one_down.status, Status::Down);
+
+        let gateway_short = stack_health(gateway_health(3, 2), &[], [("prod".to_string(), healthy())].into());
+        assert_eq!(gateway_short.status, Status::Degraded);
+
+        let placeholder = stack_health(
+            gateway_health(1, 1),
+            &[Tls::Valid, Tls::SelfSigned],
+            [("prod".to_string(), healthy())].into(),
+        );
+        assert_eq!(
+            (placeholder.status, placeholder.tls),
+            (Status::Degraded, Some(Tls::SelfSigned))
+        );
+
+        assert_eq!(gateway_health(1, 0).status, Status::Down);
+    }
 
     fn service(name: &str, version: &str, desired: u64, running: u64) -> ServiceState {
         ServiceState {

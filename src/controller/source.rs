@@ -49,6 +49,10 @@ pub trait Source: Send + Sync {
     fn nodes(&self) -> BoxFuture<'_, Result<Option<Value>>> {
         Box::pin(async { Ok(None) })
     }
+    /// The gateway's desired and running tasks (Swarm) or containers (standalone).
+    fn gateway_replicas(&self) -> BoxFuture<'_, Result<(u64, u64)>> {
+        Box::pin(async { Ok((1, 1)) })
+    }
 }
 
 /// The gateway's certificates, for `/health`.
@@ -340,6 +344,44 @@ impl Source for DockerSource {
                     let filters = HashMap::from([("name".to_string(), vec![format!("^/{}$", GATEWAY_CONTAINER)])]);
                     let containers = self.containers(filters).await?;
                     Ok(json!({ "tasks": containers.iter().map(inspect::container_json).collect::<Vec<_>>() }))
+                }
+            }
+        })
+    }
+
+    fn gateway_replicas(&self) -> BoxFuture<'_, Result<(u64, u64)>> {
+        Box::pin(async move {
+            match self.mode {
+                Mode::Swarm => {
+                    let services = self
+                        .docker
+                        .list_services(Some(ListServicesOptions {
+                            filters: Some(HashMap::from([(
+                                "name".to_string(),
+                                vec![GATEWAY_SWARM_SERVICE.to_string()],
+                            )])),
+                            status: Some(true),
+                        }))
+                        .await
+                        .context("Cannot list the swarm's services")?;
+                    // The name filter matches prefixes too.
+                    let status = services
+                        .iter()
+                        .find(|s| s.spec.as_ref().and_then(|s| s.name.as_deref()) == Some(GATEWAY_SWARM_SERVICE))
+                        .and_then(|s| s.service_status.as_ref());
+                    Ok((
+                        status.and_then(|s| s.desired_tasks).unwrap_or_default(),
+                        status.and_then(|s| s.running_tasks).unwrap_or_default(),
+                    ))
+                }
+                Mode::Standalone => {
+                    let filters = HashMap::from([("name".to_string(), vec![format!("^/{}$", GATEWAY_CONTAINER)])]);
+                    let containers = self.containers(filters).await?;
+                    let running = containers
+                        .iter()
+                        .filter(|c| c.state == Some(ContainerSummaryStateEnum::RUNNING))
+                        .count() as u64;
+                    Ok((1, running))
                 }
             }
         })

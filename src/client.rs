@@ -1,7 +1,7 @@
 //! `simpled status`, `simpled logs` and `simpled wait`: clients of the controller
-//! (`docs/design/controller.md` §4). The first two use the private API, which the
-//! env spec routes under `controller.hosts`, with the token in
-//! `SIMPLED_TOKEN`. `wait` polls a deployment's public `/health`.
+//! (`docs/design/controller.md` §4), served under `/simpled/` on the env spec's
+//! `controller.host`. The first two use the private API, with the token in
+//! `SIMPLED_TOKEN`. `wait` polls a deployment's public health.
 
 use crate::spec::DeploymentEnvironmentSpec;
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,36 +28,37 @@ fn first_domain<'a>(env: &'a DeploymentEnvironmentSpec, alias: &str) -> Result<&
         .ok_or_else(|| anyhow!("gateway.hosts has no domain for '{}'", alias))
 }
 
-/// `https://<domain><prefix>/api/v1`, from the first of `controller.hosts`.
-pub fn api_base(env: &DeploymentEnvironmentSpec) -> Result<String> {
-    let (alias, prefix) = env
+/// `https://<domain>/simpled`: the controller, on the first domain of
+/// `controller.host`.
+fn controller_base(env: &DeploymentEnvironmentSpec) -> Result<String> {
+    let controller = env
         .ingress
         .controller
         .as_ref()
-        .and_then(|d| d.hosts.first())
-        .ok_or_else(|| {
-            anyhow!("The env spec routes no private API: set controller.hosts and a token, or pass --url")
-        })?;
-    Ok(format!(
-        "{}://{}{}/api/v1",
-        scheme(env),
-        first_domain(env, alias)?,
-        prefix.trim_end_matches('/')
-    ))
-}
-
-/// The public health of a deployment, on its primary host.
-pub fn health_url(env: &DeploymentEnvironmentSpec, deployment: &str) -> Result<String> {
-    let dep = env
-        .deployments
-        .iter()
-        .find(|d| d.name == deployment)
-        .ok_or_else(|| anyhow!("The env spec has no deployment '{}'", deployment))?;
+        .ok_or_else(|| anyhow!("The env spec has no controller: set controller.host, or pass --url"))?;
     Ok(format!(
         "{}://{}{}",
         scheme(env),
-        first_domain(env, &dep.primary_host)?,
-        crate::controller::http::HEALTH_PATH
+        first_domain(env, &controller.host)?,
+        crate::controller::PREFIX
+    ))
+}
+
+/// `https://<domain>/simpled/api/v1`.
+pub fn api_base(env: &DeploymentEnvironmentSpec) -> Result<String> {
+    Ok(format!("{}/api/v1", controller_base(env)?))
+}
+
+/// The public health of one deployment, on the controller's host.
+pub fn health_url(env: &DeploymentEnvironmentSpec, deployment: &str) -> Result<String> {
+    if !env.deployments.iter().any(|d| d.name == deployment) {
+        bail!("The env spec has no deployment '{}'", deployment);
+    }
+    Ok(format!(
+        "{}{}/{}",
+        controller_base(env)?,
+        crate::controller::http::HEALTH_PATH,
+        deployment
     ))
 }
 

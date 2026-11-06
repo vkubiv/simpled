@@ -10,7 +10,7 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
 fn project(controller: bool) -> tempfile::TempDir {
     let top = if controller {
         format!(
-            "swarm_mode: true\ncontroller:\n  hosts:\n    web:\n      prefix: /_simpled\n  read_token: \"{}\"",
+            "swarm_mode: true\ncontroller:\n  host: web\n  read_token: \"{}\"",
             TOKEN
         )
     } else {
@@ -39,12 +39,12 @@ fn status_needs_a_token() {
 }
 
 #[test]
-fn status_finds_the_api_under_its_prefix() {
+fn status_finds_the_api_under_simpled_on_the_controller_host() {
     let dir = project(true);
     let (ok, stderr) = run(&dir, &["status"], &[("SIMPLED_TOKEN", TOKEN)]);
     assert!(!ok);
     assert!(
-        stderr.contains("Cannot reach http://shop.simpled-test.invalid/_simpled/api/v1/status"),
+        stderr.contains("Cannot reach http://shop.simpled-test.invalid/simpled/api/v1/status"),
         "{}",
         stderr
     );
@@ -55,27 +55,20 @@ fn status_finds_the_api_under_its_prefix() {
             "prod",
             "api",
             "--url",
-            "http://ops.simpled-test.invalid/api/v1/",
+            "http://ops.simpled-test.invalid/simpled/api/v1/",
         ],
         &[("SIMPLED_TOKEN", TOKEN)],
     );
     assert!(
-        stderr.contains("Cannot reach http://ops.simpled-test.invalid/api/v1/deployments/prod/services/api/logs"),
+        stderr
+            .contains("Cannot reach http://ops.simpled-test.invalid/simpled/api/v1/deployments/prod/services/api/logs"),
         "{}",
         stderr
     );
 }
 
 #[test]
-fn without_controller_hosts_status_says_how_to_route_the_api() {
-    let dir = project(false);
-    let (ok, stderr) = run(&dir, &["status"], &[("SIMPLED_TOKEN", TOKEN)]);
-    assert!(!ok);
-    assert!(stderr.contains("set controller.hosts"), "{}", stderr);
-}
-
-#[test]
-fn wait_polls_the_primary_hosts_health_until_the_time_is_up() {
+fn wait_polls_the_deployments_health_on_the_controller_host_until_the_time_is_up() {
     let dir = project(false);
     let (ok, stderr) = run(
         &dir,
@@ -93,7 +86,7 @@ fn wait_polls_the_primary_hosts_health_until_the_time_is_up() {
     );
     assert!(!ok);
     assert!(
-        stderr.contains("http://shop.simpled-test.invalid/.well-known/simpled/health did not report 1.2.3 as healthy within 1 seconds; last: cannot reach it"),
+        stderr.contains("http://shop.simpled-test.invalid/simpled/health/prod did not report 1.2.3 as healthy within 1 seconds; last: cannot reach it"),
         "{}",
         stderr
     );

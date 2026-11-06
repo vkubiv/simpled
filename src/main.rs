@@ -74,10 +74,10 @@ enum Commands {
     },
 
     /// Every deployment's version, health and services, from the simpled controller.
-    /// Reads the API's address from the env spec here (controller.hosts)
+    /// Reads the API's address from the env spec here (controller.host)
     /// and the token from SIMPLED_TOKEN
     Status {
-        /// The API's base instead, e.g. https://ops.example.com/api/v1
+        /// The API's base instead, e.g. https://ops.example.com/simpled/api/v1
         #[arg(long)]
         url: Option<String>,
         /// Print the API's JSON answer
@@ -107,7 +107,7 @@ enum Commands {
     },
 
     /// Waits until a deployment reports a version as healthy and converged, on
-    /// its primary host's public /.well-known/simpled/health. For CI, after
+    /// the controller's public /simpled/health/<deployment>. For CI, after
     /// deploy.sh. Needs no token
     Wait {
         deployment: String,

@@ -60,12 +60,19 @@ extra_services:
       interval: 5s
 "#;
 
-/// An env spec for `env_type` with one `prod` deployment of the fixture app.
+/// An env spec for `env_type` with one `prod` deployment of the fixture app. On
+/// Docker the controller is served on `web`, unless `extra_top_level` sets it.
 pub fn envspec(env_type: &str, extra_top_level: &str, gateway_type: &str) -> String {
+    let controller = if env_type == "docker" && !extra_top_level.contains("controller:") {
+        "controller:\n  host: web"
+    } else {
+        ""
+    };
     format!(
         r#"
 type: {env_type}
 {extra_top_level}
+{controller}
 gateway:
   hosts:
     web: shop.example.com
