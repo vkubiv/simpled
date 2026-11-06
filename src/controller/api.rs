@@ -100,15 +100,7 @@ fn client(headers: &HeaderMap) -> String {
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
-    let mut response = (
-        status,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        json!({ "error": message }).to_string(),
-    )
-        .into_response();
+    let mut response = super::http::json_response(status, json!({ "error": message }));
     if status == StatusCode::UNAUTHORIZED {
         response
             .headers_mut()
@@ -173,15 +165,7 @@ pub fn authorize(api: &Api, headers: &HeaderMap, needed: Access) -> Result<Acces
 }
 
 fn json_ok(body: serde_json::Value) -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body.to_string(),
-    )
-        .into_response()
+    super::http::json_response(StatusCode::OK, body)
 }
 
 pub fn routes() -> Router<Arc<App>> {
@@ -230,14 +214,7 @@ async fn logs(
     let now = i64::try_from(super::unix_now()).unwrap_or(i64::MAX);
     let query = match super::inspect::log_query(&params, now) {
         Ok(q) => q,
-        Err(message) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                [(header::CONTENT_TYPE, "application/json")],
-                json!({ "error": message }).to_string(),
-            )
-                .into_response()
-        }
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
     };
     match app.source.logs(&deployment, &service, query).await {
         Ok(Some(stream)) => (
@@ -311,27 +288,36 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             return error(StatusCode::SERVICE_UNAVAILABLE, "cannot read the deployments");
         }
     };
-    let mut out = Vec::new();
-    for deployment in deployments {
-        let services = match app.source.services(&deployment).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("api: {}: {:#}", deployment, e);
-                continue;
-            }
-        };
-        let health = super::http::health_with_tls(&app, &deployment, model::health(&services)).await;
-        out.push(json!({
-            "name": deployment,
-            "version": model::version_document(&deployment, &services),
-            "health": health,
-            "services": services.iter().map(|s| json!({
-                "name": s.service,
-                "desired": s.desired,
-                "running": s.running,
-            })).collect::<Vec<_>>(),
-        }));
-    }
+    // Every deployment is read at once: one slow Docker call does not add to
+    // the next, and a dashboard's poll stays one round trip long.
+    let read = |deployment: String| {
+        let app = app.clone();
+        async move {
+            let services = match app.source.services(&deployment).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("api: {}: {:#}", deployment, e);
+                    return None;
+                }
+            };
+            let health = super::http::health_with_tls(&app, &deployment, model::health(&services)).await;
+            Some(json!({
+                "name": deployment,
+                "version": model::version_document(&deployment, &services),
+                "health": health,
+                "services": services.iter().map(|s| json!({
+                    "name": s.service,
+                    "desired": s.desired,
+                    "running": s.running,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+    };
+    let out: Vec<_> = futures_util::future::join_all(deployments.into_iter().map(read))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     json_ok(json!({ "deployments": out }))
 }
 

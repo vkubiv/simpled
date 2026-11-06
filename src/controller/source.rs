@@ -129,11 +129,8 @@ pub struct DockerSource {
 }
 
 impl DockerSource {
-    pub fn connect(mode: Mode) -> Result<Self> {
-        Ok(DockerSource {
-            docker: connect_docker()?,
-            mode,
-        })
+    pub fn new(docker: Docker, mode: Mode) -> Self {
+        DockerSource { docker, mode }
     }
 }
 

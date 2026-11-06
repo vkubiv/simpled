@@ -317,8 +317,41 @@ pub fn import_acme_json(
             let Some(main) = names.first().cloned() else {
                 continue;
             };
-            let chain = decode(&entry["certificate"], "certificate", &main)?;
-            let key = decode(&entry["key"], "key", &main)?;
+            // The names this gateway can use are known before the entry is
+            // decoded, so an entry with none of them is not even looked at.
+            let mut wanted = Vec::new();
+            for name in names {
+                if name.starts_with("*.") {
+                    report
+                        .skipped
+                        .push((name, "a wildcard, which HTTP-01 cannot renew".to_string()));
+                } else if only.is_some_and(|domains| !domains.contains(&name)) {
+                    report
+                        .skipped
+                        .push((name, "not one of the gateway's domains".to_string()));
+                } else {
+                    wanted.push(name);
+                }
+            }
+            if wanted.is_empty() {
+                continue;
+            }
+            // One entry Traefik left half-written (an order it never finished)
+            // must not stop the import of the others, or the deploy.
+            let decoded = decode(&entry["certificate"], "certificate", &main).and_then(|chain| {
+                let key = decode(&entry["key"], "key", &main)?;
+                let expires = crate::controller::acme::not_after(&chain)?;
+                Ok((chain, key, expires))
+            });
+            let (chain, key, expires) = match decoded {
+                Ok(d) => d,
+                Err(e) => {
+                    for name in wanted {
+                        report.skipped.push((name, format!("{:#}", e)));
+                    }
+                    continue;
+                }
+            };
             let pem = format!(
                 "{}
 {}",
@@ -326,20 +359,7 @@ pub fn import_acme_json(
                 key.trim_end()
             ) + "
 ";
-            let expires = crate::controller::acme::not_after(&chain)?;
-            for name in names {
-                if name.starts_with("*.") {
-                    report
-                        .skipped
-                        .push((name, "a wildcard, which HTTP-01 cannot renew".to_string()));
-                    continue;
-                }
-                if only.is_some_and(|domains| !domains.contains(&name)) {
-                    report
-                        .skipped
-                        .push((name, "not one of the gateway's domains".to_string()));
-                    continue;
-                }
+            for name in wanted {
                 if expires <= now {
                     report.skipped.push((name, "expired".to_string()));
                     continue;
@@ -374,7 +394,16 @@ pub fn import_acme_json(
 /// with the new names removes it, once, and waits until its containers and
 /// networks are gone. Only a stack whose gateway carries simpled's label is
 /// removed; any other `ingress` stack stops the deploy with what to do.
-pub fn retire_legacy_stack(docker: &dyn Docker, wait: std::time::Duration, poll: std::time::Duration) -> Result<bool> {
+///
+/// `images` are the new stack's: they are pulled first, while the old gateway
+/// still serves, so an image that cannot be pulled (a tag that does not exist, a
+/// registry that cannot be reached) stops the deploy before anything is removed.
+pub fn retire_legacy_stack(
+    docker: &dyn Docker,
+    images: &[String],
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<bool> {
     let output = docker.run(&[
         "service",
         "inspect",
@@ -395,6 +424,20 @@ pub fn retire_legacy_stack(docker: &dyn Docker, wait: std::time::Duration, poll:
             LEGACY_GATEWAY_SERVICE,
             LEGACY_STACK
         );
+    }
+    for image in images {
+        eprintln!("Pulling {} before the '{}' stack is removed", image, LEGACY_STACK);
+        let output = docker.run(&["pull", "--quiet", image])?;
+        if !output.success {
+            bail!(
+                "Cannot pull {}, which the '{}' stack's gateway needs: {}. The '{}' stack is left as it is; \
+                 fix the image (or set the variable it comes from) and run deploy.sh again.",
+                image,
+                STACK,
+                output.stderr.trim(),
+                LEGACY_STACK
+            );
+        }
     }
     eprintln!(
         "The gateway now runs in the '{}' stack. Removing the '{}' stack simpled {} deployed; \
@@ -421,6 +464,36 @@ pub fn retire_legacy_stack(docker: &dyn Docker, wait: std::time::Duration, poll:
         }
         std::thread::sleep(poll);
     }
+}
+
+/// The images a stack file's services run, with `${VAR:-default}` resolved the
+/// way `docker stack deploy` does it, from `lookup`. An image written any other
+/// way is skipped: it is checked by the deploy itself.
+pub fn stack_images(compose: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let Ok(stack) = serde_yaml::from_str::<serde_yaml::Value>(compose) else {
+        return vec![];
+    };
+    let Some(services) = stack.get("services").and_then(|s| s.as_mapping()) else {
+        return vec![];
+    };
+    let mut images = Vec::new();
+    for service in services.values() {
+        let Some(image) = service.get("image").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let resolved = match image.strip_prefix("${").and_then(|rest| rest.strip_suffix('}')) {
+            Some(inner) => match inner.split_once(":-") {
+                Some((var, default)) => lookup(var).filter(|v| !v.is_empty()).unwrap_or(default.to_string()),
+                None => continue,
+            },
+            None if image.contains('$') => continue,
+            None => image.to_string(),
+        };
+        if !images.contains(&resolved) {
+            images.push(resolved);
+        }
+    }
+    images
 }
 
 /// Removes older objects: of each base name, the two newest stay, the current
@@ -1446,12 +1519,12 @@ c
         let quick = std::time::Duration::from_millis(1);
         // None there: nothing to do.
         let docker = FakeDocker::new(&[("service inspect ingress_traefik", false, "")]);
-        assert!(!retire_legacy_stack(&docker, quick, quick).unwrap());
+        assert!(!retire_legacy_stack(&docker, &[], quick, quick).unwrap());
         assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("stack rm")));
 
         // simpled's: removed, then waited for.
         let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, "2.0.1\n")]);
-        assert!(retire_legacy_stack(&docker, quick, quick).unwrap());
+        assert!(retire_legacy_stack(&docker, &[], quick, quick).unwrap());
         let calls = docker.calls.borrow();
         assert!(calls.contains(&"stack rm ingress".to_string()), "{:?}", calls);
         assert!(calls
@@ -1461,7 +1534,7 @@ c
 
         // Someone else's: left alone, with what to do.
         let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, "<no value>\n")]);
-        let err = retire_legacy_stack(&docker, quick, quick).unwrap_err();
+        let err = retire_legacy_stack(&docker, &[], quick, quick).unwrap_err();
         assert!(err.to_string().contains("carries no simpled.version label"), "{}", err);
         assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("stack rm")));
     }
@@ -1473,7 +1546,92 @@ c
             ("service inspect ingress_traefik", true, "2.0.1"),
             ("ps -q", true, "abc123\n"),
         ]);
-        let err = retire_legacy_stack(&docker, quick, quick).unwrap_err();
+        let err = retire_legacy_stack(&docker, &[], quick, quick).unwrap_err();
         assert!(err.to_string().contains("still there"), "{}", err);
+    }
+
+    #[test]
+    fn the_new_images_are_pulled_while_the_old_stack_still_serves() {
+        let quick = std::time::Duration::from_millis(1);
+        let images = vec!["traefik:v2.10".to_string(), "ghcr.io/vkubiv/simpled:2.1.0".to_string()];
+        let docker = FakeDocker::new(&[("service inspect ingress_traefik", true, "2.0.1\n")]);
+        assert!(retire_legacy_stack(&docker, &images, quick, quick).unwrap());
+        let calls = docker.calls.borrow();
+        let position = |prefix: &str| calls.iter().position(|c| c.starts_with(prefix)).unwrap();
+        assert!(
+            position("pull --quiet traefik:v2.10") < position("stack rm ingress"),
+            "{:?}",
+            calls
+        );
+        assert!(position("pull --quiet ghcr.io/vkubiv/simpled:2.1.0") < position("stack rm ingress"));
+        drop(calls);
+
+        // An image that cannot be pulled: nothing is removed.
+        let docker = FakeDocker::new(&[
+            ("service inspect ingress_traefik", true, "2.0.1\n"),
+            ("pull --quiet ghcr.io", false, ""),
+        ]);
+        let err = retire_legacy_stack(&docker, &images, quick, quick).unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot pull ghcr.io/vkubiv/simpled:2.1.0"),
+            "{}",
+            err
+        );
+        assert!(err.to_string().contains("boom"), "{}", err);
+        assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("stack rm")));
+
+        // No legacy stack: nothing is pulled either.
+        let docker = FakeDocker::new(&[("service inspect ingress_traefik", false, "")]);
+        assert!(!retire_legacy_stack(&docker, &images, quick, quick).unwrap());
+        assert!(!docker.calls.borrow().iter().any(|c| c.starts_with("pull")));
+    }
+
+    #[test]
+    fn stack_images_resolve_variables_the_way_docker_stack_deploy_does() {
+        let compose = concat!(
+            "services:\n",
+            "  traefik:\n    image: traefik:v2.10\n",
+            "  controller:\n    image: \"${SIMPLED_CONTROLLER_IMAGE:-ghcr.io/vkubiv/simpled:2.1.0}\"\n",
+            "  other:\n    image: ${NO_DEFAULT}\n",
+            "  again:\n    image: traefik:v2.10\n",
+        );
+        let none = |_: &str| None;
+        assert_eq!(
+            stack_images(compose, &none),
+            vec!["traefik:v2.10", "ghcr.io/vkubiv/simpled:2.1.0"]
+        );
+        let set = |name: &str| (name == "SIMPLED_CONTROLLER_IMAGE").then(|| "registry.local/simpled:dev".to_string());
+        assert_eq!(
+            stack_images(compose, &set),
+            vec!["traefik:v2.10", "registry.local/simpled:dev"]
+        );
+        assert!(stack_images("not: [yaml", &none).is_empty());
+    }
+
+    #[test]
+    fn a_half_written_entry_is_skipped_and_the_others_are_imported() {
+        let mut broken = acme_entry("pending.example.com", &[], 2027);
+        broken["certificate"] = serde_json::Value::String(String::new());
+        let mut foreign = acme_entry("gone.example.com", &[], 2027);
+        foreign["certificate"] = serde_json::Value::String("not base64!".to_string());
+        let store = serde_json::json!({
+            "myresolver": {"Certificates": [broken, foreign, acme_entry("shop.example.com", &[], 2027)]}
+        })
+        .to_string();
+        let docker = FakeDocker::new(&[("secret inspect", false, "")]);
+        let only = vec!["shop.example.com".to_string(), "pending.example.com".to_string()];
+        let report = import_acme_json(&docker, &store, Some(&only), NOW_2026).unwrap();
+        assert_eq!(report.imported, vec!["shop.example.com"]);
+        assert_eq!(report.skipped.len(), 2, "{:?}", report.skipped);
+        assert_eq!(report.skipped[0].0, "pending.example.com");
+        assert!(report.skipped[0].1.contains("not PEM"), "{}", report.skipped[0].1);
+        // Not one of the gateway's domains: never decoded, so its garbage is not an error.
+        assert_eq!(
+            report.skipped[1],
+            (
+                "gone.example.com".to_string(),
+                "not one of the gateway's domains".to_string()
+            )
+        );
     }
 }

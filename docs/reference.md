@@ -1908,9 +1908,11 @@ certificate and key, in one PEM, from `/run/secrets/simpled_tls/<domain>.pem`.
    a domain has an issued certificate, its placeholder and all but the two newest
    certificates are removed.
 
-The controller keeps no state: each start creates a new ACME account, and what it
-needs to know about a certificate is in its labels. If the controller is down, the
-gateway keeps serving; renewals wait, with 30 days of margin.
+The controller keeps almost no state: what it needs to know about a certificate is
+in its labels, and its ACME account lives in a Swarm config (`simpled_acme_account_*`,
+named after the directory and the e-mail), so every start is the same account at the
+CA and restarts do not run into Let's Encrypt's limit on new accounts. If the
+controller is down, the gateway keeps serving; renewals wait, with 30 days of margin.
 
 **The `simpled` stack.** simpled 2.0.x ran the gateway in a stack called `ingress`,
 the same name as Swarm's own routing-mesh network. The gateway and the controller
@@ -1918,8 +1920,10 @@ now run in the `simpled` stack, as `simpled_gateway` and `simpled_controller`, a
 the deploy directory has `gateway/` instead of `ingress/`. The first deploy with the
 new names removes the old stack (`./simpled step retire-legacy-stack`), which takes
 the gateway down for a few seconds once: the new gateway cannot bind ports 80 and 443
-while the old one holds them. It only removes an `ingress` stack whose gateway carries
-simpled's `simpled.version` label; any other one stops the deploy with what to do. On
+while the old one holds them. The new stack's images are pulled first, while the old
+gateway still serves, so an image that cannot be pulled stops the deploy with the old
+gateway in place. It only removes an `ingress` stack whose gateway carries simpled's
+`simpled.version` label; any other one stops the deploy with what to do. On
 standalone Docker the gateway container is now `simpled-gateway`, and `deploy.sh`
 removes the old `traefik-ingress` one.
 
@@ -1928,8 +1932,13 @@ removes the old `traefik-ingress` one.
 imports the certificates of the gateway's domains into secrets before anything else,
 then renames the file `acme.json.imported`. The gateway starts with the certificates
 it already had, and the controller requests nothing until they are 30 days from expiry.
-Expired certificates and wildcard names are not imported. To import a file kept
-elsewhere, run [`simpled tls import`](#simpled-tls-import) on a swarm manager first.
+Expired certificates and wildcard names are not imported, and an entry Traefik left
+half-written is skipped with its reason, not a failure. Traefik wrote the file as root,
+readable by root only; when `deploy.sh` runs as a user that cannot read it or rename it,
+the deploy stops and names the one command to run instead
+(`sudo ./simpled step tls-import gateway/plan.json letsencrypt/acme.json`). To import a
+file kept elsewhere, run [`simpled tls import`](#simpled-tls-import) on a swarm manager
+first.
 
 ---
 

@@ -190,6 +190,8 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
         let challenges = acme::Challenges::default();
+        // One connection; bollard's `Docker` is a cheap clone of it.
+        let docker = source::connect_docker()?;
         let certs = match &config.acme {
             Some(acme_config) => {
                 let mut domains_of: std::collections::HashMap<String, Vec<String>> = Default::default();
@@ -202,7 +204,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
                     }
                 }
                 Some(http::Certs {
-                    source: Box::new(source::CachedCerts::new(source::connect_docker()?)),
+                    source: Box::new(source::CachedCerts::new(docker.clone())),
                     domains_of,
                     domains: acme_config.domains.clone(),
                 })
@@ -210,13 +212,12 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
             None => None,
         };
         if let Some(acme_config) = config.acme.clone() {
-            let docker = source::connect_docker()?;
             eprintln!(
                 "Issuing the gateway's certificates for {} domain(s) from {}",
                 acme_config.domains.len(),
                 acme_config.directory
             );
-            tokio::spawn(acme::run(acme_config, docker, challenges.clone()));
+            tokio::spawn(acme::run(acme_config, docker.clone(), challenges.clone()));
         }
         let api = config.api.as_ref().and_then(|a| {
             api::Api::new(
@@ -236,7 +237,7 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
                 .iter()
                 .map(|o| (o.domain.to_ascii_lowercase(), o.deployment.clone()))
                 .collect(),
-            source: Box::new(source::DockerSource::connect(config.mode)?),
+            source: Box::new(source::DockerSource::new(docker, config.mode)),
         });
         let listener = tokio::net::TcpListener::bind(listen)
             .await
