@@ -27,7 +27,7 @@ describe("web app: monitoring", () => {
       "deploy/prod/envspec.yaml": envSpec(host, { prod: { application: "shop" } }),
       "appspec.yaml": appSpec("shop", "2.0.0"),
     });
-    await fakes.site(host, { application: "shop", deployment: "prod", version: "1.9.0" });
+    await fakes.controller(host, { application: "shop", deployment: "prod", version: "1.9.0" });
 
     const app = await signedInApp(sugar.email("ann"));
     apps.push(app);

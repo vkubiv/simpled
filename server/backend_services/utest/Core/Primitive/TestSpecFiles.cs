@@ -21,6 +21,66 @@ public class TestSpecFiles
     }
 
     [Fact]
+    public void TestReadEnvSpec_DockerAsksTheController()
+    {
+        var spec = SpecFiles.ReadEnvSpec(MonitorSupport.EnvSpec);
+
+        var canary = spec.Deployments.Single(d => d.Name == "canary");
+        Assert.Equal("https://ops.example.com/simpled/version/canary", canary.VersionUrl);
+        Assert.Equal("https://ops.example.com/simpled/health/canary", canary.HealthUrl);
+
+        var workers = SpecFiles.ReadEnvSpec("""
+            type: docker
+            gateway:
+              tls: { upstream: true }
+              hosts:
+                ops: [ops.example.com]
+            controller: { host: ops }
+            deployments:
+              jobs:
+                application: { name: worker }
+            """).Deployments.Single();
+        Assert.Equal("https://ops.example.com", workers.Url);
+        Assert.Equal("https://ops.example.com/simpled/version/jobs", workers.VersionUrl);
+
+        var templated = SpecFiles.ReadEnvSpec("""
+            type: docker
+            gateway:
+              hosts:
+                web: shop.example.com
+                ops: ops.$port(gateway)
+            controller: { host: ops }
+            deployments:
+              prod:
+                primary_host: web
+                application: { name: shop }
+            """).Deployments.Single();
+        Assert.Equal("https://shop.example.com", templated.Url);
+        Assert.Null(templated.VersionUrl);
+        Assert.Null(templated.HealthUrl);
+    }
+
+    [Theory]
+    [InlineData("type: k8s")]
+    [InlineData("type: docker")]
+    [InlineData("type: k8s\ncontroller: { host: web }")]
+    public void TestReadEnvSpec_WellKnownWithoutAController(string head)
+    {
+        var deployment = SpecFiles.ReadEnvSpec(head + """
+
+            gateway:
+              hosts:
+                web: shop.example.com
+            deployments:
+              prod:
+                application: { name: shop }
+            """).Deployments.Single();
+
+        Assert.Equal("https://shop.example.com/.well-known/simpled/version", deployment.VersionUrl);
+        Assert.Null(deployment.HealthUrl);
+    }
+
+    [Fact]
     public void TestReadEnvSpec_TlsDisabledSingleHostAndTemplates()
     {
         var spec = SpecFiles.ReadEnvSpec("""
@@ -41,6 +101,7 @@ public class TestSpecFiles
 
         Assert.Null(spec.Deployments.Single(d => d.Name == "local").Url);
         Assert.Null(spec.Deployments.Single(d => d.Name == "other").Url);
+        Assert.Null(spec.Deployments.Single(d => d.Name == "other").VersionUrl);
 
         var plain = SpecFiles.ReadEnvSpec("""
             gateway:

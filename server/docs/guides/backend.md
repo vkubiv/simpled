@@ -13,7 +13,7 @@ A .NET 10 solution, `backend_services/backend.sln`:
 | `core` | Everything else: `Operations/`, `Validations/`, `Presentation/`, `Rules/`, `Primitive/`, `Auth/` (sessions, cookie, rate limiting), `Libs/` (`EntityAccess`, `MVCValidation`), `Services/` (`Clock`, `Mailer`). |
 | `db` | `Entities/*Entity.cs`: POCOs with snake_case `[Table]` / `[Column]` and indexes as attributes. |
 | `primary-db` | `PrimaryDbContext` (the `DbSet`s), `DesignTimeDbContextFactory`, `Migrations/`. |
-| `monitor-svc` | One instance: `MonitorWorker` re-syncs stale repositories and checks due deployments' version endpoints each tick (`MonitorRound`); `/health` says the loop runs. |
+| `monitor-svc` | One instance: `MonitorWorker` re-syncs stale repositories and checks due deployments' version (and controller health) endpoints each tick (`MonitorRound`); `/health` says the loop runs. |
 | `db-setup` | The `job` that applies migrations before main-svc starts. |
 | `config` | `CommonConfiguration` + `ConfigurationLoader`: environment variables and secret files. Not `appsettings.json`. |
 | `utest` | xUnit + EF InMemory. |
@@ -169,8 +169,8 @@ they are in one of its teams (`ProjectOps.IsMember`).
 
 - **Outside calls** go through two interfaces registered by `core/Services/MonitoringServices`: `IGitHub`
   (`GitHubClient`, REST with the organization's token, answering `GitHubResult<T>` with `Unauthorized` /
-  `NotFound` / `Unavailable` instead of throwing) and `IVersionProbe` (`VersionProbe`, through `PROBE_PROXY_URL`
-  when set). Controllers take `IGitHub` with `[FromServices]` like any dependency; tests pass fakes.
+  `NotFound` / `Unavailable` instead of throwing) and `IDeploymentProbe` (`DeploymentProbe`, through
+  `PROBE_PROXY_URL` when set). Controllers take `IGitHub` with `[FromServices]` like any dependency; tests pass fakes.
 - **Tokens**: `TokenCipher` encrypts on the way in (`GitHubConnectionOps.Create` / `ReplaceToken`) and
   `GitHubConnectionOps.Token` decrypts for a call. Presenters never include them.
 - **Specs**: `core/Primitive/SpecFiles` reads only what monitoring needs from envspec.yaml and appspec.yaml and

@@ -3,8 +3,8 @@
 Guidance for Claude Code in `server/`. Write few comments: they say why, not what.
 
 The simpled control plane: accounts, organizations, teams, projects and roles, plus monitoring of what they
-deploy (GitHub repositories' envspecs, each deployment's version endpoint), as one simpled bundle
-(`appspec.yaml`). Plan, data model and role matrix: `docs/plan.md`.
+deploy (GitHub repositories' envspecs, each deployment's version and, on Docker, the simpled controller's health),
+as one simpled bundle (`appspec.yaml`). Plan, data model and role matrix: `docs/plan.md`.
 
 | Part | Where | Guide |
 |---|---|---|
@@ -35,7 +35,7 @@ e2e, frontend); the guides are self-contained, look there only for an example th
   never touch repositories or ops.
 - A change to an endpoint touches main-svc, `backend-client`, `utest` and `e2e` in the same change.
 - GitHub tokens are stored only encrypted (`TokenCipher`, secret `github_token_key`) and never presented. Nothing
-  in the server calls GitHub or a deployment except through `IGitHub` / `IVersionProbe`, which tests fake.
+  in the server calls GitHub or a deployment except through `IGitHub` / `IDeploymentProbe`, which tests fake.
 
 ## Commands (from `server/`)
 

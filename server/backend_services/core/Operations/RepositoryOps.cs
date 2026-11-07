@@ -210,9 +210,11 @@ public static class RepositoryOps
                 deployment.ApplicationName = spec.ApplicationName;
                 deployment.VersionConstraint = spec.VersionConstraint;
                 deployment.RepoVersion = appVersions.GetValueOrDefault(spec.ApplicationName);
-                if (deployment.Url != spec.Url)
+                deployment.Url = spec.Url;
+                if (deployment.VersionUrl != spec.VersionUrl || deployment.HealthUrl != spec.HealthUrl)
                 {
-                    deployment.Url = spec.Url;
+                    deployment.VersionUrl = spec.VersionUrl;
+                    deployment.HealthUrl = spec.HealthUrl;
                     MonitorOps.Reset(deployment);
                 }
             }

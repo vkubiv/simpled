@@ -662,7 +662,7 @@ App containers are not on `simpled_control` and reach the controller only throug
 | `GET /simpled/health/{deployment}` | One deployment. |
 | `GET /simpled/version/{deployment}` | `{"application","version","deployment","deployed_at"}`; `deployed_at` is when `deploy.sh` ran (Unix seconds), so a redeploy of the same version is visible too. |
 
-Both health routes answer 200 only when `status` is `healthy` and 503 otherwise, with the same body, so an uptime check needs no JSON. A deployment the env spec does not name and Docker does not run is a 404.
+Both health routes answer 200 whenever the controller could read Docker, whatever `status` says, even `down`: the HTTP status is about the controller, and the health is in the body. They answer 503 only when the controller cannot read Docker (or, for `/simpled/health`, the gateway service), with whatever document it could build. An uptime check alarms on `status` in the body, or on a 503 or no answer for the controller itself. A deployment the env spec does not name and Docker does not run is a 404.
 
 ```json
 {"status":"healthy","converged":true,"version":"1.2.3"}

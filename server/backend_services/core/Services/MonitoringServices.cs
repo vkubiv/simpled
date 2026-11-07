@@ -16,9 +16,10 @@ public static class MonitoringServices
         return services;
     }
 
-    public static IServiceCollection AddVersionProbe(this IServiceCollection services, CommonConfiguration config)
+    public static IServiceCollection AddDeploymentProbe(this IServiceCollection services, CommonConfiguration config)
     {
-        services.AddSingleton<IVersionProbe>(new VersionProbe(VersionProbe.CreateHttpClient(config.ProbeProxyUrl)));
+        services.AddSingleton<IDeploymentProbe>(
+            new DeploymentProbe(DeploymentProbe.CreateHttpClient(config.ProbeProxyUrl)));
         return services;
     }
 }

@@ -51,7 +51,7 @@ public static class MonitorRound
     public static async Task<int> CheckDeployments(
         DateTime now,
         TimeSpan interval,
-        IVersionProbe probe,
+        IDeploymentProbe probe,
         Mutate<DeploymentEntity> mutateDeployments,
         Mutate<DeploymentEventEntity> mutateEvents,
         UnitOfWork unitOfWork,
@@ -69,7 +69,7 @@ public static class MonitorRound
             await gate.WaitAsync(cancellationToken);
             try
             {
-                return await probe.Probe(d.Url!, cancellationToken);
+                return await probe.Probe(d.VersionUrl!, d.HealthUrl, cancellationToken);
             }
             finally
             {

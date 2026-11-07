@@ -244,6 +244,10 @@ namespace primary_db.Migrations
                         .HasColumnType("integer")
                         .HasColumnName("failure_count");
 
+                    b.Property<string>("HealthUrl")
+                        .HasColumnType("text")
+                        .HasColumnName("health_url");
+
                     b.Property<DateTime?>("LiveDeployedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("live_deployed_at");
@@ -277,6 +281,10 @@ namespace primary_db.Migrations
                     b.Property<string>("VersionConstraint")
                         .HasColumnType("text")
                         .HasColumnName("version_constraint");
+
+                    b.Property<string>("VersionUrl")
+                        .HasColumnType("text")
+                        .HasColumnName("version_url");
 
                     b.HasKey("Id");
 

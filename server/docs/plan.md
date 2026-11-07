@@ -52,8 +52,8 @@ Local gateway `localhost:7080`: `/api` → main-svc (prefix stripped), `/` → w
 | `github_connections` | org, name (unique per org), github_login, token_ciphertext (AES-GCM, key from the `github_token_key` secret), created_at |
 | `repositories` | project, github_connection, owner, name (unique per project), default_branch, synced_at, synced_revision, sync_error |
 | `environments` | repository, name (the envspec's directory), path (unique per repository) |
-| `deployments` | environment, name (unique per environment), application_name, version_constraint, url (primary host), repo_version (the appspec's), status (`unknown` / `up` / `down` / `mismatch`), status_since, live_version, live_deployed_at, checked_at, check_error, failure_count |
-| `deployment_events` | deployment, at, kind (`version-changed` / `down` / `up` / `mismatch`), version, previous_version, details |
+| `deployments` | environment, name (unique per environment), application_name, version_constraint, url (primary host), version_url, health_url (the controller's, Docker only), repo_version (the appspec's), status (`unknown` / `up` / `degraded` / `down` / `mismatch`), status_since, live_version, live_deployed_at, checked_at, check_error, failure_count |
+| `deployment_events` | deployment, at, kind (`version-changed` / `down` / `degraded` / `up` / `mismatch`), version, previous_version, details |
 
 ## Roles
 
@@ -115,17 +115,24 @@ Monitoring:
 A sync (`RepositoryOps.Sync`) lists the default branch's tree, reads every `envspec.yaml` (an environment, named
 after its directory) and `appspec.yaml` (application name → version), and makes the rows match: a deployment's URL
 is the first domain of its `primary_host` (`http` when `gateway.tls.disable`), `extends` is followed, templated
-hosts (`$port(...)`) give none. An envspec that cannot be read leaves its environment as it was; problems go to
+hosts (`$port(...)`) give none. Where the monitor asks follows simpled 2.1: a `type: docker` envspec with a
+`controller` block is asked on the first domain of `controller.host`, at `/simpled/version/<deployment>` and
+`/simpled/health/<deployment>`, so route-less deployments are followed too; Kubernetes, local and Docker envspecs
+from before 2.1 (no `controller`) answer `/.well-known/simpled/version` on the primary host and have no health.
+A deployment is reset when those URLs change, not when only its primary host does. An envspec that cannot be read leaves its environment as it was; problems go to
 `sync_error`. Linking and "Sync now" sync in main-svc; `monitor-svc` re-syncs every
 `REPOSITORY_SYNC_INTERVAL_SECONDS` (600).
 
-`monitor-svc` (one instance) asks each deployment's `/.well-known/simpled/version` every `MONITOR_INTERVAL_SECONDS`
-(60) and applies `MonitorOps.ApplyCheck`: an answer for the deployment is `up` and records a `version-changed`
-event when the version moves; an answer for another application or deployment is `mismatch`; two failures in a row
-are `down`. Status changes are events, except a new deployment's first `up`.
+`monitor-svc` (one instance) checks each deployment every `MONITOR_INTERVAL_SECONDS` (60) and applies
+`MonitorOps.ApplyCheck`: an answer for the deployment records a `version-changed` event when the version moves;
+an answer for another application or deployment is `mismatch`; with the controller's health `healthy` (or no health
+endpoint) it is `up`. Two failed checks in a row are `down`, and so are two in a row the controller reports `down`;
+two it reports `degraded` (fewer tasks than wanted, a failing healthcheck, a certificate not `valid`) are
+`degraded`, so a rollout replacing a task does not flap. Status changes are events, except a new deployment's
+first `up`.
 
-Next: deploy CI runs from GitHub Actions (workflows that run `simpled prepare-deployment <deployment>`), and
-service health through a gateway endpoint simpled aggregates from the appspec healthchecks.
+Next: a deployment's services, tasks and logs from the controller's private API (`controller.read_token`), which
+needs a per-environment token stored like GitHub tokens. Deploy CI runs from GitHub Actions are set aside.
 
 ## web-app pages
 
@@ -139,5 +146,5 @@ service health through a gateway endpoint simpled aggregates from the appspec he
 4. ✅ `web-app`, its controller tests, and e2e cases driving its controllers (`e2e/test/web-app/`).
 5. ✅ CLAUDE.md and guides adapted to this repo (`docs/guides/`).
 6. ✅ Monitoring: GitHub connections, linked repositories synced into environments and deployments, monitor-svc
-   checking version endpoints, simpled-fakes for local runs and e2e, the `github` page and the project's
+   checking version endpoints (the simpled 2.1 controller's version and health on Docker), simpled-fakes for local runs and e2e, the `github` page and the project's
    deployments.

@@ -185,8 +185,11 @@ controller sees them, after the gateway strips the prefix.
 | `GET /health/{d}` | `{"status":"healthy\|degraded\|down","converged":bool,"version":"1.2.3"}`, plus `tls` and `services_status` with Let's Encrypt on Swarm. |
 | `GET /version/{d}` | `{"application","version","deployment","deployed_at"}`. |
 
-Both health routes answer 200 when `healthy` and 503 otherwise, so uptime checks need
-no JSON parsing. A `{d}` that the env spec does not name and Docker does not run is a
+Both health routes answer 200 whenever the controller could read Docker, whatever the
+`status` in the body, even `down`, and 503 only when it could not: the HTTP status is
+about the controller, not about what it reports. A `degraded` environment usually still
+serves (a rollout, an expiring certificate), so a 503 for it would mislead clients and
+balancers. A `{d}` that the env spec does not name and Docker does not run is a
 404; one the env spec names but that has no services yet is `down`.
 
 A deployment's health:

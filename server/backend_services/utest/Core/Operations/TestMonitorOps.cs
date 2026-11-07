@@ -16,11 +16,17 @@ public class TestMonitorOps
         Name = "prod",
         ApplicationName = "shop",
         Url = "https://shop.example.com",
+        VersionUrl = "https://ops.example.com/simpled/version/prod",
+        HealthUrl = "https://ops.example.com/simpled/health/prod",
         Status = DeploymentEntity.StatusUnknown,
     };
 
-    private static ProbeResult Answer(string version, string application = "shop", string deployment = "prod") =>
-        ProbeResult.Ok(new VersionInfo(application, version, deployment, Now.AddHours(-1)));
+    private static ProbeResult Answer(string version, string application = "shop", string deployment = "prod",
+        HealthInfo? health = null) =>
+        ProbeResult.Ok(new VersionInfo(application, version, deployment, Now.AddHours(-1)), health);
+
+    private static ProbeResult Health(string status, bool converged = true, string? tls = null) =>
+        Answer("1.2.3", health: new HealthInfo(status, converged, tls));
 
     private static async Task Apply(PrimaryDbContext db, DeploymentEntity deployment, ProbeResult result,
         int minutes = 0)
@@ -117,12 +123,53 @@ public class TestMonitorOps
         var fresh = NewDeployment();
         fresh.CheckedAt = Now.AddSeconds(-10);
         var noAddress = NewDeployment();
-        noAddress.Url = null;
+        noAddress.VersionUrl = null;
         db.Deployments.AddRange(never, stale, fresh, noAddress);
         await db.SaveChangesAsync();
 
         var due = await MonitorOps.DueForCheck(Now, TimeSpan.FromMinutes(1), 10, new Read<DeploymentEntity>(db));
 
         Assert.Equal([never.Id, stale.Id], due.Select(d => d.Id).Order());
+    }
+
+    [Fact]
+    public async Task TestApplyCheck_UnhealthyTwiceInARowIsDegradedThenDown()
+    {
+        var (db, deployment) = await Setup();
+        await Apply(db, deployment, Health("healthy"));
+
+        await Apply(db, deployment, Health("degraded", converged: false), minutes: 1);
+        Assert.Equal(DeploymentEntity.StatusUp, deployment.Status);
+        Assert.Equal("The controller reports the deployment degraded (rollout in progress).", deployment.CheckError);
+
+        await Apply(db, deployment, Health("degraded", tls: "self-signed"), minutes: 2);
+        Assert.Equal(DeploymentEntity.StatusDegraded, deployment.Status);
+        Assert.Contains("certificate self-signed", deployment.CheckError, StringComparison.Ordinal);
+
+        await Apply(db, deployment, Health("down"), minutes: 3);
+        Assert.Equal(DeploymentEntity.StatusDown, deployment.Status);
+        Assert.Equal("1.2.3", deployment.LiveVersion);
+
+        await Apply(db, deployment, Health("healthy"), minutes: 4);
+        Assert.Equal(DeploymentEntity.StatusUp, deployment.Status);
+        Assert.Null(deployment.CheckError);
+        Assert.Equal(0, deployment.FailureCount);
+        Assert.Equal(
+            [DeploymentEventEntity.KindDegraded, DeploymentEventEntity.KindDown, DeploymentEventEntity.KindUp],
+            db.DeploymentEvents.OrderBy(e => e.At).Select(e => e.Kind));
+    }
+
+    [Fact]
+    public async Task TestApplyCheck_OneHealthyAnswerAfterAnUnhealthyOneResets()
+    {
+        var (db, deployment) = await Setup();
+        await Apply(db, deployment, Health("healthy"));
+
+        await Apply(db, deployment, Health("down"), minutes: 1);
+        await Apply(db, deployment, Health("healthy"), minutes: 2);
+        await Apply(db, deployment, Health("down"), minutes: 3);
+
+        Assert.Equal(DeploymentEntity.StatusUp, deployment.Status);
+        Assert.Empty(db.DeploymentEvents);
     }
 }
