@@ -16,23 +16,24 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Failed attempts a client may make in `FAILURE_WINDOW` before it is refused.
+/// Failed attempts a client may make before it is refused; forgotten once it has
+/// made none for `FAILURE_WINDOW`.
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// How long a client past `MAX_FAILURES` waits for each answer, per failure
-/// beyond the limit, and at most. The client's requests wait one at a time, so
-/// the wait bounds its guesses however many connections it opens. A valid
-/// token still passes after the wait: the client is the address the gateway
-/// saw, which behind a proxy is everyone's, and the token's holders must not be
-/// locked out. The wait is what makes the failures cost anything; the length
-/// of the token is what makes guessing hopeless.
+/// beyond the limit, and at most. One of its requests waits at a time; the
+/// others are refused without a look at their token, so neither the guesses in
+/// flight nor the requests waiting can grow with the connections it opens. The
+/// client is the address the gateway saw, which behind a proxy is everyone's: a
+/// valid token from there passes once the one in the gate is through, and is
+/// refused only while another request from there is waiting.
 const PENALTY_PER_FAILURE: Duration = Duration::from_secs(1);
 const MAX_PENALTY: Duration = Duration::from_secs(10);
 
-/// A client's failed attempts, from the first in the window.
+/// A client's failed attempts.
 struct Failing {
     count: u32,
-    since: Instant,
+    last: Instant,
     /// Held by one of its requests at a time, while that one waits.
     gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -126,6 +127,8 @@ fn error(status: StatusCode, message: &str) -> Response {
     response
 }
 
+const TOO_MANY: &str = "too many failed attempts from this address; try again later";
+
 /// Why a request is refused; the response is `error(status, message)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Denied(pub StatusCode, pub &'static str);
@@ -137,13 +140,13 @@ impl IntoResponse for Denied {
 }
 
 /// How long a client past `MAX_FAILURES` waits before its request is looked
-/// at, and the gate its requests wait at one at a time; `None` for a client
+/// at, and the gate one of its requests waits in at a time; `None` for a client
 /// within the limit. Taken before `authorize`, by the handler, since the wait
 /// is async.
 pub fn penalty(api: &Api, headers: &HeaderMap) -> Option<(Duration, Arc<tokio::sync::Mutex<()>>)> {
     let now = Instant::now();
     let mut failures = api.failures.lock().ok()?;
-    failures.retain(|_, f| now.duration_since(f.since) < FAILURE_WINDOW);
+    failures.retain(|_, f| now.duration_since(f.last) < FAILURE_WINDOW);
     let failing = failures.get(&client(headers))?;
     let beyond = failing.count.checked_sub(MAX_FAILURES).filter(|b| *b > 0)?;
     Some(((PENALTY_PER_FAILURE * beyond).min(MAX_PENALTY), failing.gate.clone()))
@@ -176,18 +179,16 @@ pub fn authorize(api: &Api, headers: &HeaderMap, needed: Access) -> Result<Acces
                 .failures
                 .lock()
                 .map_err(|_| Denied(StatusCode::INTERNAL_SERVER_ERROR, "locked"))?;
-            failures.retain(|_, f| now.duration_since(f.since) < FAILURE_WINDOW);
+            failures.retain(|_, f| now.duration_since(f.last) < FAILURE_WINDOW);
             let failing = failures.entry(client(headers)).or_insert_with(|| Failing {
                 count: 0,
-                since: now,
+                last: now,
                 gate: Default::default(),
             });
             failing.count += 1;
+            failing.last = now;
             if failing.count > MAX_FAILURES {
-                return Err(Denied(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "too many failed attempts; try again in a minute",
-                ));
+                return Err(Denied(StatusCode::TOO_MANY_REQUESTS, TOO_MANY));
             }
             Err(Denied(StatusCode::UNAUTHORIZED, "a valid bearer token is required"))
         }
@@ -303,7 +304,9 @@ async fn nodes(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 async fn guard(app: &App, headers: &HeaderMap) -> Result<(), Denied> {
     let api = app.api.as_ref().ok_or(Denied(StatusCode::NOT_FOUND, "not found"))?;
     if let Some((wait, gate)) = penalty(api, headers) {
-        let _one_at_a_time = gate.lock().await;
+        let Ok(_one_at_a_time) = gate.try_lock() else {
+            return Err(Denied(StatusCode::TOO_MANY_REQUESTS, TOO_MANY));
+        };
         tokio::time::sleep(wait).await;
     }
     authorize(api, headers, Access::Read).map(|_| ())
@@ -461,6 +464,32 @@ mod tests {
         let (_, again) = penalty(&api, &headers(Some(READ), "2.2.2.2")).unwrap();
         assert!(Arc::ptr_eq(&gate, &again));
         assert_eq!(wait("3.3.3.3"), None);
+    }
+
+    #[test]
+    fn the_window_runs_from_the_last_failure() {
+        let api = Api::new(Some(READ.to_string()), None).unwrap();
+        for _ in 0..=MAX_FAILURES {
+            let _ = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read);
+        }
+        // Still failing: the window is not over for having begun a while ago.
+        {
+            let mut failures = api.failures.lock().unwrap();
+            let failing = failures.get_mut("2.2.2.2").unwrap();
+            failing.last = Instant::now() - FAILURE_WINDOW + Duration::from_secs(1);
+        }
+        let refused = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read).unwrap_err();
+        assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(penalty(&api, &headers(Some("wrong"), "2.2.2.2")).is_some());
+        // A quiet window: forgotten.
+        {
+            let mut failures = api.failures.lock().unwrap();
+            let failing = failures.get_mut("2.2.2.2").unwrap();
+            failing.last = Instant::now() - FAILURE_WINDOW;
+        }
+        assert!(penalty(&api, &headers(Some("wrong"), "2.2.2.2")).is_none());
+        let refused = authorize(&api, &headers(Some("wrong"), "2.2.2.2"), Access::Read).unwrap_err();
+        assert_eq!(refused.0, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

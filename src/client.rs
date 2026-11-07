@@ -239,6 +239,12 @@ fn describe(health: &Value) -> String {
     )
 }
 
+/// Polls in a row that have to say the controller does not know the deployment
+/// before the wait gives up on it: right after a deploy that added it, on a swarm
+/// with several managers, the first may still reach a controller task with the
+/// config from before.
+const NOT_FOUND_POLLS: u32 = 3;
+
 /// `simpled wait`: polls the deployment's public health until it reports
 /// `version`, converged and healthy, or the time is up. `insecure` accepts any
 /// certificate, for a staging or private ACME server, or the placeholder.
@@ -249,21 +255,31 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, ins
         .context("Cannot set up the HTTP client")?;
     let started = Instant::now();
     let mut last = String::from("no answer yet");
+    let mut not_found = 0;
     loop {
+        let mut still_not_found = false;
         match client.get(url).send() {
-            // 503 still carries the health document. The controller's own 404
-            // says the deployment is not one it knows, which waiting does not
-            // change; any other 404 is the gateway before it routes the
+            // 503 still carries the health document. The controller's own 404,
+            // repeated, says the deployment is not one it knows, which waiting
+            // does not change; any other 404 is the gateway before it routes the
             // controller, right after a deploy, and is waited out.
             Ok(response) => match (response.status(), response.json::<Value>()) {
                 (reqwest::StatusCode::NOT_FOUND, Ok(body))
                     if body["error"].as_str() == Some(controller_http::NO_SUCH_DEPLOYMENT) =>
                 {
-                    bail!(
-                        "{} is not a deployment the controller knows ({}); check the name against the env spec",
-                        url,
+                    still_not_found = true;
+                    not_found += 1;
+                    if not_found >= NOT_FOUND_POLLS {
+                        bail!(
+                            "{} is not a deployment the controller knows ({}); check the name against the env spec",
+                            url,
+                            controller_http::NO_SUCH_DEPLOYMENT
+                        )
+                    }
+                    last = format!(
+                        "not a deployment the controller knows ({})",
                         controller_http::NO_SUCH_DEPLOYMENT
-                    )
+                    );
                 }
                 (_, Ok(health)) if health.get("status").is_some() => {
                     if reached(&health, version) {
@@ -299,6 +315,9 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, ins
                 last = format!("its certificate is not trusted ({}); --insecure skips the check", e)
             }
             Err(e) => last = format!("cannot reach it: {}", e),
+        }
+        if !still_not_found {
+            not_found = 0;
         }
         if started.elapsed().saturating_add(interval) > timeout {
             bail!(
@@ -345,44 +364,62 @@ mod tests {
         );
     }
 
-    /// One HTTP answer on a local port, then the listener closes.
-    fn answer_once(status_line: &'static str, body: &'static str) -> String {
+    /// The same HTTP answer to `times` connections on a local port, then the
+    /// listener closes.
+    fn answer(times: usize, status_line: &'static str, body: &'static str) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer);
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status_line,
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
+            for _ in 0..times {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
         });
         format!("http://127.0.0.1:{}/health/prodd", port)
     }
 
     #[test]
-    fn waiting_stops_at_once_when_the_deployment_does_not_exist() {
-        let url = answer_once("404 Not Found", r#"{"error":"no such deployment"}"#);
+    fn waiting_stops_once_the_controller_keeps_not_knowing_the_deployment() {
+        let unknown = r#"{"error":"no such deployment"}"#;
+        let url = answer(NOT_FOUND_POLLS as usize, "404 Not Found", unknown);
         let started = Instant::now();
         let err = wait(&url, "1.2.3", Duration::from_secs(30), Duration::from_secs(1), false).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(10), "did not stop at once");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "did not stop after {} polls",
+            NOT_FOUND_POLLS
+        );
         assert!(
             err.to_string().contains("not a deployment the controller knows"),
             "{}",
             err
         );
         assert!(err.to_string().contains("no such deployment"), "{}", err);
+
+        // Said once, by a controller task that may predate the deployment: waited out.
+        let url = answer(1, "404 Not Found", unknown);
+        let err = wait(&url, "1.2.3", Duration::from_secs(1), Duration::from_secs(1), false).unwrap_err();
+        assert!(err.to_string().contains("did not report 1.2.3 as healthy"), "{}", err);
+        assert!(
+            err.to_string().contains("last: not a deployment the controller knows"),
+            "{}",
+            err
+        );
     }
 
     #[test]
     fn waiting_outlasts_the_gateways_own_not_found() {
         // Before the gateway routes the controller, right after a deploy.
-        let url = answer_once("404 Not Found", "404 page not found");
+        let url = answer(1, "404 Not Found", "404 page not found");
         let err = wait(&url, "1.2.3", Duration::from_secs(1), Duration::from_secs(1), false).unwrap_err();
         assert!(err.to_string().contains("did not report 1.2.3 as healthy"), "{}", err);
         assert!(err.to_string().contains("HTTP 404"), "{}", err);

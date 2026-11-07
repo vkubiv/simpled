@@ -231,10 +231,12 @@ Rules:
 - A wrong or missing token gets 401 and a token without enough rights gets 403.
   Tokens are compared in constant time. Failed attempts are rate-limited per client
   IP, using the real client IP that the gateway already forwards (`trusted_proxies`):
-  past the limit, every answer to that IP is delayed, growing with the failures and one
-  request at a time, so the delay bounds its guesses however many connections it opens; a
-  valid token still passes, since behind a proxy the IP is everyone's and failing
-  attempts from there must not lock the token's holders out.
+  past the limit, one request from that IP at a time is answered, after a delay that grows
+  with the failures, and the others are refused at once with their token unread, so the
+  guesses it can make are bounded however many connections it opens and nothing queues up.
+  Behind a proxy the IP is everyone's: a valid token from there passes once the request in
+  the gate is through, and is refused only while another one from there is waiting, so a
+  failing client there slows the token's holders down but cannot lock them out for long.
 - Logs are as sensitive as the secrets that leak into them. The reference must say
   that the read token is a credential, not a "viewer" password.
 - Rotation means redeploying with a new value. One token of each kind is enough for

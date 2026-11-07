@@ -71,7 +71,13 @@ pub fn write_token_files(
                 fetch_script.fetch(token, reference);
                 // What prepare-deployment checks on a literal token, checked here
                 // on the fetched value, before the deploy: the controller would
-                // otherwise refuse the token and the API would not exist.
+                // otherwise refuse the token and the API would not exist. The
+                // value is trimmed first, as the controller trims the file, so
+                // both count the same characters.
+                fetch_script.command(format!(
+                    "{var}=\"${{{var}#\"${{{var}%%[![:space:]]*}}\"}}\"; {var}=\"${{{var}%\"${{{var}##*[![:space:]]}}\"}}\"",
+                    var = token.shell_var(),
+                ));
                 fetch_script.command(format!(
                     "if [ \"${{#{var}}}\" -lt {min} ]; then echo 'controller.{name} fetched from AWS is '\"${{#{var}}}\"' \
                      characters long; a token needs at least {min}, for example `openssl rand -hex 32`' >&2; exit 1; fi",

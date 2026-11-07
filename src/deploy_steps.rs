@@ -733,7 +733,8 @@ pub fn lock(
             // Released between the two calls; try again right away.
             continue;
         };
-        let age = Duration::from_secs(now().saturating_sub(holder.since));
+        let at = now();
+        let age = Duration::from_secs(at.saturating_sub(holder.since));
         if started.elapsed() >= timing.wait {
             let _ = std::fs::remove_file(lock_file);
             let mut message = format!(
@@ -744,7 +745,7 @@ pub fn lock(
                 human(age),
                 human(timing.wait)
             );
-            if lock_is_stale(holder.since, now(), timing.stale_after) {
+            if lock_is_stale(holder.since, at, timing.stale_after) {
                 message.push_str(&format!(
                     "\nA deploy does not take that long, so that one probably died. If nothing is deploying, \
                      clear the lock with: ./simpled step unlock --force (or docker config rm {})",

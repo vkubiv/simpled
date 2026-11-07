@@ -525,7 +525,16 @@ async fn prune(docker: &Docker, domain: &str) {
     let Ok(secrets) = domain_secrets(docker, domain).await else {
         return;
     };
-    for secret in stale(&secrets) {
+    let stale = stale(&secrets);
+    if stale.is_empty() {
+        return;
+    }
+    // A running deploy may have picked one of these for the gateway's stack
+    // file, in `step tls-secrets`, and not deployed it yet.
+    if deploy_in_progress(docker).await {
+        return;
+    }
+    for secret in stale {
         // Refused while a task still mounts it; the next round tries again.
         if docker.delete_secret(&secret.id).await.is_ok() {
             eprintln!("acme: removed the old certificate secret {}", secret.name);
