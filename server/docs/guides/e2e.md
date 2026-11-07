@@ -35,7 +35,7 @@ e2e/test/
     expect.ts        expectSuccess / expectError
     web-app.ts       WebApp: the web app's deps over a real client; signedInApp(email)
     rx.ts            waitFor(rx, pred), settled(loadStatus)
-    fakes.ts         Fakes: token, repository, site, siteDown on simpled-fakes; envSpec(), appSpec() file builders
+    fakes.ts         Fakes: token, repository, controller, siteDown on simpled-fakes; envSpec(), appSpec() file builders
     eventually.ts    eventually(read, pred, what): polls for what monitor-svc does on its own (every 2 s locally)
   auth.test.ts  orgs.test.ts  invitations.test.ts  teams-projects.test.ts     the API
   web-app/onboarding.test.ts  web-app/organization.test.ts                    the web app's controllers
@@ -91,7 +91,7 @@ the API tests cover. These tests found two session bugs the unit tests' fakes co
 
 `simpled-fakes` (`fakes/server.mjs`, mounted into `node:alpine` by `local-infra.yaml`) is GitHub's REST API for
 main-svc and monitor-svc (`GITHUB_API_URL`) and, as monitor-svc's HTTP proxy (`PROBE_PROXY_URL`), every
-deployment's gateway. Tests script it through `Fakes`; names come from `fakes.unique(...)`, so tests share it like
+deployment's simpled controller. Tests script it through `Fakes`; names come from `fakes.unique(...)`, so tests share it like
 they share the database:
 
 ```ts
@@ -99,13 +99,15 @@ await fakes.token(token, "acme-bot");
 await fakes.repository(owner, "shop", [token], {
   "deployment/prod/envspec.yaml": envSpec(host, { prod: { application: "shop" } }),
 });
-await fakes.site(host, { application: "shop", deployment: "prod", version: "1.0.0" });
+await fakes.controller(host, { application: "shop", deployment: "prod", version: "1.0.0" }); // "healthy" by default
 // ... link the repository through the client, then:
 await eventually(read, (d) => d.status === "up", "prod up");
 ```
 
-`envSpec` turns TLS off, so the monitor asks `http://<host>`, which the proxy answers. `fakes.siteDown(host)` makes
-it answer 502.
+`envSpec` is a Docker envspec with TLS off and its controller on `host`, so the monitor asks
+`http://<host>/simpled/version/<deployment>` and `/simpled/health/<deployment>`, which the proxy answers. A third
+argument of `"degraded"` or `"down"` makes the health answer 503 with that status; `fakes.siteDown(host)` makes the
+host answer 502.
 
 ## Adding coverage
 

@@ -263,8 +263,8 @@ one inline with `extends:`.
   quietly dropped. A `prefixes` typo used to produce wrong routing in silence.
 - On Docker every env spec needs `controller: { host: <alias> }`. The environment's
   controller is served under `/simpled/` on that host: `/simpled/health` (the whole
-  environment), `/simpled/health/<deployment>` (200 only when healthy, plus
-  `converged`), `/simpled/version/<deployment>`, and with a token the private API
+  environment), `/simpled/health/<deployment>` (`status` and `converged` in the
+  body; 200 even when down, 503 only when the controller cannot read Docker), `/simpled/version/<deployment>`, and with a token the private API
   under `/simpled/api/v1`. Do not route an app service at `/simpled` on that host. On
   Kubernetes a `simpled-version-<deployment>` service answers
   `/.well-known/simpled/version` on every host instead.

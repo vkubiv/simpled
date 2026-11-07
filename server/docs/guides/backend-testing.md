@@ -39,7 +39,7 @@ Naming: `Test<Subject>` classes, `Test<Action>_<Scenario>` methods (`TestSetRole
 | `OrgSupport.RoleOf(db, org, account)` | the stored role |
 | `RecordingMailer` | records mails; `.UserMailer()` for controllers, `.LastToken(email, template)` reads the link's token |
 | `FakeGitHub` | tokens and repositories a test adds (`AddToken`, `AddRepository`); files change between syncs, `Unreadable` and `Down` make reads fail |
-| `FakeVersionProbe` | `Answer(url, application, deployment, version)`; any other URL fails like a dead gateway |
+| `FakeDeploymentProbe` | `Answer(versionUrl, application, deployment, version, health?)`; any other URL fails like a dead gateway; `Probed` lists the (version, health) URLs asked |
 | `MonitorSupport.GitHub()`, `AddShop(github)` | GitHub with `MonitorSupport.Token`, and acme/shop holding a prod envspec and an appspec |
 | `MonitorSupport.CreateConnection(db, org)`, `LinkRepository(db, project, connection, github)` | a connection and a linked, synced repository |
 | `ControllerAssert.HasValidationError(result, code, field)`, `IsOkResult(result)` | assertions on action results |

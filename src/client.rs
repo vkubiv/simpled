@@ -259,7 +259,8 @@ pub fn wait(url: &str, version: &str, timeout: Duration, interval: Duration, ins
     loop {
         let mut still_not_found = false;
         match client.get(url).send() {
-            // 503 still carries the health document. The controller's own 404,
+            // Health is in the body, 200 or 503 (a 2.1 controller answers
+            // 503 when not healthy, and any controller when it cannot read Docker). The controller's own 404,
             // repeated, says the deployment is not one it knows, which waiting
             // does not change; any other 404 is the gateway before it routes the
             // controller, right after a deploy, and is waited out.

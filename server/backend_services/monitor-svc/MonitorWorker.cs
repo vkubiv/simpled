@@ -95,7 +95,7 @@ public sealed partial class MonitorWorker(
         await MonitorRound.CheckDeployments(
             now: services.GetRequiredService<Clock>().Now,
             interval: config.MonitorInterval,
-            probe: services.GetRequiredService<IVersionProbe>(),
+            probe: services.GetRequiredService<IDeploymentProbe>(),
             mutateDeployments: services.GetRequiredService<Mutate<DeploymentEntity>>(),
             mutateEvents: services.GetRequiredService<Mutate<DeploymentEventEntity>>(),
             unitOfWork: services.GetRequiredService<UnitOfWork>(),

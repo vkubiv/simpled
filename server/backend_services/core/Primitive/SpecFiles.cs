@@ -19,7 +19,15 @@ public class SpecFormatException : Exception
 }
 
 /// <param name="Url">The primary host's base URL; null when the envspec names none or only a templated one.</param>
-public record EnvSpecDeployment(string Name, string ApplicationName, string? VersionConstraint, string? Url);
+/// <param name="VersionUrl">Where the deployment's version is read; null when the envspec gives no reachable host.</param>
+/// <param name="HealthUrl">Where its health is read: the controller's, on Docker since simpled 2.1.</param>
+public record EnvSpecDeployment(
+    string Name,
+    string ApplicationName,
+    string? VersionConstraint,
+    string? Url,
+    string? VersionUrl,
+    string? HealthUrl);
 
 /// <param name="Problems">Deployments that were skipped, and why.</param>
 public record EnvSpec(IReadOnlyList<EnvSpecDeployment> Deployments, IReadOnlyList<string> Problems);
@@ -53,6 +61,9 @@ public static class SpecFiles
         return directory[(directory.LastIndexOf('/') + 1)..];
     }
 
+    /// <summary>What every gateway host answers on Kubernetes and locally, and on Docker before simpled 2.1.</summary>
+    public const string WellKnownVersionPath = "/.well-known/simpled/version";
+
     public static EnvSpec ReadEnvSpec(string yaml)
     {
         var root = Map(Parse(yaml), "the file");
@@ -60,6 +71,11 @@ public static class SpecFiles
         var tls = gateway == null ? null : OptionalMap(gateway, "tls");
         var scheme = tls != null && Scalar(tls, "disable") is "true" or "True" ? "http" : "https";
         var hosts = gateway == null ? null : OptionalMap(gateway, "hosts");
+        // Since 2.1 a Docker env spec names the controller's host, which answers for every deployment under
+        // /simpled/; one without the block was prepared by an older simpled, whose hosts answer the well-known path.
+        var controller = Scalar(root, "type") == "docker" ? OptionalMap(root, "controller") : null;
+        var controllerHost = controller == null ? null : Scalar(controller, "host");
+        var controllerUrl = controllerHost == null ? null : HostUrl(hosts, controllerHost, scheme);
 
         var deployments = OptionalMap(root, "deployments") ??
                           throw new SpecFormatException("It has no `deployments`.");
@@ -77,8 +93,14 @@ public static class SpecFiles
                 continue;
             }
 
-            result.Add(new EnvSpecDeployment(name, applicationName, Scalar(application!, "version"),
-                BaseUrl(hosts, primaryHost, scheme)));
+            var url = BaseUrl(hosts, primaryHost, scheme);
+            var escaped = Uri.EscapeDataString(name);
+            result.Add(controllerHost == null
+                ? new EnvSpecDeployment(name, applicationName, Scalar(application!, "version"), url,
+                    url == null ? null : url + WellKnownVersionPath, null)
+                : new EnvSpecDeployment(name, applicationName, Scalar(application!, "version"), url,
+                    controllerUrl == null ? null : $"{controllerUrl}/simpled/version/{escaped}",
+                    controllerUrl == null ? null : $"{controllerUrl}/simpled/health/{escaped}"));
         }
 
         return new EnvSpec(result, problems);
@@ -113,7 +135,13 @@ public static class SpecFiles
         }
 
         var key = primaryHost ?? (hosts.Count == 1 ? hosts.Keys.First().ToString() : null);
-        if (key == null || !hosts.TryGetValue(key, out var value))
+        return key == null ? null : HostUrl(hosts, key, scheme);
+    }
+
+    /// <summary>The first domain of the host alias <paramref name="key"/>.</summary>
+    private static string? HostUrl(Dictionary<object, object>? hosts, string key, string scheme)
+    {
+        if (hosts == null || !hosts.TryGetValue(key, out var value))
         {
             return null;
         }

@@ -21,6 +21,9 @@ public static class MonitorSupport
           hosts:
             web: [shop.example.com, www.shop.example.com]
             api: api.shop.example.com
+            ops: ops.example.com
+        controller:
+          host: ops
         deployments:
           prod:
             primary_host: web

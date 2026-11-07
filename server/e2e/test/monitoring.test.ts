@@ -65,7 +65,7 @@ describe("monitoring", () => {
       "app/appspec.yaml": appSpec("shop", "1.1.0"),
     };
     await fakes.repository(owner, "shop", [token], files);
-    await fakes.site(host, { application: "shop", deployment: "prod", version: "1.0.0" });
+    await fakes.controller(host, { application: "shop", deployment: "prod", version: "1.0.0" });
 
     const connection = expectSuccess(await gitHubConnections.create(ann, orgId, { name: "Bot", token }));
     const project = expectSuccess(await projects.create(ann, orgId, { name: "Shop" }));
@@ -87,8 +87,12 @@ describe("monitoring", () => {
     expect(up.liveVersion).toBe("1.0.0");
     expect(up.liveDeployedAt).not.toBeNull();
 
-    await fakes.site(host, { application: "shop", deployment: "prod", version: "1.1.0" });
+    await fakes.controller(host, { application: "shop", deployment: "prod", version: "1.1.0" });
     await eventually(read, (d) => d.liveVersion === "1.1.0", "the new version");
+
+    await fakes.controller(host, { application: "shop", deployment: "prod", version: "1.1.0" }, "degraded");
+    const degraded = await eventually(read, (d) => d.status === "degraded", "prod degraded");
+    expect(degraded.checkError).toContain("degraded");
 
     await fakes.siteDown(host);
     const down = await eventually(read, (d) => d.status === "down", "prod down");
@@ -97,6 +101,7 @@ describe("monitoring", () => {
     const events = expectSuccess(await repositories.deploymentEvents(sugar.ctx("max"), prod.id));
     expect(events.map((e) => [e.kind, e.version, e.previousVersion])).toEqual([
       ["down", "1.1.0", null],
+      ["degraded", "1.1.0", null],
       ["version-changed", "1.1.0", "1.0.0"],
     ]);
 

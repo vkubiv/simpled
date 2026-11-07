@@ -13,6 +13,7 @@ public class DeploymentEventEntity
     public const string KindDown = "down";
     public const string KindUp = "up";
     public const string KindMismatch = "mismatch";
+    public const string KindDegraded = "degraded";
 
     [Column("id")]
     [Key]

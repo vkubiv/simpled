@@ -18,7 +18,7 @@ environment:
     - AUTH_RATE_LIMIT_PER_MINUTE    # per client IP on the auth endpoints; empty means 20
     - GITHUB_API_URL                # empty means https://api.github.com
     - PROBE_PROXY_URL               # local only: monitor-svc reaches every deployment through simpled-fakes
-    - MONITOR_INTERVAL_SECONDS      # how often each deployment's version endpoint is checked; empty means 60
+    - MONITOR_INTERVAL_SECONDS      # how often each deployment's version and health are checked; empty means 60
     - REPOSITORY_SYNC_INTERVAL_SECONDS  # how often linked repositories' spec files are re-read; empty means 600
 
   relative:
@@ -59,7 +59,7 @@ app_services:
       timeout: 3s
       retries: 12
 
-  # Re-syncs linked repositories and checks every deployment's version endpoint. Run exactly one.
+  # Re-syncs linked repositories and checks every deployment's version and health. Run exactly one.
   monitor-svc:
     type: internal
     image: simpled-server/monitor-svc

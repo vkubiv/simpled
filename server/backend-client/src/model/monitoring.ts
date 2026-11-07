@@ -24,10 +24,12 @@ export interface GitHubConnectionUpdate {
 }
 
 /**
- * What the monitor last saw at the deployment's `/.well-known/simpled/version`: `unknown` before the first check,
- * `down` after failed checks in a row, `mismatch` when it answers for another application or deployment.
+ * What the monitor last saw at the deployment's version endpoint (on Docker, the simpled controller's, with its
+ * health): `unknown` before the first check, `down` after failed checks in a row or when the controller reports it
+ * down, `degraded` when the controller reports it so twice in a row, `mismatch` when the endpoint answers for
+ * another application or deployment.
  */
-export const DEPLOYMENT_STATUSES = ["unknown", "up", "down", "mismatch"] as const;
+export const DEPLOYMENT_STATUSES = ["unknown", "up", "degraded", "down", "mismatch"] as const;
 export const DeploymentStatus = z.enum(DEPLOYMENT_STATUSES);
 export type DeploymentStatus = z.output<typeof DeploymentStatus>;
 
@@ -37,7 +39,7 @@ export const Deployment = z.object({
   applicationName: z.string(),
   /** The envspec's `application.version`, such as `^1.2.0`. */
   versionConstraint: z.string().nullable(),
-  /** The primary host the monitor checks; null when the envspec gives none it can reach. */
+  /** The primary host, the site itself; null when the envspec gives none. */
   url: z.string().nullable(),
   /** The appspec's version on the default branch: what ships next. */
   repoVersion: z.string().nullable(),
@@ -82,7 +84,7 @@ export interface RepositoryLink {
   fullName: string;
 }
 
-export const DEPLOYMENT_EVENT_KINDS = ["version-changed", "down", "up", "mismatch"] as const;
+export const DEPLOYMENT_EVENT_KINDS = ["version-changed", "down", "degraded", "up", "mismatch"] as const;
 export const DeploymentEventKind = z.enum(DEPLOYMENT_EVENT_KINDS);
 export type DeploymentEventKind = z.output<typeof DeploymentEventKind>;
 

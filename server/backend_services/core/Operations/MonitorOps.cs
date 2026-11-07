@@ -5,10 +5,13 @@ using Microsoft.EntityFrameworkCore;
 
 namespace core.Operations;
 
-/// <summary>What a version endpoint check means for a deployment's status, and the events it leaves.</summary>
+/// <summary>What a check of a deployment's endpoints means for its status, and the events it leaves.</summary>
 public static class MonitorOps
 {
-    /// <summary>Failed checks in a row before a deployment counts as down; one is a network blip.</summary>
+    /// <summary>
+    /// Failed or unhealthy checks in a row before a deployment counts as down or degraded; one is a network blip
+    /// or a rollout replacing a task.
+    /// </summary>
     public const int FailuresBeforeDown = 2;
 
     /// <summary>Deployments with an address whose last check is older than <paramref name="interval"/>.</summary>
@@ -17,13 +20,13 @@ public static class MonitorOps
     {
         var before = now - interval;
         return readDeployments
-            .Where(d => d.Url != null && (d.CheckedAt == null || d.CheckedAt <= before))
+            .Where(d => d.VersionUrl != null && (d.CheckedAt == null || d.CheckedAt <= before))
             .OrderBy(d => d.CheckedAt)
             .Take(limit)
             .ToListAsync();
     }
 
-    /// <summary>Forgets what was seen, for a deployment that moved to another address.</summary>
+    /// <summary>Forgets what was seen, for a deployment whose endpoints moved.</summary>
     public static void Reset(DeploymentEntity deployment)
     {
         deployment.Status = DeploymentEntity.StatusUnknown;
@@ -55,9 +58,9 @@ public static class MonitorOps
             return;
         }
 
-        deployment.FailureCount = 0;
         if (info.Application != deployment.ApplicationName || info.Deployment != deployment.Name)
         {
+            deployment.FailureCount = 0;
             deployment.CheckError = $"The endpoint answers for {info.Application}/{info.Deployment}, " +
                                     $"not {deployment.ApplicationName}/{deployment.Name}.";
             await SetStatus(deployment, DeploymentEntity.StatusMismatch, now, deployment.CheckError, mutateEvents);
@@ -79,7 +82,40 @@ public static class MonitorOps
 
         deployment.LiveVersion = info.Version;
         deployment.LiveDeployedAt = info.DeployedAt;
+
+        if (result.Health is { Status: not "healthy" } health)
+        {
+            deployment.FailureCount++;
+            deployment.CheckError = HealthProblem(health);
+            if (deployment.FailureCount >= FailuresBeforeDown)
+            {
+                await SetStatus(deployment,
+                    health.Status == "down" ? DeploymentEntity.StatusDown : DeploymentEntity.StatusDegraded,
+                    now, deployment.CheckError, mutateEvents);
+            }
+
+            return;
+        }
+
+        deployment.FailureCount = 0;
         await SetStatus(deployment, DeploymentEntity.StatusUp, now, null, mutateEvents);
+    }
+
+    private static string HealthProblem(HealthInfo health)
+    {
+        var notes = new List<string>();
+        if (health.Tls is { } tls && tls != "valid")
+        {
+            notes.Add($"certificate {tls}");
+        }
+
+        if (!health.Converged)
+        {
+            notes.Add("rollout in progress");
+        }
+
+        return $"The controller reports the deployment {health.Status}" +
+               (notes.Count == 0 ? "." : $" ({string.Join(", ", notes)}).");
     }
 
     /// <summary>Records the change; the first answer of a new deployment is not news, a first failure is.</summary>
@@ -107,6 +143,7 @@ public static class MonitorOps
             {
                 DeploymentEntity.StatusUp => DeploymentEventEntity.KindUp,
                 DeploymentEntity.StatusDown => DeploymentEventEntity.KindDown,
+                DeploymentEntity.StatusDegraded => DeploymentEventEntity.KindDegraded,
                 _ => DeploymentEventEntity.KindMismatch,
             },
             Version = deployment.LiveVersion,

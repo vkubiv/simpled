@@ -37,7 +37,7 @@ builder.Services.AddScoped<Clock>();
 
 builder.Services.AddSingleton(config);
 builder.Services.AddGitHub(config);
-builder.Services.AddVersionProbe(config);
+builder.Services.AddDeploymentProbe(config);
 builder.Services.AddSingleton<MonitorHeartbeat>();
 builder.Services.AddHostedService<MonitorWorker>();
 

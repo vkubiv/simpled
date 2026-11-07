@@ -24,10 +24,25 @@ export class Fakes {
     await call("PUT", `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`, { tokens, files });
   }
 
-  /** What `host`'s `/.well-known/simpled/version` answers, as a simpled gateway would. */
-  async site(host: string, version: { application: string; deployment: string; version: string }): Promise<void> {
-    await call("PUT", `/sites/${encodeURIComponent(host)}`, {
+  /**
+   * What the simpled controller on `host` answers for `version.deployment`: its version, and its health (200 when
+   * healthy, 503 otherwise, as the controller does).
+   */
+  async controller(
+    host: string,
+    version: { application: string; deployment: string; version: string },
+    health: "healthy" | "degraded" | "down" = "healthy",
+  ): Promise<void> {
+    const site = `/sites/${encodeURIComponent(host)}`;
+    const deployment = encodeURIComponent(version.deployment);
+    await call("PUT", site, {
+      path: `/simpled/version/${deployment}`,
       body: { ...version, deployed_at: Math.floor(Date.now() / 1000) },
+    });
+    await call("PUT", site, {
+      path: `/simpled/health/${deployment}`,
+      status: health === "healthy" ? 200 : 503,
+      body: { status: health, converged: true, version: version.version },
     });
   }
 
@@ -46,10 +61,13 @@ async function call(method: string, path: string, body?: unknown): Promise<void>
   if (!r.ok) throw new Error(`simpled-fakes ${method} ${path}: ${r.status} ${await r.text()}`);
 }
 
-/** An envspec with TLS off, so the monitor asks `http://<host>`, which simpled-fakes answers. */
+/**
+ * A Docker envspec with TLS off whose controller is on `host`, so the monitor asks `http://<host>/simpled/...`,
+ * which simpled-fakes answers.
+ */
 export function envSpec(host: string, deployments: Record<string, { application: string; version?: string }>) {
   const lines = ["type: docker", "gateway:", "  name: e2e", "  tls:", "    disable: true", "  hosts:"];
-  lines.push(`    web: [${host}]`, "deployments:");
+  lines.push(`    web: [${host}]`, "controller:", "  host: web", "deployments:");
   for (const [name, d] of Object.entries(deployments)) {
     lines.push(`  ${name}:`, "    primary_host: web", "    application:", `      name: ${d.application}`);
     if (d.version) lines.push(`      version: "${d.version}"`);

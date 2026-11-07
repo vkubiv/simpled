@@ -8,6 +8,7 @@ import { DeploymentsActions, DeploymentsState, type OpenEvents } from "./deploym
 
 const STATUS: Record<DeploymentStatus, { label: string; cls: string }> = {
   up: { label: "Up", cls: "bg-ok-soft text-ok" },
+  degraded: { label: "Degraded", cls: "bg-warn-soft text-warn" },
   down: { label: "Down", cls: "bg-danger-soft text-danger" },
   mismatch: { label: "Mismatch", cls: "bg-warn-soft text-warn" },
   unknown: { label: "Not checked", cls: "bg-sunken text-muted" },
@@ -16,6 +17,7 @@ const STATUS: Record<DeploymentStatus, { label: string; cls: string }> = {
 const EVENT_LABEL: Record<DeploymentEvent["kind"], string> = {
   "version-changed": "New version",
   down: "Went down",
+  degraded: "Degraded",
   up: "Back up",
   mismatch: "Answered for another deployment",
 };

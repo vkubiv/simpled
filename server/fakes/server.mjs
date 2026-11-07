@@ -1,11 +1,13 @@
-// simpled-fakes: GitHub's REST API and the gateway of every monitored deployment, for local runs and e2e.
+// simpled-fakes: GitHub's REST API and the gateway (or simpled controller) of every monitored deployment, for
+// local runs and e2e.
 // No dependencies; local-infra.yaml mounts this file into node:alpine.
 //
 // Tests script it through /_fakes (all bodies JSON):
 //   PUT    /_fakes/tokens/:token          {login}                         a token GitHub accepts
 //   PUT    /_fakes/repos/:owner/:name     {tokens, files, defaultBranch?} a repository those tokens can read
 //   DELETE /_fakes/repos/:owner/:name
-//   PUT    /_fakes/sites/:host            {status?, body}                 what /.well-known/simpled/version answers
+//   PUT    /_fakes/sites/:host            {path, status?, body}           what the host answers at path; other
+//                                                                         paths of a known host are 404
 //   DELETE /_fakes/sites/:host                                            the host stops answering (502)
 //
 // monitor-svc reaches deployments with simpled-fakes as its HTTP proxy (PROBE_PROXY_URL), so a request whose
@@ -16,7 +18,7 @@ import { createServer } from "node:http";
 
 const tokens = new Map(); // token -> login
 const repos = new Map(); // "owner/name" lower-cased -> { owner, name, defaultBranch, tokens: Set, files: {path: text} }
-const sites = new Map(); // host lower-cased -> { status, body }
+const sites = new Map(); // host lower-cased -> Map(path -> { status, body })
 
 const repoKey = (owner, name) => `${owner}/${name}`.toLowerCase();
 
@@ -35,8 +37,9 @@ async function readJson(req) {
 function serveSite(res, host, path) {
   const site = sites.get(host.toLowerCase());
   if (!site) return send(res, 502, { message: `no fake site for ${host}` });
-  if (path !== "/.well-known/simpled/version") return send(res, 404, { message: "not found" });
-  return send(res, site.status ?? 200, site.body);
+  const route = site.get(path);
+  if (!route) return send(res, 404, { message: "not found" });
+  return send(res, route.status ?? 200, route.body);
 }
 
 async function control(req, res, parts) {
@@ -72,7 +75,8 @@ async function control(req, res, parts) {
     }
     if (req.method === "PUT") {
       const body = await readJson(req);
-      sites.set(host, { status: body.status, body: body.body });
+      if (!sites.has(host)) sites.set(host, new Map());
+      sites.get(host).set(body.path, { status: body.status, body: body.body });
       return send(res, 200, {});
     }
   }

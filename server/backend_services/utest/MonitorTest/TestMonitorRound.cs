@@ -18,8 +18,8 @@ public class TestMonitorRound
         var github = MonitorSupport.GitHub();
         MonitorSupport.AddShop(github);
         await MonitorSupport.LinkRepository(db, project, connection, github);
-        var probe = new FakeVersionProbe();
-        probe.Answer("https://shop.example.com", "shop", "prod", "1.2.3");
+        var probe = new FakeDeploymentProbe();
+        probe.Answer("https://ops.example.com/simpled/version/prod", "shop", "prod", "1.2.3", health: "healthy");
         var now = DateTime.UtcNow;
 
         var checkedCount = await MonitorRound.CheckDeployments(now, TimeSpan.FromMinutes(1), probe,
@@ -27,9 +27,12 @@ public class TestMonitorRound
             CancellationToken.None);
 
         Assert.Equal(2, checkedCount);
+        Assert.Contains(("https://ops.example.com/simpled/version/prod", "https://ops.example.com/simpled/health/prod"),
+            probe.Probed);
         Assert.Equal(DeploymentEntity.StatusUp, MonitorSupport.Deployment(db, "prod").Status);
-        // canary shares prod's host, so the endpoint answers for prod: a mismatch.
-        Assert.Equal(DeploymentEntity.StatusMismatch, MonitorSupport.Deployment(db, "canary").Status);
+        var canary = MonitorSupport.Deployment(db, "canary");
+        Assert.Equal(DeploymentEntity.StatusUnknown, canary.Status);
+        Assert.Equal(1, canary.FailureCount);
 
         Assert.Equal(0, await MonitorRound.CheckDeployments(now.AddSeconds(30), TimeSpan.FromMinutes(1), probe,
             new Mutate<DeploymentEntity>(db), new Mutate<DeploymentEventEntity>(db), new UnitOfWork(db),

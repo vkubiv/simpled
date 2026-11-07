@@ -6,7 +6,7 @@ namespace db.Entities;
 
 /// <summary>
 /// A deployment of an envspec as of the last repository sync, and what the monitor last saw at its version
-/// endpoint (`/.well-known/simpled/version` on the primary host).
+/// endpoint and, on Docker, the simpled controller's health of it.
 /// </summary>
 [Table("deployments")]
 [Index(nameof(EnvironmentId), nameof(Name), IsUnique = true)]
@@ -15,6 +15,9 @@ public class DeploymentEntity
     public const string StatusUnknown = "unknown";
     public const string StatusUp = "up";
     public const string StatusDown = "down";
+
+    /// <summary>The controller reports fewer tasks than wanted, a failing healthcheck or a bad certificate.</summary>
+    public const string StatusDegraded = "degraded";
 
     /// <summary>The endpoint answers for another application or deployment.</summary>
     public const string StatusMismatch = "mismatch";
@@ -40,9 +43,20 @@ public class DeploymentEntity
     [Column("version_constraint")]
     public string? VersionConstraint { get; set; }
 
-    /// <summary>The primary host's base URL; null when the envspec gives none the monitor can reach.</summary>
+    /// <summary>The primary host's base URL, the site itself; null when the envspec gives none.</summary>
     [Column("url")]
     public string? Url { get; set; }
+
+    /// <summary>
+    /// What the monitor asks for the version: the controller's `/simpled/version/{name}` on Docker since simpled
+    /// 2.1, `/.well-known/simpled/version` on the primary host otherwise; null when there is nothing to ask.
+    /// </summary>
+    [Column("version_url")]
+    public string? VersionUrl { get; set; }
+
+    /// <summary>The controller's `/simpled/health/{name}`; null where there is no controller.</summary>
+    [Column("health_url")]
+    public string? HealthUrl { get; set; }
 
     /// <summary>The `version` of the application's appspec.yaml on the default branch: what ships next.</summary>
     [Column("repo_version")]
@@ -67,7 +81,9 @@ public class DeploymentEntity
     [Column("check_error")]
     public string? CheckError { get; set; }
 
-    /// <summary>Failed checks in a row; one failure is a blip, a few make the deployment down.</summary>
+    /// <summary>
+    /// Failed or unhealthy checks in a row; one is a blip or a rollout, a few make the deployment down or degraded.
+    /// </summary>
     [Column("failure_count")]
     public int FailureCount { get; set; }
 }

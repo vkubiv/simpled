@@ -44,11 +44,13 @@ public class TestRepositoryOps
         Assert.Equal("shop", prod.ApplicationName);
         Assert.Equal("1.2.3", prod.RepoVersion);
         Assert.Equal("https://shop.example.com", prod.Url);
+        Assert.Equal("https://ops.example.com/simpled/version/prod", prod.VersionUrl);
+        Assert.Equal("https://ops.example.com/simpled/health/prod", prod.HealthUrl);
         Assert.Equal(DeploymentEntity.StatusUnknown, prod.Status);
     }
 
     [Fact]
-    public async Task TestSync_KeepsMonitorStateUnlessTheAddressMoves()
+    public async Task TestSync_KeepsMonitorStateUnlessTheEndpointsMove()
     {
         var (db, github, files, repository) = await Linked();
         var prod = MonitorSupport.Deployment(db, "prod");
@@ -65,6 +67,12 @@ public class TestRepositoryOps
             MonitorSupport.EnvSpec.Replace("[shop.example.com", "[new.shop.example.com", StringComparison.Ordinal);
         await Sync(db, repository, github);
         Assert.Equal("https://new.shop.example.com", prod.Url);
+        Assert.Equal(DeploymentEntity.StatusUp, prod.Status);
+
+        files.Files["deployment/prod/envspec.yaml"] =
+            MonitorSupport.EnvSpec.Replace("ops.example.com", "status.example.com", StringComparison.Ordinal);
+        await Sync(db, repository, github);
+        Assert.Equal("https://status.example.com/simpled/version/prod", prod.VersionUrl);
         Assert.Equal(DeploymentEntity.StatusUnknown, prod.Status);
         Assert.Null(prod.LiveVersion);
     }
