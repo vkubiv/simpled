@@ -1,15 +1,22 @@
 //! `simpled status`, `simpled logs` and `simpled wait`: clients of the controller
 //! (`docs/design/controller.md` §4), served under `/simpled/` on the env spec's
-//! `controller.host`. The first two use the private API, with the token in
-//! `SIMPLED_TOKEN`. `wait` polls a deployment's public health.
+//! `controller.host`. The first two use the private API, with the token from
+//! `SIMPLED_TOKEN` or from the env spec's `controller.read_token` (see [`token`]).
+//! `wait` polls a deployment's public health.
 
 use crate::controller::http as controller_http;
-use crate::spec::DeploymentEnvironmentSpec;
+use crate::resolved_spec::SecretResolvedValue;
+use crate::spec::{AwsSecretRef, DeploymentEnvironmentSpec};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const TOKEN_VAR: &str = "SIMPLED_TOKEN";
+
+/// The file that stands in for Secrets Manager on a machine without AWS access:
+/// a JSON object from secret name to that secret's value.
+pub const SECRETS_FILE: &str = "secrets.json";
 
 fn scheme(env: &DeploymentEnvironmentSpec) -> &'static str {
     if env.ingress.tls.is_some() {
@@ -45,6 +52,25 @@ fn controller_base(env: &DeploymentEnvironmentSpec) -> Result<String> {
     ))
 }
 
+/// The private API's base and the token for it, for `status` and `logs`, run next
+/// to the env spec. With `--url` the env spec is optional: it only supplies the
+/// token, when `SIMPLED_TOKEN` does not.
+pub fn api_and_token(url: Option<&str>) -> Result<(String, String)> {
+    let root = Path::new(".");
+    let (base, env) = match url {
+        Some(url) => (
+            url.trim_end_matches('/').to_string(),
+            crate::spec_loader::load_env_spec(root, None, 0).ok(),
+        ),
+        None => {
+            let env = crate::spec_loader::load_env_spec(root, None, 0)?;
+            (api_base(&env)?, Some(env))
+        }
+    };
+    let token = token(env.as_ref(), root)?;
+    Ok((base, token))
+}
+
 /// `https://<domain>/simpled/api/v1`.
 pub fn api_base(env: &DeploymentEnvironmentSpec) -> Result<String> {
     Ok(format!("{}/api/v1", controller_base(env)?))
@@ -63,13 +89,130 @@ pub fn health_url(env: &DeploymentEnvironmentSpec, deployment: &str) -> Result<S
     ))
 }
 
-fn token() -> Result<String> {
-    std::env::var(TOKEN_VAR)
+/// The token for the private API. `SIMPLED_TOKEN` first, for CI. Otherwise the
+/// env spec's `controller.read_token` (or `manage_token` when it has none), read
+/// the way `prepare-deployment` reads it. An `aws:` token, which only the deploy
+/// target fetches, is looked up in [`SECRETS_FILE`] next to the env spec instead,
+/// so a developer without AWS access needs only that (git-ignored) file. One per
+/// env spec directory, so the env spec and its secrets travel together.
+pub fn token(env: Option<&DeploymentEnvironmentSpec>, root: &Path) -> Result<String> {
+    if let Some(token) = std::env::var(TOKEN_VAR)
         .ok()
-        .filter(|t| !t.trim().is_empty())
         .map(|t| t.trim().to_string())
-        .ok_or_else(|| anyhow!("Set {} to the controller's read or manage token", TOKEN_VAR))
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(token);
+    }
+    let secret = env
+        .and_then(|e| e.ingress.controller.as_ref())
+        .and_then(|c| c.read_token.as_ref().or(c.manage_token.as_ref()));
+    let (Some(env), Some(secret)) = (env, secret) else {
+        bail!(
+            "Set {} to the controller's read or manage token (the env spec here declares neither)",
+            TOKEN_VAR
+        );
+    };
+    let token = match crate::resolver::resolve_one_secret(env, secret).with_context(|| {
+        format!(
+            "{} is not set, and controller.{} cannot be read here",
+            TOKEN_VAR, secret.secret_name
+        )
+    })? {
+        SecretResolvedValue::Literal(token) => token,
+        SecretResolvedValue::Deferred(reference) => from_secrets_file(root, &reference, &secret.secret_name)?,
+    };
+    Ok(token.trim().to_string())
 }
+
+/// The value of an `aws:` secret from [`SECRETS_FILE`], keyed by its secret id
+/// like Secrets Manager, with the same `jq:` path applied. The secret may be the
+/// JSON document itself or, as Secrets Manager's SecretString, that document as a
+/// string. No error quotes the content.
+fn from_secrets_file(root: &Path, reference: &AwsSecretRef, name: &str) -> Result<String> {
+    let example = match &reference.jq {
+        Some(jq) => format!(
+            "{{\"{}\": {{\"{}\": \"...\"}}}}",
+            reference.secret_id,
+            jq.trim_start_matches('.')
+        ),
+        None => format!("{{\"{}\": \"...\"}}", reference.secret_id),
+    };
+    let path = root.join(SECRETS_FILE);
+    if !path.is_file() {
+        bail!(
+            "controller.{} is the AWS secret {}, which only the deploy target reads. Set {}, or put it into a \
+             git-ignored {} next to the env spec: {}",
+            name,
+            reference.secret_id,
+            TOKEN_VAR,
+            SECRETS_FILE,
+            example
+        );
+    }
+    warn_if_readable_by_others(&path);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("Cannot read {}", path.display()))?;
+    let file: Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow!(
+            "{} is not valid JSON (line {}, column {})",
+            path.display(),
+            e.line(),
+            e.column()
+        )
+    })?;
+    let missing = || {
+        anyhow!(
+            "{} has no value for controller.{}; expected {}",
+            path.display(),
+            name,
+            example
+        )
+    };
+    let secret = file.get(&reference.secret_id).ok_or_else(missing)?;
+    let value = match &reference.jq {
+        None => secret.as_str().map(String::from),
+        Some(jq) => {
+            let field = crate::transform::parse_field_path(jq).ok_or_else(|| {
+                anyhow!(
+                    "controller.{}: jq filter {} is not a plain path like .field, which is all {} supports",
+                    name,
+                    jq,
+                    SECRETS_FILE
+                )
+            })?;
+            let document = match secret {
+                Value::String(text) => serde_json::from_str(text).map_err(|_| {
+                    anyhow!(
+                        "{}: {} is a string that is not a JSON document",
+                        path.display(),
+                        reference.secret_id
+                    )
+                })?,
+                other => other.clone(),
+            };
+            crate::spec::select_json_field(&document, &field)
+        }
+    };
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(missing)
+}
+
+#[cfg(unix)]
+fn warn_if_readable_by_others(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "Warning: {} holds tokens but others may read it; chmod 600 it",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_readable_by_others(_path: &Path) {}
 
 fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
     builder(timeout).build().context("Cannot set up the HTTP client")
@@ -84,8 +227,8 @@ fn builder(timeout: Option<Duration>) -> reqwest::blocking::ClientBuilder {
 /// What a refused request means, in words.
 fn refused(status: reqwest::StatusCode, url: &str, what: &str) -> anyhow::Error {
     match status.as_u16() {
-        401 => anyhow!("The controller refused the token in {} (401)", TOKEN_VAR),
-        403 => anyhow!("The token in {} may not do that (403)", TOKEN_VAR),
+        401 => anyhow!("The controller refused the token (401)"),
+        403 => anyhow!("The token may not do that (403)"),
         404 => anyhow!("{}: not found (404) at {}", what, url),
         429 => anyhow!("Too many failed attempts from here; try again in a minute (429)"),
         _ => anyhow!("{} answered {}", url, status),
@@ -105,8 +248,8 @@ fn get_json(url: &str, token: &str) -> Result<Value> {
 }
 
 /// `simpled status`.
-pub fn status(base: &str, json: bool) -> Result<()> {
-    let body = get_json(&format!("{}/status", base), &token()?)?;
+pub fn status(base: &str, token: &str, json: bool) -> Result<()> {
+    let body = get_json(&format!("{}/status", base), token)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&body)?);
     } else {
@@ -160,7 +303,7 @@ pub struct LogArgs<'a> {
 }
 
 /// `simpled logs`: copies the stream to stdout as it arrives.
-pub fn logs(base: &str, args: &LogArgs) -> Result<()> {
+pub fn logs(base: &str, token: &str, args: &LogArgs) -> Result<()> {
     let mut query: Vec<(&str, &str)> = Vec::new();
     if let Some(tail) = args.tail {
         query.push(("tail", tail));
@@ -182,7 +325,7 @@ pub fn logs(base: &str, args: &LogArgs) -> Result<()> {
     let mut response = client(None)?
         .get(&url)
         .query(&query)
-        .bearer_auth(token()?)
+        .bearer_auth(token)
         .send()
         .with_context(|| format!("Cannot reach {}", url))?;
     if !response.status().is_success() {

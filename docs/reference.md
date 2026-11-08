@@ -1691,7 +1691,24 @@ into whatever convention your agent uses (`AGENTS.md`, `CLAUDE.md`, …).
 Every deployment's version, health and services, from the
 [controller's private API](#private-api). Run it next to the env spec: the API's
 address comes from `controller.host`, the token from `SIMPLED_TOKEN` (the read
-or the manage token).
+or the manage token) or, when that is not set, from the env spec's
+`controller.read_token` (else `manage_token`), read as `prepare-deployment` reads it.
+
+An `aws:` token is fetched only on the deploy target, so on a developer's machine
+`simpled` looks it up in a `secrets.json` next to the env spec, keyed by the
+secret's name like Secrets Manager, with the same `jq:` path applied. One file per
+env directory, so `cd deployment/dev && simpled status` has everything it needs,
+the controller's address from the env spec and the token from the file:
+
+```json
+{
+  "dev/simpled-controller": { "controller_read_token": "..." }
+}
+```
+
+A secret's value may also be its SecretString as it is, a JSON document in a string.
+Add the file to `.gitignore` and keep it `chmod 600`; simpled warns when others may
+read it. Put only the read token there unless you need the manage one.
 
 ```
 simpled status [--url <API>] [--json]

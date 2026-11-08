@@ -2,7 +2,7 @@ mod app;
 mod env;
 
 pub use app::{convert_app_spec, convert_service_secrets, parse_service_env_option};
-pub use env::convert_env_spec;
+pub use env::{convert_env_spec, parse_field_path};
 
 use crate::spec::{ServiceCommand, ServicePort, ServiceVolume, ServiceVolumeType};
 use crate::spec_yaml::ServiceCommandYaml;
