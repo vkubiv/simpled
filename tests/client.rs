@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{envspec, simpled, write_project};
+use common::{simpled, unreachable_project, UNREACHABLE_STATUS as REACHED};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
 
@@ -23,18 +23,8 @@ controller:
 }
 
 fn project_with(top: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    write_env(dir.path(), top);
-    dir
+    unreachable_project(top)
 }
-
-fn write_env(root: &std::path::Path, top: &str) {
-    let env = envspec("docker", top, "").replace("shop.example.com", "shop.simpled-test.invalid");
-    std::fs::create_dir_all(root).unwrap();
-    write_project(root, &env);
-}
-
-const REACHED: &str = "Cannot reach http://shop.simpled-test.invalid/simpled/api/v1/status";
 
 fn run(dir: &tempfile::TempDir, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
     let output = simpled(dir.path(), args, env);

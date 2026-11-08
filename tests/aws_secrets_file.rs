@@ -4,12 +4,13 @@
 
 mod common;
 
-use common::{envspec, simpled, write_project};
+use common::{
+    simpled, unreachable_project as project, write_unreachable_project as write_env, UNREACHABLE_STATUS as REACHED,
+};
 use std::path::{Path, PathBuf};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef-read";
 const LOCAL_FILE: &str = "aws-secrets.local.json";
-const REACHED: &str = "Cannot reach http://shop.simpled-test.invalid/simpled/api/v1/status";
 
 /// An env spec whose read token lives in Secrets Manager, as on a real cluster.
 const AWS_TOKEN: &str = "swarm_mode: true
@@ -18,18 +19,6 @@ controller:
   read_token:
     aws: dev/simpled-controller
     jq: .controller_read_token";
-
-fn write_env(root: &Path, top: &str) {
-    let env = envspec("docker", top, "").replace("shop.example.com", "shop.simpled-test.invalid");
-    std::fs::create_dir_all(root).unwrap();
-    write_project(root, &env);
-}
-
-fn project(top: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    write_env(dir.path(), top);
-    dir
-}
 
 fn local_file(token: &str) -> String {
     format!(
@@ -339,11 +328,11 @@ fn a_whitespace_only_simpled_token_counts_as_unset() {
 }
 
 #[test]
-fn a_jq_dot_secret_is_shown_as_a_document() {
+fn a_jq_dot_secret_cannot_be_stood_in_for() {
     let dir = project(&AWS_TOKEN.replace(".controller_read_token", "."));
     let (_, stderr) = status(dir.path());
     assert!(
-        stderr.contains(r#"add it there: {"dev/simpled-controller":{"...":"..."}}"#),
+        stderr.contains("it cannot hold this secret: its jq filter '.' is not a path to one field like .a.b"),
         "{}",
         stderr
     );
@@ -355,7 +344,7 @@ fn a_jq_filter_beyond_a_path_gets_no_example() {
     let (_, stderr) = status(dir.path());
     assert!(
         stderr.contains(
-            "it cannot hold this secret: its jq filter '.a | ascii_downcase' is more than a plain path like .a.b"
+            "it cannot hold this secret: its jq filter '.a | ascii_downcase' is not a path to one field like .a.b"
         ),
         "{}",
         stderr
@@ -364,17 +353,19 @@ fn a_jq_filter_beyond_a_path_gets_no_example() {
 }
 
 #[test]
-fn a_broken_file_is_an_error_not_a_fall_back_to_aws() {
+fn a_broken_file_without_aws_names_both_problems() {
     let dir = project(AWS_TOKEN);
     std::fs::write(dir.path().join(LOCAL_FILE), r#"{"dev/simpled-controller": {"#).unwrap();
     let (ok, stderr) = status(dir.path());
     assert!(!ok);
     assert!(
-        stderr.contains("is not valid JSON") && stderr.contains("fix it, or remove it"),
+        stderr.contains("aws-secrets.local.json next to the env spec is unusable (")
+            && stderr.contains("is not valid JSON")
+            && stderr.contains("and the AWS CLI could not read it either. Fix the file, or remove it."),
         "{}",
         stderr
     );
-    assert!(!stderr.contains("could not read it"), "{}", stderr);
+    assert!(!stderr.contains("Secret 'dev/simpled-controller': "), "{}", stderr);
 }
 
 #[test]
@@ -400,4 +391,102 @@ controller:
     );
     assert!(ok, "{}", stderr);
     assert!(!stderr.contains("written into the prepared output"), "{}", stderr);
+}
+
+fn status_with_file(file: &str) -> String {
+    let dir = project(AWS_TOKEN);
+    std::fs::write(dir.path().join(LOCAL_FILE), file).unwrap();
+    let (ok, stderr) = status(dir.path());
+    assert!(!ok);
+    stderr
+}
+
+#[test]
+fn a_false_or_null_field_fails_as_jq_e_would() {
+    for value in ["false", "null"] {
+        let stderr = status_with_file(&format!(
+            r#"{{"dev/simpled-controller": {{"controller_read_token": {value}}}}}"#
+        ));
+        assert!(
+            stderr.contains(&format!(
+                ".controller_read_token is {value}, which jq -e treats as no value"
+            )),
+            "{}",
+            stderr
+        );
+    }
+}
+
+#[test]
+fn an_object_field_is_refused_rather_than_formatted_differently_from_jq() {
+    let stderr = status_with_file(r#"{"dev/simpled-controller": {"controller_read_token": {"a": 1}}}"#);
+    assert!(
+        stderr.contains("is a JSON object, which jq -r prints indented"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn a_number_field_is_printed_as_jq_prints_it() {
+    // A number is no valid token, but it is read: the request is what fails.
+    let stderr =
+        status_with_file(r#"{"dev/simpled-controller": {"controller_read_token": 12345678901234567890123456789012}}"#);
+    assert!(stderr.contains(REACHED), "{}", stderr);
+}
+
+#[test]
+fn a_whole_secret_that_is_the_text_none_is_refused() {
+    let dir = project(&AWS_TOKEN.replace("\n    jq: .controller_read_token", ""));
+    std::fs::write(dir.path().join(LOCAL_FILE), r#"{"dev/simpled-controller": "None"}"#).unwrap();
+    let (ok, stderr) = status(dir.path());
+    assert!(!ok);
+    assert!(stderr.contains("is the text None"), "{}", stderr);
+}
+
+const READ_FROM_ENV_MANAGE_FROM_AWS: &str = "swarm_mode: true
+controller:
+  host: web
+  read_token:
+    env: SIMPLED_TEST_NO_SUCH_READ_TOKEN
+  manage_token:
+    aws: dev/simpled-controller
+    jq: .controller_manage_token";
+
+#[test]
+fn the_manage_token_is_tried_when_the_read_token_cannot_be_read() {
+    let dir = project(READ_FROM_ENV_MANAGE_FROM_AWS);
+    std::fs::write(
+        dir.path().join(LOCAL_FILE),
+        format!(
+            r#"{{"dev/simpled-controller": {{"controller_manage_token": "{}"}}}}"#,
+            TOKEN
+        ),
+    )
+    .unwrap();
+    let (ok, stderr) = status(dir.path());
+    assert!(!ok);
+    assert!(stderr.contains(REACHED), "{}", stderr);
+}
+
+#[test]
+fn when_neither_token_can_be_read_both_reasons_are_given() {
+    let dir = project(READ_FROM_ENV_MANAGE_FROM_AWS);
+    let (ok, stderr) = status(dir.path());
+    assert!(!ok);
+    assert!(
+        stderr.contains("SIMPLED_TOKEN is not set, and neither token can be read here"),
+        "{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("controller.read_token cannot be read here"),
+        "{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("controller.manage_token cannot be read here"),
+        "{}",
+        stderr
+    );
 }
