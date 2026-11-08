@@ -782,12 +782,11 @@ fn prepare_deployment_command(
     aws_secrets_file: Option<&Path>,
 ) -> Result<()> {
     // 1. Load specs
-    let mut env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
+    let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
     if let Some(path) = aws_secrets_file {
         if !path.is_file() {
             bail!("--aws-secrets-file {}: no such file", path.display());
         }
-        env_spec.aws_secrets_file = Some(path.to_path_buf());
     }
 
     let app_name = &env_spec.deployment(deployment_name)?.application.name;
@@ -803,13 +802,17 @@ fn prepare_deployment_command(
     println!("Validation passed for deployment {}", deployment_name);
 
     // 3. Resolve
-    let resolved_spec = resolver::resolve(&env_spec, &app_spec, deployment_name).context("Resolution failed")?;
+    let resolution =
+        resolver::resolve_with(&env_spec, &app_spec, deployment_name, aws_secrets_file).context("Resolution failed")?;
+    let resolved_spec = resolution.spec;
     match aws_secrets_file {
         None => secret_fetch::warn_local_file_unused(&env_spec.root, &resolved_spec.deferred_secret_ids()),
-        Some(path) => eprintln!(
-            "Warning: the AWS secrets in {} are written into the prepared output; keep it on this machine and do not commit it.",
+        Some(path) if !resolution.from_aws_secrets_file.is_empty() => eprintln!(
+            "Warning: the AWS secrets {} were read from {} and written into the prepared output; keep it on this machine and do not commit it.",
+            resolution.from_aws_secrets_file.join(", "),
             path.display()
         ),
+        Some(_) => {}
     }
 
     // 4. Generate
