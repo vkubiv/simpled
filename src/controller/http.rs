@@ -3,7 +3,7 @@
 //! the controller sees `/health`, `/api/v1/...`. ACME challenges reach it
 //! unchanged, on every host.
 
-use super::model::{self, Status};
+use super::model;
 use super::source::Source;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -68,9 +68,11 @@ fn no_such_deployment() -> Response {
     json_response(StatusCode::NOT_FOUND, json!({"error": NO_SUCH_DEPLOYMENT}))
 }
 
-/// 200 only when healthy, so an uptime check needs no JSON parsing.
-fn health_response<T: serde::Serialize>(status: Status, health: &T) -> Response {
-    let code = if status == Status::Healthy {
+/// The HTTP status is about the controller, not about what it reports: 200
+/// whenever it could read Docker, whatever the `status` in the body, and 503
+/// only when it could not, still with the document it could build.
+fn health_response<T: serde::Serialize>(read: bool, health: &T) -> Response {
+    let code = if read {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -145,7 +147,7 @@ async fn deployment_health(State(app): State<Arc<App>>, Path(deployment): Path<S
         Err(()) => None,
     };
     let health = read_health(&app, &deployment, services.as_deref()).await;
-    health_response(health.status, &health)
+    health_response(services.is_some(), &health)
 }
 
 /// The gateway, every certificate and every deployment that has services: one
@@ -164,10 +166,10 @@ async fn stack_health(State(app): State<Arc<App>>) -> Response {
     };
     let gateway = async {
         match app.source.gateway_replicas().await {
-            Ok((desired, running)) => model::gateway_health(desired, running),
+            Ok((desired, running)) => (model::gateway_health(desired, running), true),
             Err(e) => {
                 eprintln!("health: gateway: {:#}", e);
-                model::gateway_health(1, 0)
+                (model::gateway_health(1, 0), false)
             }
         }
     };
@@ -192,9 +194,9 @@ async fn stack_health(State(app): State<Arc<App>>) -> Response {
             (deployment, health)
         }
     }));
-    let (gateway, certificates, each) = tokio::join!(gateway, certificates, each);
+    let ((gateway, gateway_read), certificates, each) = tokio::join!(gateway, certificates, each);
     let health = model::stack_health(gateway, &certificates, each.into_iter().collect::<BTreeMap<_, _>>());
-    health_response(health.status, &health)
+    health_response(gateway_read, &health)
 }
 
 /// The key authorization of a pending HTTP-01 challenge, on any host: the
@@ -297,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deployments_health_is_200_only_when_healthy() {
+    fn a_deployments_health_is_200_whatever_it_reports() {
         let (status, body) = run(get(vec![api(2)], "/health/prod"));
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -306,8 +308,12 @@ mod tests {
         );
 
         let (status, body) = run(get(vec![api(1)], "/health/prod"));
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "degraded");
+
+        let (status, body) = run(get(vec![api(0)], "/health/prod"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "down");
     }
 
     #[test]
@@ -315,7 +321,7 @@ mod tests {
         assert_eq!(run(get(vec![api(2)], "/version/other")).0, StatusCode::NOT_FOUND);
         assert_eq!(run(get(vec![api(2)], "/health/other")).0, StatusCode::NOT_FOUND);
         let (status, body) = run(get(vec![api(2)], "/health/blog"));
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "down");
     }
 
@@ -333,8 +339,60 @@ mod tests {
         );
 
         let (status, body) = run(get(vec![api(0)], "/health"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "down");
+    }
+
+    /// Docker that cannot be read: the one trouble a 503 is for.
+    struct Unreadable {
+        services: bool,
+    }
+
+    impl Source for Unreadable {
+        fn services<'a>(&'a self, _deployment: &'a str) -> BoxFuture<'a, Result<Vec<ServiceState>>> {
+            let services = self.services;
+            Box::pin(async move {
+                if services {
+                    Ok(vec![api(2)])
+                } else {
+                    Err(anyhow::anyhow!("no Docker"))
+                }
+            })
+        }
+
+        fn all_services(&self) -> BoxFuture<'_, Result<BTreeMap<String, Vec<ServiceState>>>> {
+            let services = self.services;
+            Box::pin(async move {
+                if services {
+                    Ok(BTreeMap::from([("prod".to_string(), vec![api(2)])]))
+                } else {
+                    Err(anyhow::anyhow!("no Docker"))
+                }
+            })
+        }
+
+        fn gateway_replicas(&self) -> BoxFuture<'_, Result<(u64, u64)>> {
+            Box::pin(async { Err(anyhow::anyhow!("no gateway service")) })
+        }
+    }
+
+    #[test]
+    fn health_is_503_only_when_the_controller_cannot_read_docker() {
+        let unreadable = |services: bool| App {
+            source: Box::new(Unreadable { services }),
+            ..app_with(vec![])
+        };
+        let (status, body) = run(ask(unreadable(false), "/health/prod"));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "down");
+        let (status, body) = run(ask(unreadable(false), "/health"));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "cannot read the deployments");
+        // The services read, the gateway not: still a report the controller could not complete.
+        let (status, body) = run(ask(unreadable(true), "/health"));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["gateway"]["status"], "down");
+        assert_eq!(body["deployments"]["prod"]["status"], "healthy");
     }
 
     #[test]
@@ -417,7 +475,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["tls"], "valid");
         let (status, body) = ask(Some((false, 0)));
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
             (
                 body["status"].as_str(),
