@@ -554,6 +554,7 @@ gateway:
   body_limit: 10m         # optional; max request body for every route
   trusted_proxies:          # docker only, optional; proxies whose X-Forwarded-For is believed
     - 10.0.0.0/8
+  access_log: true          # docker only, optional; one log line per request (JSON)
   global: true              # swarm only, optional; one gateway task on every node
   placement:                # swarm only, optional; where the gateway task(s) run
     constraints:
@@ -768,6 +769,30 @@ gateway:
 | `local` | Rejected. |
 
 Under Docker Swarm the gateway publishes its ports in host mode, so it sees the real peer address to begin with; see [Docker Swarm](#docker-swarm-type-docker-swarm_mode-true).
+
+#### access_log
+
+Traefik's access log: one line per request, for every host and app, on the gateway's stdout next to Traefik's own log. It is read with `docker service logs simpled_gateway` (Swarm), `docker logs simpled-gateway` (standalone) or `simpled logs`, and a log driver or agent ships it on, e.g. to CloudWatch Logs.
+
+```yaml
+gateway:
+  access_log: true              # JSON
+  # access_log: {format: common}  # Common Log Format
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `access_log` | `true`, `false` or `{format: json\|common}` | no | `true` and `{}` are `json`. Unset or `false` is off, and the gateway config is what it was without the field. |
+
+A `json` line carries, among others, `ClientHost` (the client IP), `RequestHost`, `RequestMethod`, `RequestPath`, `RouterName` and `ServiceName` (which app), `DownstreamStatus`, `Duration` (nanoseconds) and `request_X-Forwarded-For`. Every other request header is dropped from the log. `common` is one Common Log Format line, client IP first and the duration last in milliseconds, with the router name but no host.
+
+The client IP is the address the gateway was connected from, or the original client from `X-Forwarded-For` when that address is in [`trusted_proxies`](#trusted_proxies). From any other address Traefik strips the header, so it cannot fake the IP. Through several proxies `ClientHost` is the whole `X-Forwarded-For` list, the original client first.
+
+| Target | Mechanism |
+|--------|-----------|
+| `docker` | `accessLog` in `traefik.yml`, with no `filePath` (stdout), JSON with `fields.headers` keeping only `X-Forwarded-For`. |
+| `k8s` | Rejected. The ingress controller owns its access log. |
+| `local` | Rejected. |
 
 #### TLS options (mutually exclusive)
 

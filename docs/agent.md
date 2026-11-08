@@ -271,6 +271,9 @@ one inline with `extends:`.
 - Several copies of one local stack need named ports: `ports:` at the top of
   `localenv.yaml`, `$port(name)` wherever a host port is written, and `--instance N`
   (or `.simpled-instance`) per copy. Above instance 0 a literal host port is an error.
+- `gateway.access_log: true` (docker only) logs every request on the gateway's stdout as
+  JSON: client IP, host, router, status, duration. `{format: common}` for CLF. The client
+  IP is the X-Forwarded-For one only from a `trusted_proxies` peer.
 - Behind a CDN or load balancer on `docker`, list its ranges under `gateway.trusted_proxies`
   (IPs/CIDRs) or the apps see the proxy instead of the client. Rejected on `k8s` (the
   ingress controller owns it) and `local`. The swarm gateway publishes in host mode and

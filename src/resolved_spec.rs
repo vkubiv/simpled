@@ -1,6 +1,6 @@
 use crate::spec::{
-    AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, Placement, ResourcesSpec, ServiceCommand,
-    ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume,
+    AccessLogFormat, AwsSecretRef, DeploymentEnvType, EnvVariable, Healthcheck, Placement, ResourcesSpec,
+    ServiceCommand, ServiceConfigOption, ServicePort, ServiceSecret, ServiceType, ServiceVolume,
 };
 
 #[derive(Debug)]
@@ -28,6 +28,8 @@ pub struct IngressResolvedSpec {
     pub version_document: Option<String>,
     /// Docker only: proxies whose X-Forwarded-For the gateway believes.
     pub trusted_proxies: Vec<String>,
+    /// Docker only: Traefik's access log on stdout; `None` is off.
+    pub access_log: Option<AccessLogFormat>,
     /// Swarm only: one gateway task per node.
     pub global: bool,
     /// Swarm only: where the gateway task(s) may run.
