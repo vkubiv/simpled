@@ -531,6 +531,24 @@ Every secret is read, and checked, before the script writes the first file or cr
 
 jq's own error output is discarded rather than printed: a parse error quotes the input it choked on, which is the secret. The messages the script prints name the secret and the id it tried, never the value.
 
+#### aws-secrets.local.json
+
+Where simpled reads an `aws` secret **on this machine** (a `local` env spec, and the controller's token in [`simpled status`](#simpled-status) and `logs`), an `aws-secrets.local.json` next to the env spec stands in for Secrets Manager, for developers without AWS access. It is a JSON object from secret id, exactly as the spec writes it, to the secret's value:
+
+```json
+{
+  "dev/simpled-controller": { "controller_read_token": "..." },
+  "dev/myapp/db": { "password": "local-only" }
+}
+```
+
+- The `jq` path applies to the value as it would to the SecretString. Only a plain field path (`.a`, `.a.b`, `."a b"`) is understood, as for [`secrets_json`](#secrets_json).
+- A value may also be the SecretString as Secrets Manager returns it: a string, or a JSON document in a string. Without `jq` it must be a string.
+- A secret the file does not list is read with the AWS CLI, as without the file. A listed secret whose `jq` path selects nothing is an error, not a fall-back.
+- Only the env spec's own directory is looked in. The `.local.` name is the usual never-commit convention: add `*.local.json` (or the file) to `.gitignore` and keep it `chmod 600`; simpled warns when others may read it. No error quotes its content.
+
+`prepare-deployment` for a remote target does **not** read it: its `aws` secrets stay with `fetch-secrets.sh` on the deploy target. When the file is there and the deployment has `aws` secrets, `prepare-deployment` says so on stderr, and goes on. To prepare with those values anyway, for example to check a deployment with real secrets, pass the file explicitly: `--aws-secrets-file aws-secrets.local.json` (any path; the same shape). Every `aws` secret is then read from it while preparing and **written into the output** like an `env` secret, so no `fetch-secrets.sh` is needed for them; a secret it does not list is an error. Keep that output on your machine.
+
 Notes:
 
 - A secret has one source: `env`, `file`, `aws`, `json_file` or `json_env`. `jq` goes with `aws`, [`json_file` or `json_env`](#json_file-and-json_env), [`secrets_json`](#secrets_json) or [`secrets_aws`](#secrets_aws) — never with `env` or `file`, which carry one raw value.
@@ -1519,6 +1537,8 @@ Options:
   --github-tag-prefix <PREFIX>         Prefix for GitHub release tag
   --target-binary <PATH>               Swarm: the simpled binary to ship for the deploy
                                        target (also SIMPLED_TARGET_BINARY)
+  --aws-secrets-file <PATH>            Read `aws` secrets from this file and write them
+                                       into the output; see aws-secrets.local.json
 ```
 
 Must be run from the directory containing `envspec.yaml`.
@@ -1694,11 +1714,11 @@ address comes from `controller.host`, the token from `SIMPLED_TOKEN` (the read
 or the manage token) or, when that is not set, from the env spec's
 `controller.read_token` (else `manage_token`), read as `prepare-deployment` reads it.
 
-An `aws:` token is fetched only on the deploy target, so on a developer's machine
-`simpled` looks it up in a `secrets.json` next to the env spec, keyed by the
-secret's name like Secrets Manager, with the same `jq:` path applied. One file per
-env directory, so `cd deployment/dev && simpled status` has everything it needs,
-the controller's address from the env spec and the token from the file:
+An `aws:` token is fetched only on the deploy target, so here it is read like a
+local deployment's: from [`aws-secrets.local.json`](#aws-secretslocaljson) next to
+the env spec, else with the AWS CLI. One file per env directory, so
+`cd deployment/dev && simpled status` has everything it needs, the controller's
+address from the env spec and the token from the file:
 
 ```json
 {
@@ -1706,9 +1726,8 @@ the controller's address from the env spec and the token from the file:
 }
 ```
 
-A secret's value may also be its SecretString as it is, a JSON document in a string.
-Add the file to `.gitignore` and keep it `chmod 600`; simpled warns when others may
-read it. Put only the read token there unless you need the manage one.
+Put only the read token there unless you need the manage one. A refused token (401,
+403) names where it came from. With `--url` and `SIMPLED_TOKEN` no env spec is read.
 
 ```
 simpled status [--url <API>] [--json]

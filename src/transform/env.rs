@@ -332,6 +332,8 @@ pub fn convert_env_spec(
         deployments,
         ports,
         published_images: false,
+        root: root.to_path_buf(),
+        aws_secrets_file: None,
     })
 }
 

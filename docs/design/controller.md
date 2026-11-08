@@ -250,7 +250,8 @@ Rules:
 `simpled status` and `simpled logs <deployment> <service> [-f]` use
 `https://<first domain of controller.host>/simpled/api/v1` and the token from
 `SIMPLED_TOKEN`, else the env spec's `controller.read_token`; an `aws:` one from a
-git-ignored `secrets.json` (next to the env spec, keyed by secret name), since developers usually have no AWS access. For CI there is `simpled wait <d> --version 1.2.3 --timeout 10m`,
+`aws-secrets.local.json` next to the env spec (keyed by secret id, a stand-in for
+Secrets Manager), else the AWS CLI, since developers usually have no AWS access. For CI there is `simpled wait <d> --version 1.2.3 --timeout 10m`,
 which polls `/simpled/health/<d>` until it reports `converged` and `healthy` at that
 version.
 

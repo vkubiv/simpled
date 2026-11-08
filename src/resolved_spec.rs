@@ -11,6 +11,24 @@ pub struct EnvironmentResolvedSpec {
     pub ports: crate::ports::LocalPorts,
 }
 
+impl EnvironmentResolvedSpec {
+    /// The ids of the AWS secrets only the deploy target fetches: the current
+    /// deployment's and the controller's tokens, sorted, each once.
+    pub fn deferred_secret_ids(&self) -> Vec<String> {
+        let deployment = self.current_deployment.deferred_secrets().into_iter().map(|(_, r)| r);
+        let controller = self
+            .ingress
+            .controller
+            .iter()
+            .flat_map(|c| c.tokens())
+            .filter_map(|(_, token)| token.deferred());
+        let mut ids: Vec<String> = deployment.chain(controller).map(|r| r.secret_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngressResolvedSpec {
     pub name: String,

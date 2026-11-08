@@ -192,8 +192,22 @@ fn read_config_file(path: &Path) -> Result<ConfigResolvedFile> {
 /// Every other target gets the lookup written into its generated
 /// `fetch-secrets.sh` instead.
 fn resolve_aws_secret(env_spec: &DeploymentEnvironmentSpec, reference: &AwsSecretRef) -> Result<SecretResolvedValue> {
+    if let Some(path) = &env_spec.aws_secrets_file {
+        let value = secret_fetch::read_from_file(path, reference)?.ok_or_else(|| {
+            anyhow!(
+                "Secret '{}' is not listed in {} (--aws-secrets-file); add it: {}",
+                reference.secret_id,
+                path.display(),
+                secret_fetch::local_file_example(reference)
+            )
+        })?;
+        return Ok(SecretResolvedValue::Literal(value));
+    }
     if env_spec.env_type == DeploymentEnvType::Local {
-        Ok(SecretResolvedValue::Literal(secret_fetch::fetch_locally(reference)?))
+        Ok(SecretResolvedValue::Literal(secret_fetch::fetch_locally(
+            reference,
+            &env_spec.root,
+        )?))
     } else {
         Ok(SecretResolvedValue::Deferred(reference.clone()))
     }

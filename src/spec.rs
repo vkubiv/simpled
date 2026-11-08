@@ -428,6 +428,13 @@ pub struct DeploymentEnvironmentSpec {
     /// images CI published for its version, through `registry`, instead of
     /// `:latest` from the local Docker cache.
     pub published_images: bool,
+    /// The directory the env spec was read from, where simpled looks for
+    /// [`crate::secret_fetch::LOCAL_FILE`] when it reads an `aws` secret itself.
+    pub root: std::path::PathBuf,
+    /// `prepare-deployment --aws-secrets-file`: `aws` secrets are read from this
+    /// file while preparing and written into the output, instead of being fetched
+    /// on the deploy target.
+    pub aws_secrets_file: Option<std::path::PathBuf>,
 }
 
 impl DeploymentEnvironmentSpec {

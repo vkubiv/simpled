@@ -63,6 +63,13 @@ enum Commands {
         /// download it from. Also read from SIMPLED_TARGET_BINARY.
         #[arg(long)]
         target_binary: Option<std::path::PathBuf>,
+
+        /// Read `aws` secrets from this file (shaped like aws-secrets.local.json:
+        /// secret id to value) and write them into the output, instead of fetching
+        /// them on the deploy target. For checking a deployment with real values;
+        /// the output then holds those secrets
+        #[arg(long, value_name = "PATH")]
+        aws_secrets_file: Option<std::path::PathBuf>,
     },
 
     /// Steps of a Swarm deploy, run by the deploy.sh that prepare-deployment
@@ -76,7 +83,7 @@ enum Commands {
     /// Every deployment's version, health and services, from the simpled controller.
     /// Reads the API's address from the env spec here (controller.host) and the
     /// token from SIMPLED_TOKEN, or else from controller.read_token: an `aws:` one
-    /// from a git-ignored secrets.json here
+    /// from aws-secrets.local.json here, else with the AWS CLI
     Status {
         /// The API's base instead, e.g. https://ops.example.com/simpled/api/v1
         #[arg(long)]
@@ -423,8 +430,14 @@ fn main() -> Result<()> {
             deployment_name,
             bundle,
             target_binary,
+            aws_secrets_file,
         } => {
-            prepare_deployment_command(deployment_name, bundle, target_binary.as_deref())?;
+            prepare_deployment_command(
+                deployment_name,
+                bundle,
+                target_binary.as_deref(),
+                aws_secrets_file.as_deref(),
+            )?;
         }
         Commands::Step { command } => {
             step_command(command)?;
@@ -766,9 +779,16 @@ fn prepare_deployment_command(
     deployment_name: &str,
     bundle: &bundle_repo::BundleArgs,
     target_binary: Option<&Path>,
+    aws_secrets_file: Option<&Path>,
 ) -> Result<()> {
     // 1. Load specs
-    let env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
+    let mut env_spec = spec_loader::load_env_spec(Path::new("."), Some(deployment_name), 0)?;
+    if let Some(path) = aws_secrets_file {
+        if !path.is_file() {
+            bail!("--aws-secrets-file {}: no such file", path.display());
+        }
+        env_spec.aws_secrets_file = Some(path.to_path_buf());
+    }
 
     let app_name = &env_spec.deployment(deployment_name)?.application.name;
     let bundle_path = bundle
@@ -784,6 +804,13 @@ fn prepare_deployment_command(
 
     // 3. Resolve
     let resolved_spec = resolver::resolve(&env_spec, &app_spec, deployment_name).context("Resolution failed")?;
+    match aws_secrets_file {
+        None => secret_fetch::warn_local_file_unused(&env_spec.root, &resolved_spec.deferred_secret_ids()),
+        Some(path) => eprintln!(
+            "Warning: the AWS secrets in {} are written into the prepared output; keep it on this machine and do not commit it.",
+            path.display()
+        ),
+    }
 
     // 4. Generate
     match env_spec.env_type {
