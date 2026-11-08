@@ -227,6 +227,19 @@ pub struct ControllerSpecYaml {
     // Secret sources, the same shapes a deployment secret takes.
     pub read_token: Option<DeploymentSecretSpecExYaml>,
     pub manage_token: Option<DeploymentSecretSpecExYaml>,
+    // The controller publishes the environment's health to CloudWatch and keeps
+    // its alarms, emailing `alarm_email` through SNS.
+    pub cloudwatch: Option<CloudWatchSpecYaml>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CloudWatchSpecYaml {
+    // The `Env` dimension and the alarms' names; the gateway's name by default.
+    pub name: Option<String>,
+    // The instance's own region by default.
+    pub region: Option<String>,
+    pub alarm_email: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

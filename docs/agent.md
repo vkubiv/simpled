@@ -271,6 +271,10 @@ one inline with `extends:`.
 - Several copies of one local stack need named ports: `ports:` at the top of
   `localenv.yaml`, `$port(name)` wherever a host port is written, and `--instance N`
   (or `.simpled-instance`) per copy. Above instance 0 a literal host port is an error.
+- `controller.cloudwatch: {alarm_email: [..]}` (docker): the controller publishes health
+  metrics (namespace `Simpled`) every minute and keeps alarms `simpled:<name>:*` with an
+  SNS email topic; `silent` fires when the metrics stop. Needs the instance role's
+  policy from the reference and an IMDSv2 hop limit of 2.
 - `gateway.access_log: true` (docker only) logs every request on the gateway's stdout as
   JSON: client IP, host, router, status, duration. `{format: common}` for CLF. The client
   IP is the X-Forwarded-For one only from a `trusted_proxies` peer.

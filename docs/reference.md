@@ -737,6 +737,70 @@ Every request needs `Authorization: Bearer <token>`. A missing or wrong token ge
 curl -H "Authorization: Bearer $SIMPLED_TOKEN" https://ops.example.com/simpled/api/v1/status
 ```
 
+##### CloudWatch
+
+With `controller.cloudwatch` the controller publishes the environment's health to Amazon CloudWatch every minute and keeps the alarms on it, emailing them through SNS. No Lambda or prober is needed: when the server, Docker or the controller dies, the metrics stop, and the `silent` alarm fires on the missing data.
+
+```yaml
+controller:
+  host: ops
+  cloudwatch:
+    alarm_email: [ops@example.com]   # optional: who the alarms email
+    # name: shop-prod                 # optional: gateway.name by default
+    # region: us-east-2               # optional: the instance's region by default
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | The `Env` dimension, and part of every alarm's name (`simpled:<name>:...`). 1 to 64 letters, digits, `-`, `_` or `.`. Defaults to `gateway.name`, so give environments in one AWS account different gateway names, or set it. |
+| `region` | Where the metrics, alarms and topic live. Defaults to `AWS_REGION`, then the region of the instance the controller runs on. |
+| `alarm_email` | Addresses subscribed to the SNS topic `simpled-<name>-health`, which every alarm notifies when it fires and when it recovers. AWS emails each new address once to confirm; nothing reaches it until that link is clicked. An address removed here is unsubscribed (once confirmed). Without `alarm_email` the alarms exist with no actions. |
+
+Metrics, namespace `Simpled`, dimension `Env` (plus `Deployment`), every 60 seconds; health is 0 healthy, 1 degraded, 2 down:
+
+| Metric | Dimensions | Value |
+|---|---|---|
+| `Health` | `Env` | The worst of the gateway, every certificate and every deployment of the env spec, one without services counting as down. |
+| `Health` | `Env`, `Deployment` | That deployment's health, as `/simpled/health/<deployment>`. |
+| `GatewayHealth` | `Env` | The gateway alone. |
+| `CertDaysLeft` | `Env` | Days until the earliest certificate expires; 0 for one not issued yet. Only with certificates the controller issues (Swarm with `tls.letsencrypt`). |
+
+Nothing is published while the controller cannot read Docker. Alarms, kept by the controller at start and every 6 hours:
+
+| Alarm | Fires when |
+|---|---|
+| `simpled:<name>:silent` | No `Health` for 3 minutes (missing data is breaching): the server, Docker or the controller is down, or it cannot reach CloudWatch. |
+| `simpled:<name>:deployment:<deployment>` | That deployment is down for 3 minutes. |
+| `simpled:<name>:gateway` | The gateway is down for 2 minutes. |
+| `simpled:<name>:unhealthy` | The environment is not healthy for 15 minutes: longer than a rollout, so a stuck one, missing replicas, a certificate, or anything down. |
+| `simpled:<name>:certificate` | A certificate has had under 14 days left, or none issued, for an hour (renewal starts at 30). |
+
+The controller deletes alarms under `simpled:<name>:` that the env spec no longer calls for, such as a removed deployment's, and nothing else. In money: a metric per deployment plus three, at $0.30 a month each, and $0.10 an alarm.
+
+**Credentials.** The controller signs its calls itself (no AWS SDK) with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`) if set, else the EC2 instance role through IMDSv2. In a container IMDSv2 is one network hop further away, so the instance needs a hop limit of 2, or the controller logs that it cannot reach the metadata service and `silent` fires:
+
+```sh
+aws ec2 modify-instance-metadata-options --instance-id <id>   --http-tokens required --http-put-response-hop-limit 2 --http-endpoint enabled
+```
+
+On Swarm the controller runs on a manager node; every manager's role needs this policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["cloudwatch:PutMetricData", "cloudwatch:DescribeAlarms"], "Resource": "*" },
+    { "Effect": "Allow", "Action": ["cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms"],
+      "Resource": "arn:aws:cloudwatch:*:*:alarm:simpled:*" },
+    { "Effect": "Allow",
+      "Action": ["sns:CreateTopic", "sns:Subscribe", "sns:Unsubscribe", "sns:ListSubscriptionsByTopic"],
+      "Resource": "arn:aws:sns:*:*:simpled-*-health" }
+  ]
+}
+```
+
+`sns:Unsubscribe` is authorized on the topic. The controller logs what it changed (`docker service logs simpled_controller` or `docker logs simpled-controller`), and a failure once until it recovers.
+
 #### body_limit
 
 Maximum size of a request body the gateway will accept. Set it on `gateway` for every route, and on an individual service under `deployments[].services[]` to override that default:

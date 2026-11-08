@@ -1135,6 +1135,7 @@ fn resolve_controller(
         domains,
         read_token: token(&controller.read_token)?,
         manage_token: token(&controller.manage_token)?,
+        cloudwatch: controller.cloudwatch.clone(),
     })
 }
 
