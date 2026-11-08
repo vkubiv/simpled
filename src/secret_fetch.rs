@@ -338,12 +338,146 @@ impl FetchScript {
     }
 }
 
-/// Perform the lookup on this machine. Used for `local` deployments, where the
-/// deploy target is the machine running simpled and there is no deploy script to
-/// defer the work to. Mirrors the checks the generated script makes: a secret
-/// that is missing, unreadable, valueless or whose filter points at a key the
-/// secret does not have is an error here too, never a blank value.
-pub fn fetch_locally(reference: &AwsSecretRef) -> Result<String> {
+/// The stand-in for AWS Secrets Manager on a machine without AWS access, next to
+/// the env spec: a JSON object from secret id, as the spec writes it, to the
+/// secret's value. Git-ignored by its `.local.` name.
+pub const LOCAL_FILE: &str = "aws-secrets.local.json";
+
+/// Perform the lookup on this machine: for `local` deployments, where the deploy
+/// target is the machine running simpled and there is no deploy script to defer
+/// the work to, and for the controller's token in `simpled status` and `logs`.
+/// [`LOCAL_FILE`] in `root` answers first; a secret it does not list is read with
+/// the AWS CLI. `prepare-deployment` for a remote target never gets here: its
+/// `aws` secrets are fetched on the target.
+pub fn fetch_locally(reference: &AwsSecretRef, root: &Path) -> Result<String> {
+    Ok(fetch_locally_with_origin(reference, root)?.0)
+}
+
+/// [`fetch_locally`], and where the value came from: [`LOCAL_FILE`] or the AWS
+/// CLI, for an error that has to say which one to fix.
+pub fn fetch_locally_with_origin(reference: &AwsSecretRef, root: &Path) -> Result<(String, &'static str)> {
+    let path = root.join(LOCAL_FILE);
+    if path.is_file() {
+        if let Some(value) = read_from_file(&path, reference)? {
+            return Ok((value, LOCAL_FILE));
+        }
+    }
+    let value = fetch_with_aws_cli(reference).map_err(|error| {
+        let listed = if path.is_file() { "is not listed in" } else { "has no" };
+        error.context(format!(
+            "Secret '{}' {} {} next to the env spec, and the AWS CLI could not read it. Without AWS access, add it there: {}",
+            reference.secret_id,
+            listed,
+            LOCAL_FILE,
+            local_file_example(reference)
+        ))
+    })?;
+    Ok((value, "the AWS CLI"))
+}
+
+/// `prepare-deployment` for a remote target reads no [`LOCAL_FILE`] on its own: its
+/// `aws` secrets are fetched on the target, and a value read here would travel with
+/// the prepared output. `--aws-secrets-file` asks for exactly that. A file next to
+/// the env spec is there for `simpled status` and `logs`, so it is no error, but
+/// say so, so nobody expects it to be deployed.
+pub fn warn_local_file_unused(root: &Path, deferred_ids: &[String]) {
+    if deferred_ids.is_empty() || !root.join(LOCAL_FILE).is_file() {
+        return;
+    }
+    eprintln!(
+        "Warning: {} is not used by prepare-deployment: the AWS secrets {} are fetched on the deploy target by {}. To write its values into the output instead, pass --aws-secrets-file {}.",
+        LOCAL_FILE,
+        deferred_ids.join(", "),
+        SCRIPT_NAME,
+        LOCAL_FILE
+    );
+}
+
+/// What [`LOCAL_FILE`] should hold for `reference`, with `...` for the value:
+/// the document its `jq` path selects from, nested segment by segment.
+pub fn local_file_example(reference: &AwsSecretRef) -> String {
+    let mut value = serde_json::Value::String("...".to_string());
+    if let Some(field) = reference.jq.as_deref().and_then(crate::transform::parse_field_path) {
+        for segment in field.iter().rev() {
+            value = serde_json::json!({ segment.clone(): value });
+        }
+    }
+    serde_json::json!({ reference.secret_id.clone(): value }).to_string()
+}
+
+/// `reference`'s value from a file shaped like [`LOCAL_FILE`] at `path`, or `None`
+/// when the file does not list its secret id. The value is the JSON document a `jq` path
+/// selects from, or, as Secrets Manager's SecretString, a string: the value
+/// itself, or that document as text. No error quotes the content.
+pub fn read_from_file(path: &Path, reference: &AwsSecretRef) -> Result<Option<String>> {
+    warn_if_readable_by_others(path);
+    let shown = path.display();
+    let text = std::fs::read_to_string(path).with_context(|| format!("Cannot read {}", shown))?;
+    let file: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow!("{} is not valid JSON (line {}, column {})", shown, e.line(), e.column()))?;
+    if !file.is_object() {
+        return Err(anyhow!("{} must be a JSON object from secret id to value", shown));
+    }
+    let Some(secret) = file.get(&reference.secret_id) else {
+        return Ok(None);
+    };
+    let id = &reference.secret_id;
+    let value = match &reference.jq {
+        None => match secret {
+            serde_json::Value::String(text) => text.clone(),
+            _ => {
+                return Err(anyhow!(
+                    "{}: {} is a JSON document, but the spec reads the whole secret (no jq); make it a string, or select a field with jq",
+                    shown,
+                    id
+                ))
+            }
+        },
+        Some(filter) => {
+            let field = crate::transform::parse_field_path(filter).ok_or_else(|| {
+                anyhow!(
+                    "Secret '{}' is read from {}, which understands only a plain jq path like .a.b, not '{}'",
+                    id,
+                    shown,
+                    filter
+                )
+            })?;
+            let document = match secret {
+                serde_json::Value::String(text) => serde_json::from_str(text)
+                    .map_err(|_| anyhow!("{}: {} is a string that is not a JSON document, for jq '{}'", shown, id, filter))?,
+                other => other.clone(),
+            };
+            crate::spec::select_json_field(&document, &field)
+                .ok_or_else(|| anyhow!("{}: {} has no {}", shown, id, filter))?
+        }
+    };
+    let value = trim_secret_value(&value).to_string();
+    if value.is_empty() {
+        return Err(anyhow!("{}: secret '{}' is empty", shown, id));
+    }
+    Ok(Some(value))
+}
+
+#[cfg(unix)]
+fn warn_if_readable_by_others(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "Warning: {} holds secrets but others may read it; chmod 600 it",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_readable_by_others(_path: &Path) {}
+
+/// The lookup with the AWS CLI, and `jq` for a filter. Mirrors the checks the
+/// generated script makes: a secret that is missing, unreadable, valueless or
+/// whose filter points at a key the secret does not have is an error here too,
+/// never a blank value.
+fn fetch_with_aws_cli(reference: &AwsSecretRef) -> Result<String> {
     let output = Command::new("aws")
         .args([
             "secretsmanager",
