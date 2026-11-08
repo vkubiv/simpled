@@ -210,6 +210,25 @@ fn read_config_file(path: &Path) -> Result<ConfigResolvedFile> {
     Ok(ConfigResolvedFile { name, content })
 }
 
+/// Where an `aws` secret read on this machine came from, for an error that has to
+/// say which source to fix.
+#[derive(Debug, Clone)]
+pub struct AwsOrigin {
+    pub secret_id: String,
+    /// [`secret_fetch::LOCAL_FILE`], the `--aws-secrets-file` path, or the AWS CLI.
+    pub from: String,
+}
+
+/// The stand-in next to the env spec, looked at once per [`SecretReader`].
+#[derive(Clone)]
+enum LocalFile {
+    Missing,
+    /// Parsed into the reader's documents.
+    Present,
+    /// There, but not a JSON object: why, without its content.
+    Broken(String),
+}
+
 /// Reads the secret values of one resolution. Every JSON document is read and
 /// parsed once, however many secrets share it: `json_file` and `json_env`
 /// documents, and the file that stands in for AWS Secrets Manager.
@@ -217,8 +236,14 @@ pub struct SecretReader<'a> {
     env_spec: &'a DeploymentEnvironmentSpec,
     /// `prepare-deployment --aws-secrets-file`: every `aws` secret is read from it.
     aws_secrets_file: Option<&'a Path>,
+    /// Read `aws` secrets on this machine whatever the env spec's type, as
+    /// `simpled status` and `logs` do for the controller's token.
+    read_aws_here: bool,
     documents: HashMap<JsonDocument, serde_json::Value>,
+    local_file: Option<LocalFile>,
+    warned_broken: bool,
     from_aws_secrets_file: BTreeSet<String>,
+    last_aws: Option<AwsOrigin>,
 }
 
 impl<'a> SecretReader<'a> {
@@ -226,8 +251,21 @@ impl<'a> SecretReader<'a> {
         SecretReader {
             env_spec,
             aws_secrets_file,
+            read_aws_here: false,
             documents: HashMap::new(),
+            local_file: None,
+            warned_broken: false,
             from_aws_secrets_file: BTreeSet::new(),
+            last_aws: None,
+        }
+    }
+
+    /// A reader that reads `aws` secrets on this machine (the stand-in file, else
+    /// the AWS CLI) instead of deferring them to the deploy target.
+    pub fn here(env_spec: &'a DeploymentEnvironmentSpec) -> Self {
+        SecretReader {
+            read_aws_here: true,
+            ..Self::new(env_spec, None)
         }
     }
 
@@ -236,14 +274,26 @@ impl<'a> SecretReader<'a> {
         resolve_secret_value(self, secret_spec)
     }
 
+    /// [`Self::value`], and where it came from when an `aws` source answered.
+    pub fn value_with_origin(
+        &mut self,
+        secret_spec: &crate::spec::DeploymentSecretSpec,
+    ) -> Result<(SecretResolvedValue, Option<AwsOrigin>)> {
+        self.last_aws = None;
+        let value = self.value(secret_spec)?;
+        Ok((value, self.last_aws.take()))
+    }
+
     /// An `aws` secret. With `--aws-secrets-file`, read from that file. A local
     /// deployment runs on this machine, so there is no deploy target to defer to
     /// and no artifact for the value to leak into: it is read right here (see
-    /// [`Self::aws_here`]). Every other target gets the lookup written into its
-    /// generated `fetch-secrets.sh` instead.
+    /// [`Self::aws_here`]), as it is for a reader made by [`Self::here`]. Every
+    /// other target gets the lookup written into its generated `fetch-secrets.sh`.
     fn aws(&mut self, reference: &AwsSecretRef) -> Result<SecretResolvedValue> {
-        if let Some(path) = self.aws_secrets_file {
-            let value = self.read_file(path, reference)?.ok_or_else(|| {
+        let (value, from) = if let Some(path) = self.aws_secrets_file {
+            let document = JsonDocument::AwsSecrets(path.to_path_buf());
+            let file = self.document(&reference.secret_id, &document)?;
+            let value = secret_fetch::select_aws_value(file, &document.describe(), reference)?.ok_or_else(|| {
                 anyhow!(
                     "Secret '{}' is not listed in {} (--aws-secrets-file); {}",
                     reference.secret_id,
@@ -252,35 +302,83 @@ impl<'a> SecretReader<'a> {
                 )
             })?;
             self.from_aws_secrets_file.insert(reference.secret_id.clone());
-            return Ok(SecretResolvedValue::Literal(value));
-        }
-        if self.env_spec.env_type == DeploymentEnvType::Local {
-            return Ok(SecretResolvedValue::Literal(self.aws_here(reference)?.0));
-        }
-        Ok(SecretResolvedValue::Deferred(reference.clone()))
+            (value, path.display().to_string())
+        } else if self.read_aws_here || self.env_spec.env_type == DeploymentEnvType::Local {
+            let (value, from) = self.aws_here(reference)?;
+            (value, from.to_string())
+        } else {
+            return Ok(SecretResolvedValue::Deferred(reference.clone()));
+        };
+        self.last_aws = Some(AwsOrigin {
+            secret_id: reference.secret_id.clone(),
+            from,
+        });
+        Ok(SecretResolvedValue::Literal(value))
     }
 
     /// An `aws` secret read on this machine, and where from: the
     /// [`secret_fetch::LOCAL_FILE`] next to the env spec when it lists the
-    /// secret, else the AWS CLI. A file that is there but broken is an error, not
-    /// a reason to go to AWS: that would hide the typo.
-    pub fn aws_here(&mut self, reference: &AwsSecretRef) -> Result<(String, &'static str)> {
+    /// secret, else the AWS CLI. A listed secret the file cannot answer is an
+    /// error. A file that is broken as a whole does not block the AWS CLI, but
+    /// it is not ignored quietly either: it is warned about once when the CLI
+    /// answers, and named in the error when the CLI fails too.
+    fn aws_here(&mut self, reference: &AwsSecretRef) -> Result<(String, &'static str)> {
         let path = self.env_spec.root.join(secret_fetch::LOCAL_FILE);
-        let file_exists = path.is_file();
-        if file_exists {
-            if let Some(value) = self.read_file(&path, reference)? {
+        let state = self.local_file_state(&path);
+        if let LocalFile::Present = state {
+            let document = JsonDocument::AwsSecrets(path.clone());
+            let file = &self.documents[&document];
+            if let Some(value) = secret_fetch::select_aws_value(file, &document.describe(), reference)? {
                 return Ok((value, secret_fetch::LOCAL_FILE));
             }
         }
-        let value = secret_fetch::fetch_with_aws_cli(reference)
-            .map_err(|error| error.context(secret_fetch::not_in_local_file(reference, file_exists)))?;
-        Ok((value, secret_fetch::FROM_AWS_CLI))
+        match secret_fetch::fetch_with_aws_cli(reference) {
+            Ok(value) => {
+                if let LocalFile::Broken(why) = &state {
+                    if !self.warned_broken {
+                        self.warned_broken = true;
+                        eprintln!(
+                            "Warning: {} is ignored: {}. Its secrets were read with the AWS CLI instead; fix or remove it.",
+                            path.display(),
+                            why
+                        );
+                    }
+                }
+                Ok((value, secret_fetch::FROM_AWS_CLI))
+            }
+            Err(error) => Err(match state {
+                LocalFile::Broken(why) => error.context(format!(
+                    "Secret '{}' cannot be read: {} next to the env spec is unusable ({}), and the AWS CLI could not read it either. Fix the file, or remove it.",
+                    reference.secret_id,
+                    secret_fetch::LOCAL_FILE,
+                    why
+                )),
+                LocalFile::Present => error.context(secret_fetch::not_in_local_file(reference, true)),
+                LocalFile::Missing => error.context(secret_fetch::not_in_local_file(reference, false)),
+            }),
+        }
     }
 
-    fn read_file(&mut self, path: &Path, reference: &AwsSecretRef) -> Result<Option<String>> {
-        let document = JsonDocument::AwsSecrets(path.to_path_buf());
-        let file = self.document(&reference.secret_id, &document)?;
-        secret_fetch::select_aws_value(file, &document.describe(), reference)
+    /// Whether the stand-in at `path` is there and usable, looked at once.
+    fn local_file_state(&mut self, path: &Path) -> LocalFile {
+        if let Some(state) = &self.local_file {
+            return state.clone();
+        }
+        let state = if !path.is_file() {
+            LocalFile::Missing
+        } else {
+            let document = JsonDocument::AwsSecrets(path.to_path_buf());
+            match read_json_document("", &document) {
+                Ok(parsed) if parsed.is_object() => {
+                    self.documents.insert(document, parsed);
+                    LocalFile::Present
+                }
+                Ok(_) => LocalFile::Broken("it is not a JSON object from secret id to value".to_string()),
+                Err(error) => LocalFile::Broken(format!("{:#}", error)),
+            }
+        };
+        self.local_file = Some(state.clone());
+        state
     }
 
     /// `document`, read and parsed on first use. `name` is the secret that asks.
@@ -465,19 +563,22 @@ fn read_json_document(name: &str, document: &JsonDocument) -> Result<serde_json:
             }
         },
     };
-    serde_json::from_str(&content).map_err(|error| {
-        let fix = match document {
-            JsonDocument::AwsSecrets(_) => "; fix it, or remove it to read every aws secret with the AWS CLI",
-            _ => "",
-        };
-        anyhow!(
-            "Secret '{}': {} is not valid JSON (line {}, column {}){}",
+    serde_json::from_str(&content).map_err(|error| match document {
+        // Shared by every aws secret, so the file is at fault, not whichever
+        // secret happened to read it first.
+        JsonDocument::AwsSecrets(_) => anyhow!(
+            "{} is not valid JSON (line {}, column {})",
+            document.describe(),
+            error.line(),
+            error.column()
+        ),
+        _ => anyhow!(
+            "Secret '{}': {} is not valid JSON (line {}, column {})",
             name,
             document.describe(),
             error.line(),
-            error.column(),
-            fix
-        )
+            error.column()
+        ),
     })
 }
 
@@ -2236,17 +2337,8 @@ deployments:
             assert_eq!(literal("api_key").as_deref(), Some("key"));
         }
 
-        #[test]
-        fn a_broken_local_file_is_an_error_that_says_how_to_get_past_it() {
-            let (_root, env) = with_file(LOCAL_AWS, r#"{"dev/shop": {"#);
-            let app = app_spec(&format!("{APP}{AWS_APP_SECRETS}"));
-            let err = format!("{:#}", resolve(&env, &app, "prod").unwrap_err());
-            assert!(err.contains("is not valid JSON"), "{err}");
-            assert!(
-                err.contains("fix it, or remove it to read every aws secret with the AWS CLI"),
-                "{err}"
-            );
-        }
+        // A broken file falls through to the AWS CLI, which a unit test must not
+        // reach: tests/aws_secrets_file.rs covers it with an empty PATH.
 
         #[test]
         fn a_remote_deployment_ignores_the_local_file() {

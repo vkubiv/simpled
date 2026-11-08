@@ -116,6 +116,26 @@ pub fn write_project(root: &Path, env: &str) {
     fs::write(root.join("data").join("settings.json"), "{}").unwrap();
 }
 
+/// The controller's API `simpled status` tries for a project from
+/// [`write_unreachable_project`]: its domain does not resolve, so the error shows
+/// which URL, and so which token lookup, was used.
+pub const UNREACHABLE_STATUS: &str = "Cannot reach http://shop.simpled-test.invalid/simpled/api/v1/status";
+
+/// [`write_project`] with a Docker env spec carrying `top` (the controller block)
+/// on a domain that does not resolve.
+pub fn write_unreachable_project(root: &Path, top: &str) {
+    let env = envspec("docker", top, "").replace("shop.example.com", "shop.simpled-test.invalid");
+    fs::create_dir_all(root).unwrap();
+    write_project(root, &env);
+}
+
+/// [`write_unreachable_project`] in a new temporary directory.
+pub fn unreachable_project(top: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_unreachable_project(dir.path(), top);
+    dir
+}
+
 /// Runs the built `simpled` binary in `root` with the given arguments and
 /// environment variables.
 pub fn simpled(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {

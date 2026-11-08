@@ -365,26 +365,24 @@ pub fn warn_local_file_unused(root: &Path, deferred_ids: &[String]) {
     );
 }
 
+/// The path a `jq` filter selects, when a file shaped like [`LOCAL_FILE`] can stand
+/// in for it: a plain field path to one value. `.` alone selects the whole
+/// document, which `jq -r` prints as indented JSON; the file cannot reproduce that
+/// byte for byte, so it does not try.
+fn standable_path(filter: &str) -> Option<Vec<String>> {
+    crate::transform::parse_field_path(filter).filter(|field| !field.is_empty())
+}
+
 /// What [`LOCAL_FILE`] should hold for `reference`, with `...` for the value: the
-/// document its `jq` path selects from, nested segment by segment (`.` selects
-/// the whole document). `None` for a filter that is more than a plain path, which
-/// the file cannot stand in for.
+/// document its `jq` path selects from, nested segment by segment. `None` for a
+/// filter the file cannot stand in for.
 pub fn local_file_example(reference: &AwsSecretRef) -> Option<String> {
-    let value = match reference.jq.as_deref() {
-        None => serde_json::Value::String("...".to_string()),
-        Some(filter) => {
-            let field = crate::transform::parse_field_path(filter)?;
-            if field.is_empty() {
-                serde_json::json!({ "...": "..." })
-            } else {
-                let mut value = serde_json::Value::String("...".to_string());
-                for segment in field.iter().rev() {
-                    value = serde_json::json!({ segment.clone(): value });
-                }
-                value
-            }
+    let mut value = serde_json::Value::String("...".to_string());
+    if let Some(filter) = reference.jq.as_deref() {
+        for segment in standable_path(filter)?.iter().rev() {
+            value = serde_json::json!({ segment.clone(): value });
         }
-    };
+    }
     Some(serde_json::json!({ reference.secret_id.clone(): value }).to_string())
 }
 
@@ -394,7 +392,7 @@ pub fn local_file_hint(reference: &AwsSecretRef) -> String {
     match local_file_example(reference) {
         Some(example) => format!("add it there: {}", example),
         None => format!(
-            "it cannot hold this secret: its jq filter '{}' is more than a plain path like .a.b",
+            "it cannot hold this secret: its jq filter '{}' is not a path to one field like .a.b",
             reference.jq.as_deref().unwrap_or_default()
         ),
     }
@@ -415,14 +413,18 @@ pub fn not_in_local_file(reference: &AwsSecretRef, file_exists: bool) -> String 
 /// `reference`'s value from `file`, a parsed document shaped like [`LOCAL_FILE`]
 /// (`shown` names it), or `None` when it does not list the secret id. A value is
 /// the JSON document a `jq` path selects from, or, as Secrets Manager's
-/// SecretString, a string: the value itself, or that document as text. No error
-/// quotes the content.
+/// SecretString, a string: the value itself, or that document as text.
+///
+/// The result is what the AWS CLI and `jq -er` would give on the deploy target,
+/// or the error they would fail with: a string raw, a number or `true` as jq
+/// prints it; `false`, `null` or a missing key fail `jq -e`; an object or array,
+/// which `jq -r` prints indented over several lines, is refused rather than
+/// guessed at; a whole secret that is the text `None` is what `--output text`
+/// prints for a secret with no string value. No error quotes the content.
 pub fn select_aws_value(file: &serde_json::Value, shown: &str, reference: &AwsSecretRef) -> Result<Option<String>> {
+    use serde_json::Value;
     if !file.is_object() {
-        return Err(anyhow!(
-            "{} must be a JSON object from secret id to value; fix it, or remove it to read every aws secret with the AWS CLI",
-            shown
-        ));
+        return Err(anyhow!("{} must be a JSON object from secret id to value", shown));
     }
     let Some(secret) = file.get(&reference.secret_id) else {
         return Ok(None);
@@ -430,7 +432,14 @@ pub fn select_aws_value(file: &serde_json::Value, shown: &str, reference: &AwsSe
     let id = &reference.secret_id;
     let value = match &reference.jq {
         None => match secret {
-            serde_json::Value::String(text) => text.clone(),
+            Value::String(text) if trim_secret_value(text) == "None" => {
+                return Err(anyhow!(
+                    "{}: {} is the text None, which the AWS CLI prints for a secret with no string value; give the real value",
+                    shown,
+                    id
+                ))
+            }
+            Value::String(text) => text.clone(),
             _ => {
                 return Err(anyhow!(
                     "{}: {} is a JSON document, but the spec reads the whole secret (no jq); make it a string, or select a field with jq",
@@ -440,21 +449,48 @@ pub fn select_aws_value(file: &serde_json::Value, shown: &str, reference: &AwsSe
             }
         },
         Some(filter) => {
-            let field = crate::transform::parse_field_path(filter).ok_or_else(|| {
+            let field = standable_path(filter).ok_or_else(|| {
                 anyhow!(
-                    "Secret '{}' is listed in {}, which understands only a plain jq path like .a.b, not '{}'",
+                    "Secret '{}' is listed in {}, which can stand in only for a jq path to one field like .a.b, not '{}'",
                     id,
                     shown,
                     filter
                 )
             })?;
             let document = match secret {
-                serde_json::Value::String(text) => serde_json::from_str(text)
+                Value::String(text) => serde_json::from_str(text)
                     .map_err(|_| anyhow!("{}: {} is a string that is not a JSON document, for jq '{}'", shown, id, filter))?,
                 other => other.clone(),
             };
-            crate::spec::select_json_field(&document, &field)
-                .ok_or_else(|| anyhow!("{}: {} has no {}", shown, id, filter))?
+            let mut selected = &document;
+            for segment in &field {
+                selected = selected
+                    .get(segment)
+                    .ok_or_else(|| anyhow!("{}: {} has no {}", shown, id, filter))?;
+            }
+            match selected {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(true) => "true".to_string(),
+                Value::Bool(false) | Value::Null => {
+                    return Err(anyhow!(
+                        "{}: {} {} is {}, which jq -e treats as no value, so the deploy would fail on it too",
+                        shown,
+                        id,
+                        filter,
+                        selected
+                    ))
+                }
+                Value::Object(_) | Value::Array(_) => {
+                    return Err(anyhow!(
+                        "{}: {} {} is a JSON {}, which jq -r prints indented over several lines; give the value as a string",
+                        shown,
+                        id,
+                        filter,
+                        if selected.is_object() { "object" } else { "array" }
+                    ))
+                }
+            }
         }
     };
     let value = trim_secret_value(&value).to_string();

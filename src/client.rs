@@ -120,42 +120,54 @@ fn token_from_env() -> Option<Token> {
 /// from [`crate::secret_fetch::LOCAL_FILE`] next to the env spec, else with the
 /// AWS CLI.
 fn token_from_spec(env: &DeploymentEnvironmentSpec) -> Result<Token> {
-    let secret = env
+    let candidates: Vec<&crate::spec::DeploymentSecretSpec> = env
         .ingress
         .controller
-        .as_ref()
-        .and_then(|c| c.read_token.as_ref().or(c.manage_token.as_ref()))
-        .ok_or_else(|| {
-            anyhow!(
-                "Set {} to the controller's read or manage token: the env spec here declares neither controller.read_token nor controller.manage_token",
-                TOKEN_VAR
-            )
-        })?;
-    let name = &secret.secret_name;
-    let unreadable = || format!("{} is not set, and controller.{} cannot be read here", TOKEN_VAR, name);
-    let mut reader = crate::resolver::SecretReader::new(env, None);
-    // An `aws` token is read here whatever the env spec's type, so that the error
-    // for a refused one can say whether the file or the AWS CLI answered.
-    let reference = match &secret.source {
-        crate::spec::DeploymentSecretSource::Aws(reference) => reference.clone(),
-        _ => match reader.value(secret).with_context(unreadable)? {
-            SecretResolvedValue::Literal(value) => {
-                return Ok(Token {
-                    value,
-                    source: format!("controller.{} of the env spec", name),
-                })
+        .iter()
+        .flat_map(|c| [c.read_token.as_ref(), c.manage_token.as_ref()])
+        .flatten()
+        .collect();
+    if candidates.is_empty() {
+        bail!(
+            "Set {} to the controller's read or manage token: the env spec here declares neither controller.read_token nor controller.manage_token",
+            TOKEN_VAR
+        );
+    }
+    let mut reader = crate::resolver::SecretReader::here(env);
+    let mut failures = Vec::new();
+    for secret in &candidates {
+        let name = &secret.secret_name;
+        match reader.value_with_origin(secret) {
+            Ok((SecretResolvedValue::Literal(value), origin)) => {
+                let source = match origin {
+                    Some(origin) => format!(
+                        "controller.{} (AWS secret {}, read from {})",
+                        name, origin.secret_id, origin.from
+                    ),
+                    None => format!("controller.{} of the env spec", name),
+                };
+                return Ok(Token { value, source });
             }
-            SecretResolvedValue::Deferred(reference) => reference,
-        },
-    };
-    let (value, origin) = reader.aws_here(&reference).with_context(unreadable)?;
-    Ok(Token {
-        value,
-        source: format!(
-            "controller.{} (AWS secret {}, read from {})",
-            name, reference.secret_id, origin
-        ),
-    })
+            Ok((SecretResolvedValue::Deferred(reference), _)) => failures.push(anyhow!(
+                "controller.{}: AWS secret {} was not read here",
+                name,
+                reference.secret_id
+            )),
+            Err(error) => failures.push(error.context(format!("controller.{} cannot be read here", name))),
+        }
+    }
+    // The read token first, the manage token when it cannot be read: one that
+    // works is enough. When none does, every reason is shown.
+    if failures.len() == 1 {
+        let error = failures.pop().expect("one failure");
+        return Err(error.context(format!("{} is not set", TOKEN_VAR)));
+    }
+    let reasons: Vec<String> = failures.iter().map(|e| format!("{:#}", e)).collect();
+    bail!(
+        "{} is not set, and neither token can be read here:\n  {}",
+        TOKEN_VAR,
+        reasons.join("\n  ")
+    )
 }
 
 fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {
