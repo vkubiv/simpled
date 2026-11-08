@@ -436,6 +436,7 @@ mod tests {
             version_document: Some(r#"{"version":"1.2.3"}"#.to_string()),
             controller: None,
             trusted_proxies: Vec::new(),
+            access_log: None,
             global: false,
             placement: None,
         };
@@ -512,6 +513,7 @@ mod tests {
             version_document: None,
             controller: None,
             trusted_proxies: Vec::new(),
+            access_log: None,
             global: false,
             placement: None,
         };

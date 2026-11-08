@@ -172,6 +172,20 @@ pub struct IngressTlsSpecYaml {
     pub upstream: Option<bool>,
 }
 
+/// `gateway.access_log`: `true`/`false`, or `{format: json|common}`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum AccessLogSpecYaml {
+    On(bool),
+    With(AccessLogSettingsYaml),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLogSettingsYaml {
+    pub format: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IngressSpecYaml {
     #[serde(default = "default_gateway_name")]
@@ -184,6 +198,9 @@ pub struct IngressSpecYaml {
     // Docker only: IPs/CIDRs of proxies in front of the gateway (a CDN, a load
     // balancer) whose X-Forwarded-For the gateway believes.
     pub trusted_proxies: Option<Vec<String>>,
+    // Docker only: Traefik's access log, one line per request on stdout.
+    // `true` is JSON; `{format: common}` is the Common Log Format.
+    pub access_log: Option<AccessLogSpecYaml>,
     // Swarm only: one gateway task on every node (`deploy.mode: global`).
     pub global: Option<bool>,
     // Swarm only: where the gateway task(s) may run.

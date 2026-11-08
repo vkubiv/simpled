@@ -3,7 +3,7 @@ use crate::docker_compose::{prepare_service, DockerCompose, DockerComposeNetwork
 use crate::docker_resources::DockerResources;
 use crate::resolved_spec::{EnvironmentResolvedSpec, IngressResolvedSpec, LetsEncryptResolvedSpec};
 use crate::secret_fetch::{self, create_executable, sh_quote, FetchScript};
-use crate::spec::{DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBinding};
+use crate::spec::{AccessLogFormat, DockerSpecificSpec, SecretMount, ServiceVolumeType, VolumeBinding};
 use crate::swarm_objects::{self, ObjectKind, SwarmObjects};
 use anyhow::{anyhow, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -1044,6 +1044,7 @@ fn generate_traefik_standalone(
         letsencrypt,
         &resolved_spec.ingress.trusted_proxies,
         resolved_spec.ingress.tls_upstream(),
+        resolved_spec.ingress.access_log,
     )?;
 
     // Standalone keeps Traefik as its own ACME client, on its single host.
@@ -1170,6 +1171,7 @@ fn generate_traefik_swarm(
         None,
         &resolved_spec.ingress.trusted_proxies,
         upstream,
+        resolved_spec.ingress.access_log,
     )?;
 
     generate_traefik_dynamic_config(
@@ -1280,6 +1282,7 @@ fn write_traefik_static_config(
     letsencrypt: Option<&LetsEncryptResolvedSpec>,
     trusted_proxies: &[String],
     ping: bool,
+    access_log: Option<AccessLogFormat>,
 ) -> Result<()> {
     writeln!(file, "entryPoints:")?;
     writeln!(file, "  web:")?;
@@ -1315,6 +1318,7 @@ fn write_traefik_static_config(
         writeln!(file, "  entryPoint: web")?;
         writeln!(file, "  manualRouting: true")?;
     }
+    write_traefik_access_log(file, access_log)?;
     if let Some(le) = letsencrypt {
         writeln!(file, "certificatesResolvers:")?;
         writeln!(file, "  {}:", TRAEFIK_RESOLVER)?;
@@ -1328,6 +1332,29 @@ fn write_traefik_static_config(
         writeln!(file, "      storage: \"/letsencrypt/acme.json\"")?;
         writeln!(file, "      httpChallenge:")?;
         writeln!(file, "        entryPoint: web")?;
+    }
+    Ok(())
+}
+
+/// `accessLog`, on stdout beside Traefik's own log, so `docker service logs`
+/// and any log driver or agent pick it up. The client IP (`ClientHost`) is the
+/// peer's, or the X-Forwarded-For of a `trusted_proxies` peer, which Traefik
+/// strips from any other; JSON also keeps that header, every other one dropped.
+fn write_traefik_access_log(file: &mut File, access_log: Option<AccessLogFormat>) -> Result<()> {
+    let Some(format) = access_log else {
+        return Ok(());
+    };
+    writeln!(file, "accessLog:")?;
+    match format {
+        AccessLogFormat::Common => writeln!(file, "  format: common")?,
+        AccessLogFormat::Json => {
+            writeln!(file, "  format: json")?;
+            writeln!(file, "  fields:")?;
+            writeln!(file, "    headers:")?;
+            writeln!(file, "      defaultMode: drop")?;
+            writeln!(file, "      names:")?;
+            writeln!(file, "        X-Forwarded-For: keep")?;
+        }
     }
     Ok(())
 }
@@ -1854,6 +1881,7 @@ mod tests {
                 version_document: None,
                 controller: None,
                 trusted_proxies: Vec::new(),
+                access_log: None,
                 global: false,
                 placement: None,
                 name: "gateway".to_string(),
@@ -1883,6 +1911,7 @@ mod tests {
             version_document: None,
             controller: None,
             trusted_proxies: Vec::new(),
+            access_log: None,
             global: false,
             placement: None,
             name: "gateway".to_string(),
@@ -1914,6 +1943,7 @@ mod tests {
             version_document: None,
             controller: None,
             trusted_proxies: Vec::new(),
+            access_log: None,
             global: false,
             placement: None,
             name: "gateway".to_string(),
@@ -2505,7 +2535,7 @@ mkdir -p \"/var/"
         let letsencrypt = if has_tls { tls.letsencrypt.as_ref() } else { None };
         let proxies: Vec<String> = trusted_proxies.iter().map(|p| p.to_string()).collect();
         let mut file = File::create(&path).unwrap();
-        write_traefik_static_config(&mut file, has_tls, letsencrypt, &proxies, false).unwrap();
+        write_traefik_static_config(&mut file, has_tls, letsencrypt, &proxies, false, None).unwrap();
         drop(file);
         fs::read_to_string(path).unwrap()
     }
@@ -2527,11 +2557,34 @@ mkdir -p \"/var/"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("traefik.yml");
         let mut file = File::create(&path).unwrap();
-        write_traefik_static_config(&mut file, false, None, &["10.0.0.0/16".to_string()], true).unwrap();
+        write_traefik_static_config(&mut file, false, None, &["10.0.0.0/16".to_string()], true, None).unwrap();
         drop(file);
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "entryPoints:\n  web:\n    address: \":80\"\n    forwardedHeaders:\n      trustedIPs:\n        - \"10.0.0.0/16\"\nproviders:\n  file:\n    filename: \"/etc/traefik/dynamic_conf.yml\"\n    watch: true\nping:\n  entryPoint: web\n  manualRouting: true\n"
+        );
+    }
+
+    #[test]
+    fn the_access_log_goes_to_stdout_with_only_x_forwarded_for_kept() {
+        let conf = |format: AccessLogFormat| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("traefik.yml");
+            let mut file = File::create(&path).unwrap();
+            write_traefik_static_config(&mut file, false, None, &[], false, Some(format)).unwrap();
+            drop(file);
+            serde_yaml::from_str::<serde_yaml::Value>(&fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let json = conf(AccessLogFormat::Json);
+        let log = &json["accessLog"];
+        assert_eq!(log["format"], "json");
+        assert!(log.get("filePath").is_none(), "stdout, not a file");
+        assert_eq!(log["fields"]["headers"]["defaultMode"], "drop");
+        assert_eq!(log["fields"]["headers"]["names"]["X-Forwarded-For"], "keep");
+        let common = conf(AccessLogFormat::Common);
+        assert_eq!(
+            common["accessLog"],
+            serde_yaml::from_str::<serde_yaml::Value>("format: common").unwrap()
         );
     }
 

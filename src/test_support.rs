@@ -89,6 +89,7 @@ pub fn resolved_env(env_type: DeploymentEnvType, deployment: DeploymentResolvedS
             version_document: None,
             controller: None,
             trusted_proxies: vec![],
+            access_log: None,
             global: false,
             placement: None,
             name: "gateway".to_string(),

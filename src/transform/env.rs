@@ -45,6 +45,7 @@ pub fn convert_env_spec(
     };
     let ingress_type_str = gateway_yaml.ingress_type.clone();
     let has_trusted_proxies = gateway_yaml.trusted_proxies.as_ref().is_some_and(|p| !p.is_empty());
+    let has_access_log = gateway_yaml.access_log.is_some();
     let global_opt = gateway_yaml.global;
     let mut ingress = convert_ingress(gateway_yaml, &env_type_yaml)?;
     ingress.controller = yaml
@@ -125,6 +126,11 @@ pub fn convert_env_spec(
             if has_trusted_proxies {
                 return Err(anyhow!(
                     "gateway trusted_proxies cannot be set for K8S environment: configure the ingress controller instead"
+                ));
+            }
+            if has_access_log {
+                return Err(anyhow!(
+                    "gateway access_log cannot be set for K8S environment: configure the ingress controller's access log instead"
                 ));
             }
             if tls_upstream {
@@ -237,6 +243,9 @@ pub fn convert_env_spec(
             }
             if has_trusted_proxies {
                 return Err(anyhow!("gateway trusted_proxies cannot be set for Local environment"));
+            }
+            if has_access_log {
+                return Err(anyhow!("gateway access_log cannot be set for Local environment"));
             }
             reject_swarm_only("Local")?;
             if deployments.is_empty() {
@@ -873,6 +882,8 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         }
     }
 
+    let access_log = convert_access_log(yaml.access_log.as_ref())?;
+
     let global = yaml.global == Some(true);
     let placement = yaml
         .placement
@@ -895,11 +906,29 @@ fn convert_ingress(yaml: IngressSpecYaml, env_type: &DeploymentEnvTypeYaml) -> R
         redirects,
         body_limit,
         trusted_proxies,
+        access_log,
         global,
         placement,
         // Set from the env spec's top level, once the hosts are known.
         controller: None,
     })
+}
+
+/// `gateway.access_log`: `true` is JSON, which names the host and the router;
+/// `false` or absent is off.
+fn convert_access_log(yaml: Option<&AccessLogSpecYaml>) -> Result<Option<AccessLogFormat>> {
+    match yaml {
+        None | Some(AccessLogSpecYaml::On(false)) => Ok(None),
+        Some(AccessLogSpecYaml::On(true)) => Ok(Some(AccessLogFormat::Json)),
+        Some(AccessLogSpecYaml::With(settings)) => match settings.format.as_deref() {
+            None | Some("json") => Ok(Some(AccessLogFormat::Json)),
+            Some("common") => Ok(Some(AccessLogFormat::Common)),
+            Some(other) => Err(anyhow!(
+                "Invalid gateway access_log format '{}': expected json or common",
+                other
+            )),
+        },
+    }
 }
 
 /// `controller`. Docker only for now: the controller runs next to the Docker
@@ -2788,6 +2817,33 @@ deployments:
         assert!(err.contains("trusted_proxies cannot be set for K8S"), "{err}");
         // An empty list says nothing, so it is not an error anywhere.
         assert!(convert_trusted("k8s", "").is_ok());
+    }
+
+    fn convert_access_log_spec(env_type: &str, value: &str) -> Result<DeploymentEnvironmentSpec> {
+        let raw =
+            trusted_proxies_spec(env_type, "").replace("  trusted_proxies: []", &format!("  access_log: {value}"));
+        convert_raw(&raw)
+    }
+
+    #[test]
+    fn access_log_is_json_by_default_common_on_request_and_off_otherwise() {
+        let format = |value: &str| convert_access_log_spec("docker", value).unwrap().ingress.access_log;
+        assert_eq!(format("true"), Some(AccessLogFormat::Json));
+        assert_eq!(format("{format: json}"), Some(AccessLogFormat::Json));
+        assert_eq!(format("{}"), Some(AccessLogFormat::Json));
+        assert_eq!(format("{format: common}"), Some(AccessLogFormat::Common));
+        assert_eq!(format("false"), None);
+        assert_eq!(convert_trusted("docker", "").unwrap().ingress.access_log, None);
+    }
+
+    #[test]
+    fn access_log_rejects_an_unknown_format_and_is_docker_only() {
+        let err = convert_access_log_spec("docker", "{format: clf}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("access_log format 'clf'"), "{err}");
+        let err = convert_access_log_spec("k8s", "true").unwrap_err().to_string();
+        assert!(err.contains("access_log cannot be set for K8S"), "{err}");
     }
 
     fn convert_raw(raw: &str) -> Result<DeploymentEnvironmentSpec> {

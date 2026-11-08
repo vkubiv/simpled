@@ -457,12 +457,23 @@ pub struct IngressSpec {
     /// IPs/CIDRs of the proxies in front of the gateway whose X-Forwarded-For
     /// is believed. Empty trusts no one, the gateway's own default.
     pub trusted_proxies: Vec<String>,
+    /// Docker only: Traefik's access log on stdout; `None` is off.
+    pub access_log: Option<AccessLogFormat>,
     /// Swarm only: one gateway task per node instead of a single replica.
     pub global: bool,
     /// Swarm only: where the gateway task(s) may run.
     pub placement: Option<Placement>,
     /// Docker only, and required there: where the controller is served, and its tokens.
     pub controller: Option<ControllerSpec>,
+}
+
+/// The format of Traefik's access log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessLogFormat {
+    /// One JSON object per request, with the host, router, status and duration.
+    Json,
+    /// The Common Log Format, which has no host.
+    Common,
 }
 
 /// `controller`: the host the controller is served on, under

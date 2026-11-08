@@ -334,6 +334,7 @@ mod tests {
                 version_document: None,
                 controller: None,
                 trusted_proxies: Vec::new(),
+                access_log: None,
                 global: false,
                 placement: None,
                 name: "gateway".to_string(),
