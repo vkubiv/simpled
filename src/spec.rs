@@ -487,6 +487,19 @@ pub struct ControllerSpec {
     pub host: String,
     pub read_token: Option<DeploymentSecretSpec>,
     pub manage_token: Option<DeploymentSecretSpec>,
+    pub cloudwatch: Option<CloudWatchSpec>,
+}
+
+/// `controller.cloudwatch`: the controller publishes the environment's health
+/// as CloudWatch metrics and keeps their alarms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudWatchSpec {
+    /// The `Env` dimension, and part of every alarm's name.
+    pub name: String,
+    /// `None`: the region of the instance the controller runs on.
+    pub region: Option<String>,
+    /// Who the alarms email, through an SNS topic. Empty: alarms without actions.
+    pub alarm_email: Vec<String>,
 }
 
 /// A domain the gateway serves only to bounce the client to another one, such as

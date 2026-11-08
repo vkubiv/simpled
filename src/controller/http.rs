@@ -3,7 +3,7 @@
 //! the controller sees `/health`, `/api/v1/...`. ACME challenges reach it
 //! unchanged, on every host.
 
-use super::model;
+use super::model::{self, Status};
 use super::source::Source;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -150,20 +150,21 @@ async fn deployment_health(State(app): State<Arc<App>>, Path(deployment): Path<S
     health_response(services.is_some(), &health)
 }
 
+/// The environment as `/health` reports it.
+pub(super) struct Environment {
+    pub health: model::StackHealth,
+    /// The gateway service could be read too.
+    pub complete: bool,
+    /// Each certificate the controller issues: whether it was issued, and its
+    /// expiry. `None` for a domain with none, or one that could not be read.
+    pub certificates: Vec<Option<(bool, u64)>>,
+}
+
 /// The gateway, every certificate and every deployment that has services: one
 /// listing of the services, and the rest read at once, so one slow Docker call
-/// does not add to the next.
-async fn stack_health(State(app): State<Arc<App>>) -> Response {
-    let all = match app.source.all_services().await {
-        Ok(all) => all,
-        Err(e) => {
-            eprintln!("health: {:#}", e);
-            return json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"status": "down", "error": "cannot read the deployments"}),
-            );
-        }
-    };
+/// does not add to the next. `Err` when the services cannot be listed.
+pub(super) async fn environment(app: &Arc<App>) -> anyhow::Result<Environment> {
+    let all = app.source.all_services().await?;
     let gateway = async {
         match app.source.gateway_replicas().await {
             Ok((desired, running)) => (model::gateway_health(desired, running), true),
@@ -177,11 +178,10 @@ async fn stack_health(State(app): State<Arc<App>>) -> Response {
         let Some(certs) = &app.certs else {
             return vec![];
         };
-        let now = super::unix_now();
         let mut states = Vec::new();
         for domain in &certs.domains {
             match certs.source.current(domain).await {
-                Ok(current) => states.push(model::tls_state(current, now)),
+                Ok(current) => states.push(current),
                 Err(e) => eprintln!("health: certificate of {}: {:#}", domain, e),
             }
         }
@@ -194,9 +194,67 @@ async fn stack_health(State(app): State<Arc<App>>) -> Response {
             (deployment, health)
         }
     }));
-    let ((gateway, gateway_read), certificates, each) = tokio::join!(gateway, certificates, each);
-    let health = model::stack_health(gateway, &certificates, each.into_iter().collect::<BTreeMap<_, _>>());
-    health_response(gateway_read, &health)
+    let ((gateway, complete), certificates, each) = tokio::join!(gateway, certificates, each);
+    let now = super::unix_now();
+    let states: Vec<model::Tls> = certificates.iter().map(|c| model::tls_state(*c, now)).collect();
+    let health = model::stack_health(gateway, &states, each.into_iter().collect::<BTreeMap<_, _>>());
+    Ok(Environment {
+        health,
+        complete,
+        certificates,
+    })
+}
+
+async fn stack_health(State(app): State<Arc<App>>) -> Response {
+    match environment(&app).await {
+        Ok(env) => health_response(env.complete, &env.health),
+        Err(e) => {
+            eprintln!("health: {:#}", e);
+            json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"status": "down", "error": "cannot read the deployments"}),
+            )
+        }
+    }
+}
+
+/// What the CloudWatch task publishes: `/health`, plus every deployment of the
+/// env spec, `down` while it has no services. `Err` when Docker cannot be read,
+/// the gateway service included: nothing is published then.
+pub(super) async fn sample(app: &Arc<App>) -> anyhow::Result<super::cloudwatch::Sample> {
+    let env = environment(app).await?;
+    if !env.complete {
+        anyhow::bail!("cannot read the gateway service");
+    }
+    let mut deployments: BTreeMap<String, Status> = env
+        .health
+        .deployments
+        .iter()
+        .map(|(d, h)| (d.clone(), h.status))
+        .collect();
+    for deployment in &app.deployments {
+        deployments.entry(deployment.clone()).or_insert(Status::Down);
+    }
+    let worst = deployments.values().copied().fold(env.health.status, Status::max);
+    let now = super::unix_now();
+    let cert_days_left = app.certs.as_ref().map(|_| {
+        env.certificates
+            .iter()
+            .map(|c| match c {
+                Some((true, not_after)) => (*not_after as f64 - now as f64).max(0.0) / 86400.0,
+                _ => 0.0,
+            })
+            .fold(f64::INFINITY, f64::min)
+    });
+    Ok(super::cloudwatch::Sample {
+        env: worst,
+        gateway: env.health.gateway.status,
+        deployments,
+        // No certificate listed yet: nothing to report rather than infinity.
+        cert_days_left: cert_days_left
+            .filter(|d| d.is_finite())
+            .map(|d| (d * 10.0).round() / 10.0),
+    })
 }
 
 /// The key authorization of a pending HTTP-01 challenge, on any host: the

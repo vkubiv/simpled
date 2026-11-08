@@ -5,6 +5,8 @@
 
 pub mod acme;
 pub mod api;
+pub mod aws;
+pub mod cloudwatch;
 pub mod http;
 pub mod inspect;
 pub mod model;
@@ -30,6 +32,9 @@ pub struct Config {
     /// Swarm with `tls.letsencrypt`: the controller issues the gateway's certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme: Option<acme::AcmeConfig>,
+    /// `controller.cloudwatch`: health metrics and their alarms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudwatch: Option<cloudwatch::CloudWatchConfig>,
 }
 
 /// The private API's tokens, as files the controller reads at start.
@@ -191,6 +196,17 @@ pub fn config_for(spec: &crate::resolved_spec::EnvironmentResolvedSpec, mode: so
             // One host: Traefik is its own ACME client there.
             source::Mode::Standalone => None,
         },
+        cloudwatch: spec.ingress.controller.as_ref().and_then(|c| {
+            let cw = c.cloudwatch.as_ref()?;
+            let scheme = if spec.ingress.tls.is_some() { "https" } else { "http" };
+            let host = c.domains.first().cloned().unwrap_or_default();
+            Some(cloudwatch::CloudWatchConfig {
+                name: cw.name.clone(),
+                region: cw.region.clone(),
+                alarm_email: cw.alarm_email.clone(),
+                health_url: format!("{}://{}{}/health", scheme, host, PREFIX),
+            })
+        }),
     }
 }
 
@@ -266,6 +282,9 @@ pub fn run(config: &Path, listen: &str) -> Result<()> {
             deployments: config.domains.keys().cloned().collect(),
             source: Box::new(source::DockerSource::new(docker, config.mode)),
         });
+        if let Some(cloudwatch_config) = config.cloudwatch.clone() {
+            tokio::spawn(cloudwatch::run(cloudwatch_config, app.clone()));
+        }
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .with_context(|| format!("Cannot listen on {}", listen))?;

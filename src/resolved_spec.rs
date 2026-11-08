@@ -65,6 +65,7 @@ pub struct ControllerResolvedSpec {
     pub domains: Vec<String>,
     pub read_token: Option<SecretResolvedSpec>,
     pub manage_token: Option<SecretResolvedSpec>,
+    pub cloudwatch: Option<crate::spec::CloudWatchSpec>,
 }
 
 impl ControllerResolvedSpec {

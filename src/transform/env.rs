@@ -51,7 +51,7 @@ pub fn convert_env_spec(
     ingress.controller = yaml
         .controller
         .as_ref()
-        .map(|c| convert_controller(c, &ingress.hosts, &env_type_yaml, root))
+        .map(|c| convert_controller(c, &ingress.hosts, &ingress.name, &env_type_yaml, root))
         .transpose()?;
     let tls_upstream = ingress.tls.as_ref().is_some_and(|t| t.upstream);
     let has_tls_secret = ingress.tls.as_ref().is_some_and(|t| t.secret.is_some());
@@ -938,6 +938,7 @@ fn convert_access_log(yaml: Option<&AccessLogSpecYaml>) -> Result<Option<AccessL
 fn convert_controller(
     yaml: &ControllerSpecYaml,
     hosts: &[spec::HostSpec],
+    gateway_name: &str,
     env_type: &DeploymentEnvTypeYaml,
     root: &Path,
 ) -> Result<spec::ControllerSpec> {
@@ -971,10 +972,69 @@ fn convert_controller(
     };
     let read_token = token("read_token", &yaml.read_token)?;
     let manage_token = token("manage_token", &yaml.manage_token)?;
+    let cloudwatch = yaml
+        .cloudwatch
+        .as_ref()
+        .map(|c| convert_cloudwatch(c, gateway_name))
+        .transpose()?;
     Ok(spec::ControllerSpec {
         host: yaml.host.clone(),
         read_token,
         manage_token,
+        cloudwatch,
+    })
+}
+
+/// `controller.cloudwatch`. The name goes into alarm names as
+/// `simpled:<name>:...`, where the controller tells its own alarms by that
+/// prefix, so it holds no `:`.
+fn convert_cloudwatch(yaml: &CloudWatchSpecYaml, gateway_name: &str) -> Result<spec::CloudWatchSpec> {
+    let name = yaml.name.clone().unwrap_or_else(|| gateway_name.to_string());
+    let valid_name = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if !valid_name {
+        return Err(anyhow!(
+            "controller.cloudwatch.name '{}' must be 1 to 64 letters, digits, '-', '_' or '.'{}",
+            name,
+            if yaml.name.is_none() {
+                " (it defaults to gateway.name; set it)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if let Some(region) = &yaml.region {
+        if region.is_empty()
+            || !region
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(anyhow!(
+                "controller.cloudwatch.region '{}' is not an AWS region, e.g. us-east-2",
+                region
+            ));
+        }
+    }
+    let alarm_email = yaml.alarm_email.clone().unwrap_or_default();
+    for email in &alarm_email {
+        let valid = email
+            .split_once('@')
+            .is_some_and(|(user, domain)| !user.is_empty() && domain.contains('.'))
+            && !email.chars().any(|c| c.is_whitespace() || c == ',');
+        if !valid {
+            return Err(anyhow!(
+                "controller.cloudwatch.alarm_email '{}' is not an email address",
+                email
+            ));
+        }
+    }
+    Ok(spec::CloudWatchSpec {
+        name,
+        region: yaml.region.clone(),
+        alarm_email,
     })
 }
 
@@ -2845,6 +2905,83 @@ deployments:
         assert!(err.contains("access_log format 'clf'"), "{err}");
         let err = convert_access_log_spec("k8s", "true").unwrap_err().to_string();
         assert!(err.contains("access_log cannot be set for K8S"), "{err}");
+    }
+
+    fn convert_cloudwatch_spec(block: &str) -> Result<DeploymentEnvironmentSpec> {
+        let raw = trusted_proxies_spec("docker", "")
+            .replace(
+                "  host: web",
+                &format!(
+                    "  host: web
+  cloudwatch:
+{}",
+                    block
+                ),
+            )
+            .replace(
+                "gateway:
+",
+                "gateway:
+  name: shop-prod
+",
+            );
+        convert_raw(&raw)
+    }
+
+    #[test]
+    fn cloudwatch_takes_the_gateway_name_and_checks_its_fields() {
+        let spec = convert_cloudwatch_spec(
+            "    alarm_email: [ops@example.com]
+",
+        )
+        .unwrap();
+        let cw = spec.ingress.controller.unwrap().cloudwatch.unwrap();
+        assert_eq!(
+            cw,
+            CloudWatchSpec {
+                name: "shop-prod".to_string(),
+                region: None,
+                alarm_email: vec!["ops@example.com".to_string()],
+            }
+        );
+        let named = convert_cloudwatch_spec(
+            "    name: shop.eu
+    region: eu-west-1
+",
+        )
+        .unwrap();
+        let cw = named.ingress.controller.unwrap().cloudwatch.unwrap();
+        assert_eq!((cw.name.as_str(), cw.region.as_deref()), ("shop.eu", Some("eu-west-1")));
+        for (block, wanted) in [
+            (
+                "    name: \"a:b\"
+",
+                "cloudwatch.name 'a:b'",
+            ),
+            (
+                "    region: EU West
+",
+                "cloudwatch.region 'EU West'",
+            ),
+            (
+                "    alarm_email: [ops]
+",
+                "alarm_email 'ops'",
+            ),
+            (
+                "    alarm_email: [\"a@b.com, c@d.com\"]
+",
+                "is not an email address",
+            ),
+        ] {
+            let err = match convert_cloudwatch_spec(block) {
+                Ok(_) => panic!("{block} was accepted"),
+                Err(e) => format!("{:#}", e),
+            };
+            assert!(err.contains(wanted), "{block}: {err}");
+        }
+        let typo = serde_yaml::from_str::<CloudWatchSpecYaml>("alarms: true").unwrap_err();
+        assert!(typo.to_string().contains("unknown field `alarms`"), "{typo}");
     }
 
     fn convert_raw(raw: &str) -> Result<DeploymentEnvironmentSpec> {
