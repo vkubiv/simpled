@@ -666,7 +666,7 @@ fn field_path(filter: &str) -> Result<Vec<String>> {
 
 /// `.a.b` and `."a.b"` as the segments they address, or `None` for a filter that
 /// is not a plain path. `.` on its own selects the whole document.
-fn parse_field_path(filter: &str) -> Option<Vec<String>> {
+pub fn parse_field_path(filter: &str) -> Option<Vec<String>> {
     let mut rest = filter.strip_prefix('.')?;
     let mut segments = Vec::new();
     while !rest.is_empty() {

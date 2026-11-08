@@ -268,6 +268,15 @@ fn resolve_secrets(
     Ok(secrets)
 }
 
+/// One secret on its own, as `prepare-deployment` would read it: for the
+/// controller's tokens in `simpled status` and `logs`.
+pub fn resolve_one_secret(
+    env_spec: &DeploymentEnvironmentSpec,
+    secret_spec: &crate::spec::DeploymentSecretSpec,
+) -> Result<SecretResolvedValue> {
+    resolve_secret_value(env_spec, secret_spec, &mut HashMap::new())
+}
+
 /// One secret's value: read now, or deferred to the deploy target (`aws`).
 /// `documents` caches the JSON documents several secrets share.
 fn resolve_secret_value(

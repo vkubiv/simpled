@@ -74,8 +74,9 @@ enum Commands {
     },
 
     /// Every deployment's version, health and services, from the simpled controller.
-    /// Reads the API's address from the env spec here (controller.host)
-    /// and the token from SIMPLED_TOKEN
+    /// Reads the API's address from the env spec here (controller.host) and the
+    /// token from SIMPLED_TOKEN, or else from controller.read_token: an `aws:` one
+    /// from a git-ignored secrets.json here
     Status {
         /// The API's base instead, e.g. https://ops.example.com/simpled/api/v1
         #[arg(long)]
@@ -429,11 +430,8 @@ fn main() -> Result<()> {
             step_command(command)?;
         }
         Commands::Status { url, json } => {
-            let base = match url {
-                Some(url) => url.trim_end_matches('/').to_string(),
-                None => client::api_base(&spec_loader::load_env_spec(Path::new("."), None, 0)?)?,
-            };
-            client::status(&base, *json)?;
+            let (base, token) = client::api_and_token(url.as_deref())?;
+            client::status(&base, &token, *json)?;
         }
         Commands::Logs {
             deployment,
@@ -444,12 +442,10 @@ fn main() -> Result<()> {
             timestamps,
             url,
         } => {
-            let base = match url {
-                Some(url) => url.trim_end_matches('/').to_string(),
-                None => client::api_base(&spec_loader::load_env_spec(Path::new("."), None, 0)?)?,
-            };
+            let (base, token) = client::api_and_token(url.as_deref())?;
             client::logs(
                 &base,
+                &token,
                 &client::LogArgs {
                     deployment,
                     service,
