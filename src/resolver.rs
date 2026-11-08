@@ -3,7 +3,7 @@ use crate::secret_fetch;
 use crate::spec::EnvVariable;
 use crate::spec::*;
 use anyhow::{anyhow, Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -13,14 +13,34 @@ pub fn resolve(
     app_spec: &AppSpec,
     deployment_name: &str,
 ) -> Result<EnvironmentResolvedSpec> {
+    Ok(resolve_with(env_spec, app_spec, deployment_name, None)?.spec)
+}
+
+/// What [`resolve_with`] produced.
+pub struct Resolution {
+    pub spec: EnvironmentResolvedSpec,
+    /// The ids of the `aws` secrets `--aws-secrets-file` answered, sorted.
+    pub from_aws_secrets_file: Vec<String>,
+}
+
+/// [`resolve`], with `prepare-deployment --aws-secrets-file`: every `aws` secret
+/// is read from that file and written into the output instead of being fetched
+/// on the deploy target.
+pub fn resolve_with(
+    env_spec: &DeploymentEnvironmentSpec,
+    app_spec: &AppSpec,
+    deployment_name: &str,
+    aws_secrets_file: Option<&Path>,
+) -> Result<Resolution> {
     let deployment = env_spec.deployment(deployment_name)?;
+    let mut reader = SecretReader::new(env_spec, aws_secrets_file);
 
     if env_spec.env_type != DeploymentEnvType::Local && env_spec.registry.is_empty() {
         return Err(anyhow!("Registry mapping is required for non-local deployments"));
     }
 
     let configs = resolve_configs(deployment, app_spec)?;
-    let secrets = resolve_secrets(env_spec, deployment, app_spec)?;
+    let secrets = resolve_secrets(&mut reader, deployment, app_spec)?;
 
     // Deployment-level env values may reference secrets via `$secret(name)`.
     // Expand those references once before the values feed into service resolution.
@@ -81,7 +101,7 @@ pub fn resolve(
         host_environment: undockerized_values,
     };
 
-    let mut ingress = resolve_ingress(env_spec)?;
+    let mut ingress = resolve_ingress(env_spec, &mut reader)?;
     if is_local {
         ingress.version_document = Some(version_document);
     }
@@ -92,7 +112,10 @@ pub fn resolve(
         ports: env_spec.ports.clone(),
     };
     check_ports_follow_instance(&resolved)?;
-    Ok(resolved)
+    Ok(Resolution {
+        spec: resolved,
+        from_aws_secrets_file: reader.from_aws_secrets_file.into_iter().collect(),
+    })
 }
 
 /// Above instance 0 a literal host port would be the same in every instance, so
@@ -187,29 +210,86 @@ fn read_config_file(path: &Path) -> Result<ConfigResolvedFile> {
     Ok(ConfigResolvedFile { name, content })
 }
 
-/// A local deployment runs on this machine, so there is no deploy target to defer
-/// to and no artifact for the value to leak into — the lookup happens right here.
-/// Every other target gets the lookup written into its generated
-/// `fetch-secrets.sh` instead.
-fn resolve_aws_secret(env_spec: &DeploymentEnvironmentSpec, reference: &AwsSecretRef) -> Result<SecretResolvedValue> {
-    if let Some(path) = &env_spec.aws_secrets_file {
-        let value = secret_fetch::read_from_file(path, reference)?.ok_or_else(|| {
-            anyhow!(
-                "Secret '{}' is not listed in {} (--aws-secrets-file); add it: {}",
-                reference.secret_id,
-                path.display(),
-                secret_fetch::local_file_example(reference)
-            )
-        })?;
-        return Ok(SecretResolvedValue::Literal(value));
+/// Reads the secret values of one resolution. Every JSON document is read and
+/// parsed once, however many secrets share it: `json_file` and `json_env`
+/// documents, and the file that stands in for AWS Secrets Manager.
+pub struct SecretReader<'a> {
+    env_spec: &'a DeploymentEnvironmentSpec,
+    /// `prepare-deployment --aws-secrets-file`: every `aws` secret is read from it.
+    aws_secrets_file: Option<&'a Path>,
+    documents: HashMap<JsonDocument, serde_json::Value>,
+    from_aws_secrets_file: BTreeSet<String>,
+}
+
+impl<'a> SecretReader<'a> {
+    pub fn new(env_spec: &'a DeploymentEnvironmentSpec, aws_secrets_file: Option<&'a Path>) -> Self {
+        SecretReader {
+            env_spec,
+            aws_secrets_file,
+            documents: HashMap::new(),
+            from_aws_secrets_file: BTreeSet::new(),
+        }
     }
-    if env_spec.env_type == DeploymentEnvType::Local {
-        Ok(SecretResolvedValue::Literal(secret_fetch::fetch_locally(
-            reference,
-            &env_spec.root,
-        )?))
-    } else {
+
+    /// One secret's value: read now, or deferred to the deploy target (`aws`).
+    pub fn value(&mut self, secret_spec: &crate::spec::DeploymentSecretSpec) -> Result<SecretResolvedValue> {
+        resolve_secret_value(self, secret_spec)
+    }
+
+    /// An `aws` secret. With `--aws-secrets-file`, read from that file. A local
+    /// deployment runs on this machine, so there is no deploy target to defer to
+    /// and no artifact for the value to leak into: it is read right here (see
+    /// [`Self::aws_here`]). Every other target gets the lookup written into its
+    /// generated `fetch-secrets.sh` instead.
+    fn aws(&mut self, reference: &AwsSecretRef) -> Result<SecretResolvedValue> {
+        if let Some(path) = self.aws_secrets_file {
+            let value = self.read_file(path, reference)?.ok_or_else(|| {
+                anyhow!(
+                    "Secret '{}' is not listed in {} (--aws-secrets-file); {}",
+                    reference.secret_id,
+                    path.display(),
+                    secret_fetch::local_file_hint(reference)
+                )
+            })?;
+            self.from_aws_secrets_file.insert(reference.secret_id.clone());
+            return Ok(SecretResolvedValue::Literal(value));
+        }
+        if self.env_spec.env_type == DeploymentEnvType::Local {
+            return Ok(SecretResolvedValue::Literal(self.aws_here(reference)?.0));
+        }
         Ok(SecretResolvedValue::Deferred(reference.clone()))
+    }
+
+    /// An `aws` secret read on this machine, and where from: the
+    /// [`secret_fetch::LOCAL_FILE`] next to the env spec when it lists the
+    /// secret, else the AWS CLI. A file that is there but broken is an error, not
+    /// a reason to go to AWS: that would hide the typo.
+    pub fn aws_here(&mut self, reference: &AwsSecretRef) -> Result<(String, &'static str)> {
+        let path = self.env_spec.root.join(secret_fetch::LOCAL_FILE);
+        let file_exists = path.is_file();
+        if file_exists {
+            if let Some(value) = self.read_file(&path, reference)? {
+                return Ok((value, secret_fetch::LOCAL_FILE));
+            }
+        }
+        let value = secret_fetch::fetch_with_aws_cli(reference)
+            .map_err(|error| error.context(secret_fetch::not_in_local_file(reference, file_exists)))?;
+        Ok((value, secret_fetch::FROM_AWS_CLI))
+    }
+
+    fn read_file(&mut self, path: &Path, reference: &AwsSecretRef) -> Result<Option<String>> {
+        let document = JsonDocument::AwsSecrets(path.to_path_buf());
+        let file = self.document(&reference.secret_id, &document)?;
+        secret_fetch::select_aws_value(file, &document.describe(), reference)
+    }
+
+    /// `document`, read and parsed on first use. `name` is the secret that asks.
+    fn document(&mut self, name: &str, document: &JsonDocument) -> Result<&serde_json::Value> {
+        if !self.documents.contains_key(document) {
+            let parsed = read_json_document(name, document)?;
+            self.documents.insert(document.clone(), parsed);
+        }
+        Ok(&self.documents[document])
     }
 }
 
@@ -253,7 +333,7 @@ struct ResolvedSecrets {
 }
 
 fn resolve_secrets(
-    env_spec: &DeploymentEnvironmentSpec,
+    reader: &mut SecretReader,
     deployment: &DeploymentSpec,
     app_spec: &AppSpec,
 ) -> Result<ResolvedSecrets> {
@@ -262,10 +342,8 @@ fn resolve_secrets(
         values: HashMap::new(),
         deferred: HashSet::new(),
     };
-    // A document several secrets share is read and parsed once.
-    let mut documents: HashMap<JsonDocument, serde_json::Value> = HashMap::new();
     for secret_spec in &deployment.secrets {
-        let value = resolve_secret_value(env_spec, secret_spec, &mut documents)?;
+        let value = reader.value(secret_spec)?;
         match &value {
             SecretResolvedValue::Literal(literal) => {
                 secrets.values.insert(secret_spec.secret_name.clone(), literal.clone());
@@ -282,21 +360,10 @@ fn resolve_secrets(
     Ok(secrets)
 }
 
-/// One secret on its own, as `prepare-deployment` would read it: for the
-/// controller's tokens in `simpled status` and `logs`.
-pub fn resolve_one_secret(
-    env_spec: &DeploymentEnvironmentSpec,
-    secret_spec: &crate::spec::DeploymentSecretSpec,
-) -> Result<SecretResolvedValue> {
-    resolve_secret_value(env_spec, secret_spec, &mut HashMap::new())
-}
-
-/// One secret's value: read now, or deferred to the deploy target (`aws`).
-/// `documents` caches the JSON documents several secrets share.
+/// [`SecretReader::value`].
 fn resolve_secret_value(
-    env_spec: &DeploymentEnvironmentSpec,
+    reader: &mut SecretReader,
     secret_spec: &crate::spec::DeploymentSecretSpec,
-    documents: &mut HashMap<JsonDocument, serde_json::Value>,
 ) -> Result<SecretResolvedValue> {
     Ok(match &secret_spec.source {
         DeploymentSecretSource::EnvVariable(var_name) => {
@@ -321,7 +388,7 @@ fn resolve_secret_value(
                 // `secrets_aws` ends the chain: its lookup belongs on the deploy
                 // target, so nothing after it could be tried here anyway.
                 None => match &lookup.fallback {
-                    Some(reference) => resolve_aws_secret(env_spec, reference)?,
+                    Some(reference) => reader.aws(reference)?,
                     None => {
                         let mut tried = lookup.tried.clone();
                         tried.push(format!("${} (not set)", lookup.variable));
@@ -347,14 +414,11 @@ fn resolve_secret_value(
             SecretResolvedValue::Literal(value.to_string())
         }
         DeploymentSecretSource::Embedded(value) => SecretResolvedValue::Literal(value.clone()),
-        DeploymentSecretSource::Aws(reference) => resolve_aws_secret(env_spec, reference)?,
+        DeploymentSecretSource::Aws(reference) => reader.aws(reference)?,
         DeploymentSecretSource::JsonField(json) => {
             let name = &secret_spec.secret_name;
-            if !documents.contains_key(&json.document) {
-                let parsed = read_json_document(name, &json.document)?;
-                documents.insert(json.document.clone(), parsed);
-            }
-            let value = select_json_field(&documents[&json.document], &json.field).ok_or_else(|| {
+            let document = reader.document(name, &json.document)?;
+            let value = select_json_field(document, &json.field).ok_or_else(|| {
                 anyhow!(
                     "Secret '{}' has no value: {} has no {}",
                     name,
@@ -371,10 +435,14 @@ fn resolve_secret_value(
     })
 }
 
-/// The JSON document of a `json_file` or `json_env` secret. The error never
-/// quotes the content: it is the secret.
+/// The JSON document of a `json_file` or `json_env` secret, or the stand-in for
+/// AWS Secrets Manager. The error never quotes the content: it is the secret.
 fn read_json_document(name: &str, document: &JsonDocument) -> Result<serde_json::Value> {
     let content = match document {
+        JsonDocument::AwsSecrets(path) => {
+            secret_fetch::warn_if_readable_by_others(path);
+            fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?
+        }
         JsonDocument::File { path, display } => {
             if !Path::new(path).exists() {
                 return Err(anyhow!(
@@ -398,12 +466,17 @@ fn read_json_document(name: &str, document: &JsonDocument) -> Result<serde_json:
         },
     };
     serde_json::from_str(&content).map_err(|error| {
+        let fix = match document {
+            JsonDocument::AwsSecrets(_) => "; fix it, or remove it to read every aws secret with the AWS CLI",
+            _ => "",
+        };
         anyhow!(
-            "Secret '{}': {} is not valid JSON (line {}, column {})",
+            "Secret '{}': {} is not valid JSON (line {}, column {}){}",
             name,
             document.describe(),
             error.line(),
-            error.column()
+            error.column(),
+            fix
         )
     })
 }
@@ -846,14 +919,14 @@ fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppS
 /// The gateway as every generator sees it: one rule per served domain, the
 /// redirects, the TLS settings and the full list of domains a certificate has to
 /// cover.
-fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec) -> Result<IngressResolvedSpec> {
+fn resolve_ingress(env_spec: &DeploymentEnvironmentSpec, reader: &mut SecretReader) -> Result<IngressResolvedSpec> {
     let rules = build_ingress_rules(env_spec);
     check_route_conflicts(&rules)?;
     let controller = env_spec
         .ingress
         .controller
         .as_ref()
-        .map(|d| resolve_controller(env_spec, d, &rules))
+        .map(|d| resolve_controller(env_spec, reader, d, &rules))
         .transpose()?;
 
     let tls = env_spec.ingress.tls.as_ref().map(|tls_spec| IngressTlsResolvedSpec {
@@ -908,6 +981,7 @@ pub const MIN_TOKEN_LENGTH: usize = 32;
 /// read here like a deployment's secrets, or deferred to the deploy target.
 fn resolve_controller(
     env_spec: &DeploymentEnvironmentSpec,
+    reader: &mut SecretReader,
     controller: &crate::spec::ControllerSpec,
     rules: &[IngressRule],
 ) -> Result<crate::resolved_spec::ControllerResolvedSpec> {
@@ -938,10 +1012,9 @@ fn resolve_controller(
             domains.push(domain.clone());
         }
     }
-    let mut documents = HashMap::new();
     let mut token = |spec: &Option<crate::spec::DeploymentSecretSpec>| -> Result<Option<SecretResolvedSpec>> {
         let Some(spec) = spec else { return Ok(None) };
-        let value = resolve_secret_value(env_spec, spec, &mut documents)?;
+        let value = reader.value(spec)?;
         if let SecretResolvedValue::Literal(literal) = &value {
             if literal.chars().count() < MIN_TOKEN_LENGTH {
                 return Err(anyhow!(
@@ -2106,6 +2179,118 @@ deployments:
             assert_eq!(db_url.value, "postgres://u:s3cr3t@db");
             assert_eq!(spec.current_deployment.secrets[0].name, "shop-db_password");
             assert_eq!(spec.current_deployment.secrets[0].literal(), Some("s3cr3t"));
+        }
+
+        const LOCAL_AWS: &str = r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    services:
+      api:
+        host: web
+        prefix: /
+        ports:
+          - "8080:80"
+    secrets:
+      db_password:
+        aws: dev/shop
+        jq: .db.password
+      api_key:
+        aws: dev/shop
+        jq: .api_key
+"#;
+
+        const AWS_FILE: &str = r#"{"dev/shop": {"db": {"password": "pw"}, "api_key": "key"}}"#;
+        const AWS_APP_SECRETS: &str = "secrets:
+  - db_password
+  - api_key
+";
+
+        fn with_file(env_yaml: &str, file: &str) -> (tempfile::TempDir, DeploymentEnvironmentSpec) {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join(secret_fetch::LOCAL_FILE), file).unwrap();
+            let env = env_spec(env_yaml, root.path());
+            (root, env)
+        }
+
+        #[test]
+        fn a_local_deployment_reads_aws_secrets_from_the_local_file() {
+            let (_root, env) = with_file(LOCAL_AWS, AWS_FILE);
+            let app = app_spec(&format!("{APP}{AWS_APP_SECRETS}"));
+            let spec = resolve(&env, &app, "prod").unwrap();
+            let literal = |name: &str| {
+                spec.current_deployment
+                    .secrets
+                    .iter()
+                    .find(|s| s.name == format!("shop-{name}"))
+                    .and_then(|s| s.literal())
+                    .map(String::from)
+            };
+            assert_eq!(literal("db_password").as_deref(), Some("pw"));
+            assert_eq!(literal("api_key").as_deref(), Some("key"));
+        }
+
+        #[test]
+        fn a_broken_local_file_is_an_error_that_says_how_to_get_past_it() {
+            let (_root, env) = with_file(LOCAL_AWS, r#"{"dev/shop": {"#);
+            let app = app_spec(&format!("{APP}{AWS_APP_SECRETS}"));
+            let err = format!("{:#}", resolve(&env, &app, "prod").unwrap_err());
+            assert!(err.contains("is not valid JSON"), "{err}");
+            assert!(
+                err.contains("fix it, or remove it to read every aws secret with the AWS CLI"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_remote_deployment_ignores_the_local_file() {
+            let app = format!(
+                "{APP}secrets:
+  - db_password
+"
+            );
+            let services = "      api:
+        host: web
+        prefix: /
+    secrets:
+      db_password:
+        aws: dev/shop
+        jq: .db.password";
+            let (_root, env) = with_file(&env("k8s", REGISTRY, services, ""), AWS_FILE);
+            let spec = resolve(&env, &app_spec(&app), "prod").unwrap();
+            assert_eq!(
+                spec.current_deployment.secrets[0].deferred().unwrap().secret_id,
+                "dev/shop"
+            );
+        }
+
+        #[test]
+        fn aws_secrets_file_answers_a_remote_deployments_aws_secrets() {
+            let app = format!(
+                "{APP}secrets:
+  - db_password
+"
+            );
+            let services = "      api:
+        host: web
+        prefix: /
+    secrets:
+      db_password:
+        aws: dev/shop
+        jq: .db.password";
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("real.json");
+            std::fs::write(&file, AWS_FILE).unwrap();
+            let env = env_spec(&env("k8s", REGISTRY, services, ""), root.path());
+            let resolution = resolve_with(&env, &app_spec(&app), "prod", Some(&file)).unwrap();
+            assert_eq!(resolution.spec.current_deployment.secrets[0].literal(), Some("pw"));
+            assert_eq!(resolution.from_aws_secrets_file, vec!["dev/shop".to_string()]);
         }
     }
 }

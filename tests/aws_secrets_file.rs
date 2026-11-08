@@ -272,7 +272,13 @@ fn prepare_deployment_with_aws_secrets_file_writes_its_values_into_the_output() 
         ],
     );
     assert!(ok, "{}", stderr);
-    assert!(stderr.contains("are written into the prepared output"), "{}", stderr);
+    assert!(
+        stderr.contains(
+            "the AWS secrets dev/simpled-controller were read from real.json and written into the prepared output"
+        ),
+        "{}",
+        stderr
+    );
     assert!(output_holds(dir.path(), "from-the-file-"));
     assert!(!dir.path().join("docker-deploy").join("fetch-secrets.sh").exists());
 }
@@ -320,4 +326,78 @@ fn prepare_deployment_with_a_missing_aws_secrets_file_fails() {
         "{}",
         stderr
     );
+}
+
+#[test]
+fn a_whitespace_only_simpled_token_counts_as_unset() {
+    let dir = project(AWS_TOKEN);
+    let empty = tempfile::tempdir().unwrap();
+    let path = empty.path().to_str().unwrap().to_string();
+    let output = simpled(dir.path(), &["status"], &[("SIMPLED_TOKEN", "   "), ("PATH", &path)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("has no aws-secrets.local.json"), "{}", stderr);
+}
+
+#[test]
+fn a_jq_dot_secret_is_shown_as_a_document() {
+    let dir = project(&AWS_TOKEN.replace(".controller_read_token", "."));
+    let (_, stderr) = status(dir.path());
+    assert!(
+        stderr.contains(r#"add it there: {"dev/simpled-controller":{"...":"..."}}"#),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn a_jq_filter_beyond_a_path_gets_no_example() {
+    let dir = project(&AWS_TOKEN.replace(".controller_read_token", "'.a | ascii_downcase'"));
+    let (_, stderr) = status(dir.path());
+    assert!(
+        stderr.contains(
+            "it cannot hold this secret: its jq filter '.a | ascii_downcase' is more than a plain path like .a.b"
+        ),
+        "{}",
+        stderr
+    );
+    assert!(!stderr.contains("add it there"), "{}", stderr);
+}
+
+#[test]
+fn a_broken_file_is_an_error_not_a_fall_back_to_aws() {
+    let dir = project(AWS_TOKEN);
+    std::fs::write(dir.path().join(LOCAL_FILE), r#"{"dev/simpled-controller": {"#).unwrap();
+    let (ok, stderr) = status(dir.path());
+    assert!(!ok);
+    assert!(
+        stderr.contains("is not valid JSON") && stderr.contains("fix it, or remove it"),
+        "{}",
+        stderr
+    );
+    assert!(!stderr.contains("could not read it"), "{}", stderr);
+}
+
+#[test]
+fn aws_secrets_file_says_nothing_when_there_is_no_aws_secret() {
+    let dir = project(&format!(
+        "swarm_mode: true
+controller:
+  host: web
+  read_token: \"{}\"",
+        TOKEN
+    ));
+    std::fs::write(dir.path().join("real.json"), "{}").unwrap();
+    let (ok, stderr) = run_without_aws(
+        dir.path(),
+        &[
+            "prepare-deployment",
+            "prod",
+            "--bundle",
+            "bundle",
+            "--aws-secrets-file",
+            "real.json",
+        ],
+    );
+    assert!(ok, "{}", stderr);
+    assert!(!stderr.contains("written into the prepared output"), "{}", stderr);
 }

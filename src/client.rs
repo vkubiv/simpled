@@ -104,8 +104,10 @@ pub fn health_url(env: &DeploymentEnvironmentSpec, deployment: &str) -> Result<S
 
 /// `SIMPLED_TOKEN`, which wins: for CI, and for a one-off token.
 fn token_from_env() -> Option<Token> {
+    // Typed or pasted by hand, unlike a deployed value, so all surrounding
+    // whitespace goes, and a variable of only whitespace counts as unset.
     let value = std::env::var(TOKEN_VAR).ok()?;
-    let value = crate::spec::trim_secret_value(&value);
+    let value = value.trim();
     (!value.is_empty()).then(|| Token {
         value: value.to_string(),
         source: TOKEN_VAR.to_string(),
@@ -131,25 +133,29 @@ fn token_from_spec(env: &DeploymentEnvironmentSpec) -> Result<Token> {
         })?;
     let name = &secret.secret_name;
     let unreadable = || format!("{} is not set, and controller.{} cannot be read here", TOKEN_VAR, name);
-    Ok(
-        match crate::resolver::resolve_one_secret(env, secret).with_context(unreadable)? {
-            SecretResolvedValue::Literal(value) => Token {
-                value,
-                source: format!("controller.{} of the env spec", name),
-            },
-            SecretResolvedValue::Deferred(reference) => {
-                let (value, origin) =
-                    crate::secret_fetch::fetch_locally_with_origin(&reference, &env.root).with_context(unreadable)?;
-                Token {
+    let mut reader = crate::resolver::SecretReader::new(env, None);
+    // An `aws` token is read here whatever the env spec's type, so that the error
+    // for a refused one can say whether the file or the AWS CLI answered.
+    let reference = match &secret.source {
+        crate::spec::DeploymentSecretSource::Aws(reference) => reference.clone(),
+        _ => match reader.value(secret).with_context(unreadable)? {
+            SecretResolvedValue::Literal(value) => {
+                return Ok(Token {
                     value,
-                    source: format!(
-                        "controller.{} (AWS secret {}, read from {})",
-                        name, reference.secret_id, origin
-                    ),
-                }
+                    source: format!("controller.{} of the env spec", name),
+                })
             }
+            SecretResolvedValue::Deferred(reference) => reference,
         },
-    )
+    };
+    let (value, origin) = reader.aws_here(&reference).with_context(unreadable)?;
+    Ok(Token {
+        value,
+        source: format!(
+            "controller.{} (AWS secret {}, read from {})",
+            name, reference.secret_id, origin
+        ),
+    })
 }
 
 fn client(timeout: Option<Duration>) -> Result<reqwest::blocking::Client> {

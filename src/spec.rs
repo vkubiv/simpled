@@ -431,10 +431,6 @@ pub struct DeploymentEnvironmentSpec {
     /// The directory the env spec was read from, where simpled looks for
     /// [`crate::secret_fetch::LOCAL_FILE`] when it reads an `aws` secret itself.
     pub root: std::path::PathBuf,
-    /// `prepare-deployment --aws-secrets-file`: `aws` secrets are read from this
-    /// file while preparing and written into the output, instead of being fetched
-    /// on the deploy target.
-    pub aws_secrets_file: Option<std::path::PathBuf>,
 }
 
 impl DeploymentEnvironmentSpec {
@@ -592,6 +588,9 @@ pub enum JsonDocument {
     File { path: String, display: String },
     /// An environment variable holding the whole document.
     Env(String),
+    /// The stand-in for AWS Secrets Manager: `aws-secrets.local.json`, or the
+    /// file `--aws-secrets-file` names. Secret id to value.
+    AwsSecrets(std::path::PathBuf),
 }
 
 impl JsonDocument {
@@ -599,6 +598,7 @@ impl JsonDocument {
         match self {
             JsonDocument::File { display, .. } => display.clone(),
             JsonDocument::Env(variable) => format!("${}", variable),
+            JsonDocument::AwsSecrets(path) => path.display().to_string(),
         }
     }
 }

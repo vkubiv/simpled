@@ -544,7 +544,8 @@ Where simpled reads an `aws` secret **on this machine** (a `local` env spec, and
 
 - The `jq` path applies to the value as it would to the SecretString. Only a plain field path (`.a`, `.a.b`, `."a b"`) is understood, as for [`secrets_json`](#secrets_json).
 - A value may also be the SecretString as Secrets Manager returns it: a string, or a JSON document in a string. Without `jq` it must be a string.
-- A secret the file does not list is read with the AWS CLI, as without the file. A listed secret whose `jq` path selects nothing is an error, not a fall-back.
+- A secret the file does not list is read with the AWS CLI, as without the file. A listed secret whose `jq` path selects nothing is an error, not a fall-back, and so is a file that is not valid JSON: fix it, or remove it to read everything with the AWS CLI. A filter that is more than a plain path cannot be stood in for; such a secret needs the AWS CLI.
+- The file is read once per command, however many secrets it answers.
 - Only the env spec's own directory is looked in. The `.local.` name is the usual never-commit convention: add `*.local.json` (or the file) to `.gitignore` and keep it `chmod 600`; simpled warns when others may read it. No error quotes its content.
 
 `prepare-deployment` for a remote target does **not** read it: its `aws` secrets stay with `fetch-secrets.sh` on the deploy target. When the file is there and the deployment has `aws` secrets, `prepare-deployment` says so on stderr, and goes on. To prepare with those values anyway, for example to check a deployment with real secrets, pass the file explicitly: `--aws-secrets-file aws-secrets.local.json` (any path; the same shape). Every `aws` secret is then read from it while preparing and **written into the output** like an `env` secret, so no `fetch-secrets.sh` is needed for them; a secret it does not list is an error. Keep that output on your machine.
