@@ -289,6 +289,7 @@ Use `envspec.yaml` for Kubernetes and Docker environments. Use `localenv.yaml` f
 | `registry` | map | no | Image registry prefix mappings. In `localenv.yaml`, used only when running a [released bundle](#running-a-released-bundle-locally). |
 | `gateway` | object | yes | Gateway (load balancer) configuration. The deprecated alias `ingress` is still accepted with a warning. |
 | `deployments` | map | yes | Named deployment configurations. |
+| `networks` | map | no | Docker only: networks deployments share. A deployment reaches no other deployment unless both join one. See [networks](#networks). |
 
 ---
 
@@ -1036,6 +1037,7 @@ deployments:
 | `defaults` | object | no | Default `replicas`, `resources`, and on Swarm `update` and `placement`, applied to every service that does not set its own. |
 | `services` | map | no | Per-service overrides (routing, replicas, resources, variants). |
 | `exclude_services` | list | no | Services this deployment does not start. Only valid for `local`. See [exclude_services](#exclude_services). |
+| `networks` | list \| map | no | Docker only: the env spec's [networks](#networks) this deployment joins, with every service (list) or the named ones (map). Under `extends` a child's value replaces the base's. |
 | `volumes` | map | no | Swarm only: where each named volume lives (`node`, `path`, `nfs`). Required on Swarm for every mounted volume unless `multi_node: false`. Under `extends`, a child rebinds single volumes. See [Volumes on Docker Swarm](#volumes-on-docker-swarm). |
 
 ¹ Required unless supplied by an `extends` base, or omitted on an `abstract` template.
@@ -1438,6 +1440,38 @@ deployments:
 An excluded service keeps everything except its container: its gateway routes still point at its host port, and a `working_dir` still receives its `.env` and secrets, since exclusion is how a service is handed to the developer to run by hand. Every name must be a service of the application; an unknown one is rejected, as is a name listed twice. `--exclude` on the command line adds to the list.
 
 Under [extends](#extends) the child's list replaces the base's. `exclude_services` is not valid for `k8s` or `docker` environments.
+
+#### networks
+
+Docker only, Swarm and standalone. Every deployment runs on a network of its own, `simpled-<deployment>`, and reaches no other deployment. A service there answers to its bare name (`db:5432`) and to `<deployment>_<service>`; the gateway joins every deployment's network and routes to the second.
+
+To let deployments reach each other, declare a network at the top level and list it under each deployment that joins it:
+
+```yaml
+networks:
+  app1-db:
+  app2-db:
+
+deployments:
+  prod_db:
+    networks:
+      app1-db: [postgres]          # only these services join
+      app2-db: [postgres, redis]
+  prod_app1:
+    networks: [app1-db]            # every service joins, jobs included
+  prod_app2:
+    networks: [app2-db]
+```
+
+`prod_app1` and `prod_app2` reach `prod_db`, but not each other: everything on a network reaches everything else on it, so a hub serving several deployments that must stay apart needs a network per pair. A network named in a map with an empty value takes every service, like the list form.
+
+Address another deployment's service by `<deployment>_<service>` (`prod_db_postgres:5432`), the name it has on a shared network. A bare name always resolves inside the asking deployment first, but on Swarm `docker stack deploy` also puts the bare name on every network a service joins, so a bare name the deployment does not have itself can resolve to a service across a shared network. Standalone Docker gives the bare name on the own network only.
+
+Joining a network is part of the deployment, so a deployment added to a network is connected on its own next deploy, and so is every deployment already on it: adding `prod_app3` means redeploying `prod_db` too.
+
+A declared network is `simpled_<name>` in Docker, created by the first deploy that needs it, as is every deployment's own network. Errors: a network no deployment or only one deployment joins, a deployment joining an undeclared network, a listed service the application does not have, a name other than letters, digits, `_`, `.` and `-`, and the reserved `control`. `networks` is not valid for `k8s` or `local` environments.
+
+From simpled 2.4 on, a deployment leaves the shared `common_network` of earlier versions on its next deploy. The gateway stays on `common_network`, so a deployment not yet redeployed by 2.4 is still routed, but two deployments that called each other over it must now share a declared network. On standalone Docker, containers are named `<deployment>_<service>` instead of `<service>`; the old container is removed by the first deploy.
 
 ---
 
@@ -1968,6 +2002,9 @@ keeps them from getting in each other's way:
   `rsync -a docker-deploy/ host:~/deploy/shop/`. Nothing generated is then shared
   between two deployments: each has its own `deploy.sh`, binary, plans and
   `gateway/` copy.
+- **Networks are per deployment.** Each deployment's services are on its own
+  network and reach another deployment only over a [network](#networks) both
+  join. The gateway is on every deployment's network.
 - **Objects have owners.** A deployment's configs and secrets are labelled
   `simpled.deployment=<name>` and the gateway's `simpled.scope=environment`, and
   pruning only touches the owner being deployed.

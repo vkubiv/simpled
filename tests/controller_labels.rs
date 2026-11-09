@@ -60,7 +60,7 @@ fn standalone_containers_carry_the_labels() {
             .to_string()
     };
 
-    let api = run_line("api");
+    let api = run_line("prod_api");
     assert!(api.contains(" --label 'simpled.deployment=prod'"), "{}", api);
     assert!(api.contains(" --label 'simpled.service=api'"), "{}", api);
     assert!(api.contains(" --label 'simpled.version=1.2.3'"), "{}", api);
@@ -69,7 +69,7 @@ fn standalone_containers_carry_the_labels() {
         "{}",
         api
     );
-    assert!(!run_line("migrate").contains("--label"));
+    assert!(!run_line("prod_migrate").contains("--label"));
 
     let set = script.find("export SIMPLED_DEPLOYED_AT=").expect(&script);
     assert!(set < script.find("docker run").unwrap(), "{}", script);
@@ -87,5 +87,9 @@ fn standalone_removes_the_containers_of_retired_services() {
     assert!(cleanup.contains("    'api'|'primary-db') ;;"), "{}", cleanup);
     assert!(cleanup.contains("docker rm -f \"$id\""), "{}", cleanup);
     // After the services are started, so a failed start leaves the old ones.
-    assert!(script.rfind("docker run -d --name api ").unwrap() < start, "{}", script);
+    assert!(
+        script.rfind("docker run -d --name prod_api ").unwrap() < start,
+        "{}",
+        script
+    );
 }

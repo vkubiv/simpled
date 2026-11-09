@@ -153,6 +153,9 @@ pub struct DeploymentEnvironmentSpecYaml {
     pub ingress: Option<IngressSpecYaml>,
     pub registry: Option<HashMap<String, String>>,
     pub deployments: HashMap<String, DeploymentSpecYaml>,
+    // Docker only: networks deployments share, which they join under their own
+    // `networks:`. A deployment's services reach no other deployment otherwise.
+    pub networks: Option<std::collections::BTreeMap<String, Option<NetworkSpecYaml>>>,
     // local-only: host ports by name, referenced as `$port(name)`. An instance
     // shifts all of them by `instance * port_step`.
     pub ports: Option<std::collections::BTreeMap<String, u16>>,
@@ -311,6 +314,22 @@ pub struct DeploymentSpecYaml {
     // Swarm only: where each of the app's named volumes lives in this
     // environment. The app spec only names its volumes; this is the adapter.
     pub volumes: Option<HashMap<String, VolumeBindingYaml>>,
+    // Docker only: the env spec's networks this deployment joins, with all its
+    // services (a list), or with the ones named per network (a map).
+    pub networks: Option<DeploymentNetworksYaml>,
+}
+
+// Nothing to set yet; a map so options can be added without changing the shape.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSpecYaml {}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum DeploymentNetworksYaml {
+    All(Vec<String>),
+    // A null value is every service, like the list form.
+    Members(std::collections::BTreeMap<String, Option<Vec<String>>>),
 }
 
 // Exactly one of `node`, `path` (with or without `node`) or `nfs`.

@@ -11,7 +11,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-const DOCKER_NETWORK: &str = "common_network";
 /// The standalone gateway's container.
 pub const GATEWAY_CONTAINER: &str = "simpled-gateway";
 /// Where simpled 2.0.x's Swarm gateway kept Traefik's ACME store, relative to
@@ -40,6 +39,60 @@ const DEPS_COMPOSE_FILE: &str = "docker-compose.deps.yaml";
 const JOB_TIMEOUT_SECONDS: u32 = 600;
 /// Seconds to wait for a dependency to report healthy in a standalone deploy.
 const HEALTH_TIMEOUT_SECONDS: u32 = 300;
+
+/// The env spec's networks some service of the deployment joins, sorted.
+fn joined_networks(deployment: &crate::resolved_spec::DeploymentResolvedSpec) -> Vec<String> {
+    let mut joined: Vec<String> = deployment.services.iter().flat_map(|s| s.networks.clone()).collect();
+    joined.sort();
+    joined.dedup();
+    joined
+}
+
+/// The own network of every deployment of the env spec, which the gateway joins.
+fn gateway_networks(resolved_spec: &EnvironmentResolvedSpec) -> Vec<String> {
+    let mut names: Vec<String> = resolved_spec
+        .ingress
+        .deployments
+        .iter()
+        .chain(std::iter::once(&resolved_spec.current_deployment.name))
+        .map(|d| crate::networks::own(d))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Creates, when missing, every network this deploy attaches something to: the
+/// gateway's, the deployment's own, the shared ones it joins, and the legacy one
+/// the gateway still routes over.
+fn write_create_networks(deploy_sh: &mut File, resolved_spec: &EnvironmentResolvedSpec, swarm: bool) -> Result<()> {
+    let mut names = gateway_networks(resolved_spec);
+    names.extend(
+        joined_networks(&resolved_spec.current_deployment)
+            .iter()
+            .map(|n| crate::networks::declared(n)),
+    );
+    names.push(crate::networks::LEGACY.to_string());
+    let driver = if swarm { " --driver overlay --attachable" } else { "" };
+    for name in names {
+        writeln!(
+            deploy_sh,
+            "docker network inspect {name} >/dev/null 2>&1 || docker network create{driver} {name} >/dev/null"
+        )?;
+    }
+    Ok(())
+}
+
+/// Removes the container simpled before 2.4 named after the service alone, when
+/// it is this deployment's or carries no deployment label. It would hold the
+/// service's host ports.
+const LEGACY_CONTAINER_FUNCTION: &str = r#"retire_legacy_container() {
+  owner="$(docker inspect -f '{{index .Config.Labels "{label}"}}' "$1" 2>/dev/null)" || return 0
+  case "${owner}" in
+    ""|"<no value>"|"$2") docker rm -f "$1" >/dev/null ;;
+  esac
+}
+"#;
 
 /// `wait_healthy` helper embedded in the generated standalone deploy script.
 /// `docker run -d` returns once the container is created, so a declared
@@ -161,8 +214,14 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
 
     write_fetch_secrets_call(&mut deploy_sh, &fetch_script)?;
 
-    let network_name = DOCKER_NETWORK.to_string();
-    writeln!(deploy_sh, "docker network create {} || true", network_name)?;
+    write_create_networks(&mut deploy_sh, resolved_spec, false)?;
+    let own_network = crate::networks::own(&deployment.name);
+    write!(
+        deploy_sh,
+        "{}",
+        LEGACY_CONTAINER_FUNCTION.replace("{label}", crate::controller::model::labels::DEPLOYMENT)
+    )?;
+    writeln!(deploy_sh)?;
 
     // Jobs (migrations and other one-shot tasks) are ordered explicitly: first the
     // services they depend on, then the jobs themselves — run in the foreground so
@@ -199,13 +258,22 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
             jobs_started = true;
             for dependency in &prerequisites {
                 if dependency.healthcheck.as_ref().is_some_and(|hc| !hc.is_disabled()) {
-                    writeln!(deploy_sh, "wait_healthy {}", dependency.full_name)?;
+                    writeln!(deploy_sh, "wait_healthy {}_{}", deployment.name, dependency.full_name)?;
                 }
             }
         }
 
+        // `<deployment>_<service>`, the name the gateway and other deployments use,
+        // as on Swarm. The bare name is an alias on the own network only.
+        let container = format!("{}_{}", deployment.name, service.full_name);
         writeln!(deploy_sh, "echo 'Starting {}...'", service.full_name)?;
-        writeln!(deploy_sh, "docker rm -f {} || true", service.full_name)?;
+        writeln!(
+            deploy_sh,
+            "retire_legacy_container {} {}",
+            sh_quote(&service.full_name),
+            sh_quote(&deployment.name)
+        )?;
+        writeln!(deploy_sh, "docker rm -f {} || true", container)?;
 
         // Create env file
         let env_file_name = format!("{}.env", service.full_name);
@@ -229,14 +297,17 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
         // A job runs in the foreground: `set -e` then aborts the deploy when the
         // job exits non-zero, before any service that depends on its result
         // (e.g. a migrated schema) is started.
-        let detach = if is_job { "" } else { "-d " };
-        // The Traefik configuration addresses a service as `<deployment>_<service>`,
-        // the name Swarm gives it. A standalone container only answers to its own
-        // name, so it is given that alias too and both ingress types resolve it.
+        // `docker run` joins one network. A service on shared networks is created,
+        // connected to them without an alias, and only then started.
+        let run = match (service.networks.is_empty(), is_job) {
+            (false, _) => "create ",
+            (true, true) => "run ",
+            (true, false) => "run -d ",
+        };
         write!(
             deploy_sh,
-            "docker run {}--name {} --network {} --network-alias {}_{}",
-            detach, service.full_name, network_name, deployment.name, service.full_name
+            "docker {}--name {} --network {} --network-alias {}",
+            run, container, own_network, service.full_name
         )?;
 
         for port in &service.ports {
@@ -342,7 +413,21 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
         for arg in trailing_args {
             write!(deploy_sh, " {}", sh_quote(&arg))?;
         }
-        writeln!(deploy_sh)?;
+        writeln!(deploy_sh, "{}", if run == "create " { " >/dev/null" } else { "" })?;
+        if run == "create " {
+            for network in &service.networks {
+                writeln!(
+                    deploy_sh,
+                    "docker network connect {} {}",
+                    crate::networks::declared(network),
+                    container
+                )?;
+            }
+            // `start -a` exits with the job's status, as `docker run` does.
+            let attach = if is_job { "-a " } else { "" };
+            let quiet = if is_job { "" } else { " >/dev/null" };
+            writeln!(deploy_sh, "docker start {}{}{}", attach, container, quiet)?;
+        }
     }
 
     // Containers of services the spec no longer has: `docker rm -f` above only
@@ -352,13 +437,7 @@ fn generate_standalone(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Pat
 
     // Ingress Container
     if !resolved_spec.ingress.rules.is_empty() {
-        generate_traefik_standalone(
-            resolved_spec,
-            output_dir,
-            &mut deploy_sh,
-            network_name,
-            &controller_tokens,
-        )?;
+        generate_traefik_standalone(resolved_spec, output_dir, &mut deploy_sh, &controller_tokens)?;
     }
 
     Ok(())
@@ -414,7 +493,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         fs::create_dir_all(volume_sub_dir)?;
     }
 
-    let network_name = DOCKER_NETWORK.to_string();
+    let own_network = crate::networks::own(&deployment.name);
 
     // Every service (jobs included) is prepared, because that is what writes the
     // per-service `.env`, config and secret files a job needs at run time. Jobs
@@ -458,6 +537,11 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
                 aliases: vec![service.full_name.clone()],
             },
         );
+        // Keyed by the Docker name, which cannot be `default`. `docker stack
+        // deploy` adds the bare name here too; the own network still wins.
+        for network in &service.networks {
+            networks.insert(crate::networks::declared(network), ServiceNetwork { aliases: vec![] });
+        }
 
         docker_service.networks = networks;
         if single_node(resolved_spec) {
@@ -505,9 +589,13 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
             "default".to_string(),
             DockerComposeNetwork {
                 external: true,
-                name: network_name.clone(),
+                name: own_network.clone(),
             },
         );
+        for network in joined_networks(deployment) {
+            let name = crate::networks::declared(&network);
+            networks.insert(name.clone(), DockerComposeNetwork { external: true, name });
+        }
         networks
     };
 
@@ -557,8 +645,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     let ingress_dir = output_dir.join("gateway");
     fs::create_dir_all(&ingress_dir)?;
 
-    let gateway_objects =
-        generate_traefik_swarm(resolved_spec, &ingress_dir, network_name.clone(), &controller_tokens)?;
+    let gateway_objects = generate_traefik_swarm(resolved_spec, &ingress_dir, &controller_tokens)?;
 
     // 5. Plans, which the deploy steps read.
     let plan_jobs = jobs
@@ -574,7 +661,9 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
                     &deployment.name,
                     &job.full_name,
                     docker_service,
-                    &network_name,
+                    &std::iter::once(own_network.clone())
+                        .chain(job.networks.iter().map(|n| crate::networks::declared(n)))
+                        .collect::<Vec<_>>(),
                     &deployment.volume_bindings,
                 )?,
                 timeout_seconds: JOB_TIMEOUT_SECONDS,
@@ -652,11 +741,7 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
         writeln!(deploy_sh, "eval \"${{node_pin}}\"")?;
         writeln!(deploy_sh)?;
     }
-    writeln!(
-        deploy_sh,
-        "docker network create --driver overlay --attachable {} || true",
-        network_name
-    )?;
+    write_create_networks(&mut deploy_sh, resolved_spec, true)?;
 
     // Disk is reclaimed *before* the rollout, not after it. At this point the
     // release currently serving traffic is running, so `prune -a` cannot remove
@@ -893,10 +978,14 @@ fn job_args(
     deployment_name: &str,
     job_name: &str,
     service: &DockerService,
-    network_name: &str,
+    networks: &[String],
     volume_bindings: &std::collections::BTreeMap<String, VolumeBinding>,
 ) -> Result<Vec<String>> {
-    let mut args: Vec<String> = vec!["--network".into(), escape(network_name)];
+    let mut args: Vec<String> = Vec::new();
+    for network in networks {
+        args.push("--network".into());
+        args.push(escape(network));
+    }
 
     for env_file in &service.env_file {
         args.push("--env-file".into());
@@ -1028,7 +1117,6 @@ fn generate_traefik_standalone(
     resolved_spec: &EnvironmentResolvedSpec,
     output_dir: &Path,
     deploy_sh: &mut File,
-    network_name: String,
     controller_tokens: &[&str],
 ) -> Result<()> {
     let traefik_dir = output_dir.join("traefik");
@@ -1059,7 +1147,8 @@ fn generate_traefik_standalone(
     write!(
         deploy_sh,
         "docker run -d --name {} --network {}",
-        GATEWAY_CONTAINER, network_name
+        GATEWAY_CONTAINER,
+        crate::networks::LEGACY
     )?;
     write!(deploy_sh, " -p 80:80")?;
     if has_tls {
@@ -1080,13 +1169,15 @@ fn generate_traefik_standalone(
 
     write!(deploy_sh, " -e DEPLOY_DATE=$(date +%s)")?;
     writeln!(deploy_sh, " {}", TRAEFIK_IMAGE)?;
-    // `docker run` takes one network; the controller's is joined after the start.
-    writeln!(
-        deploy_sh,
-        "docker network connect {} {}",
-        crate::controller::CONTROL_NETWORK,
-        GATEWAY_CONTAINER
-    )?;
+    // `docker run` takes one network; every deployment's own network and the
+    // controller's are joined after the start.
+    for network in gateway_networks(resolved_spec)
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(crate::controller::CONTROL_NETWORK))
+    {
+        writeln!(deploy_sh, "docker network connect {} {}", network, GATEWAY_CONTAINER)?;
+    }
 
     Ok(())
 }
@@ -1151,7 +1242,6 @@ fn write_deployed_at(deploy_sh: &mut File) -> Result<()> {
 fn generate_traefik_swarm(
     resolved_spec: &EnvironmentResolvedSpec,
     ingress_dir: &Path,
-    network_name: String,
     controller_tokens: &[&str],
 ) -> Result<SwarmObjects> {
     let traefik_dir = ingress_dir.join("traefik");
@@ -1223,8 +1313,14 @@ fn generate_traefik_swarm(
             writeln!(stack, "        mode: 0400")?;
         }
     }
+    // Every deployment's own network, and the legacy one as `default`, over which
+    // a deployment not yet redeployed by 2.4 is still reached.
+    let own_networks = gateway_networks(resolved_spec);
     writeln!(stack, "    networks:")?;
     writeln!(stack, "      default:")?;
+    for network in &own_networks {
+        writeln!(stack, "      {}:", network)?;
+    }
     writeln!(stack, "      {}:", crate::controller::CONTROL_NETWORK)?;
 
     write_swarm_controller(&mut stack, resolved_spec, ingress_dir, &mut objects, controller_tokens)?;
@@ -1232,7 +1328,12 @@ fn generate_traefik_swarm(
     writeln!(stack, "networks:")?;
     writeln!(stack, "  default:")?;
     writeln!(stack, "    external: true")?;
-    writeln!(stack, "    name: {}", network_name)?;
+    writeln!(stack, "    name: {}", crate::networks::LEGACY)?;
+    for network in &own_networks {
+        writeln!(stack, "  {}:", network)?;
+        writeln!(stack, "    external: true")?;
+        writeln!(stack, "    name: {}", network)?;
+    }
     // Created by the stack. Not attachable, so only these two services join it.
     writeln!(stack, "  {}:", crate::controller::CONTROL_NETWORK)?;
     writeln!(stack, "    name: {}", crate::controller::CONTROL_NETWORK)?;
@@ -1806,6 +1907,7 @@ mod tests {
             },
             working_dir: None,
             excluded: false,
+            networks: vec![],
         }
     }
 
@@ -2173,7 +2275,7 @@ mkdir -p \"/var/"
             job.args
         );
         assert!(
-            job.args.windows(2).any(|w| w == ["--network", DOCKER_NETWORK]),
+            job.args.windows(2).any(|w| w == ["--network", "simpled-prod"]),
             "{:?}",
             job.args
         );
@@ -2251,11 +2353,11 @@ mkdir -p \"/var/"
         generate(&spec, &docker_spec, dir.path()).unwrap();
         let script = fs::read_to_string(dir.path().join("deploy.sh")).unwrap();
 
-        let db = script.find("docker run -d --name primary-db").unwrap();
-        let wait = script.find("wait_healthy primary-db").unwrap();
+        let db = script.find("docker run -d --name prod_primary-db").unwrap();
+        let wait = script.find("wait_healthy prod_primary-db").unwrap();
         // A job blocks the script, so it is started without -d.
-        let job = script.find("docker run --name migrate").unwrap();
-        let api = script.find("docker run -d --name api").unwrap();
+        let job = script.find("docker run --name prod_migrate").unwrap();
+        let api = script.find("docker run -d --name prod_api").unwrap();
         assert!(db < wait && wait < job && job < api);
     }
 
@@ -2501,9 +2603,9 @@ mkdir -p \"/var/"
         );
     }
 
-    /// Traefik targets `<deployment>_<service>`, the DNS name a Swarm service gets.
-    /// A standalone container is only reachable by its own name unless it is
-    /// given that alias, so without it every route returned a bad gateway.
+    /// Traefik targets `<deployment>_<service>`, the DNS name a Swarm service gets,
+    /// and a standalone container is named so. The bare name is an alias on the
+    /// deployment's own network only.
     #[test]
     fn standalone_containers_carry_the_name_traefik_targets() {
         let mut spec = spec(vec![service("api", ServiceType::Public, &[])]);
@@ -2522,7 +2624,7 @@ mkdir -p \"/var/"
 
         assert!(traefik.contains("url: \"http://prod_api:80/\""), "{}", traefik);
         assert!(
-            script.contains("docker run -d --name api --network common_network --network-alias prod_api"),
+            script.contains("docker run -d --name prod_api --network simpled-prod --network-alias api"),
             "{}",
             script
         );

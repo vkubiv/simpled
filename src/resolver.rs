@@ -71,6 +71,7 @@ pub fn resolve_with(
         .collect::<Result<Vec<_>>>()?;
 
     check_public_services_are_routed(deployment, app_spec)?;
+    check_network_members(deployment, app_spec)?;
     apply_volume_bindings(env_spec, app_spec, deployment, &mut resolved_services)?;
 
     let version_document = crate::version_endpoint::document(
@@ -768,6 +769,12 @@ impl ServiceResolver<'_> {
                 .unwrap_or_else(|| app_service.ports.clone()),
             working_dir: deployment_service.and_then(|s| s.working_dir.clone()),
             excluded: deployment.exclude_services.contains(&app_service.name),
+            networks: deployment
+                .networks
+                .iter()
+                .filter(|(_, members)| members.includes(&app_service.name))
+                .map(|(network, _)| network.clone())
+                .collect(),
         })
     }
 
@@ -997,6 +1004,27 @@ fn warn_database_on_shared_storage(deployment: &DeploymentSpec, service: &Servic
             );
         }
     }
+}
+
+fn check_network_members(deployment: &DeploymentSpec, app_spec: &AppSpec) -> Result<()> {
+    for (network, members) in &deployment.networks {
+        let NetworkMembers::Services(services) = members else {
+            continue;
+        };
+        if let Some(unknown) = services
+            .iter()
+            .find(|s| !app_spec.all_services().any(|a| &a.name == *s))
+        {
+            return Err(anyhow!(
+                "Network '{}' in deployment '{}' lists service '{}', which application '{}' does not have",
+                network,
+                deployment.name,
+                unknown,
+                deployment.application.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_public_services_are_routed(deployment: &DeploymentSpec, app_spec: &AppSpec) -> Result<()> {

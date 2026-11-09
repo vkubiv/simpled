@@ -216,6 +216,10 @@ pub struct ServiceResolvedSpec {
     // local-only: listed in the deployment's `exclude_services`, so no container
     // is started for it. Its routes and working_dir files are still produced.
     pub excluded: bool,
+
+    // Docker only: the env spec's networks this service joins, by their names in
+    // the env spec, sorted. Its own deployment's network is not one of them.
+    pub networks: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

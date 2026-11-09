@@ -92,6 +92,7 @@ pub fn service(deployment: &str, document: &str, env_type: &DeploymentEnvType) -
         },
         working_dir: None,
         excluded: false,
+        networks: vec![],
     }
 }
 

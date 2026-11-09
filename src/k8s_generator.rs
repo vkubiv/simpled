@@ -927,6 +927,7 @@ mod tests {
             },
             working_dir: None,
             excluded: false,
+            networks: vec![],
         }
     }
 

@@ -557,6 +557,23 @@ pub struct DeploymentSpec {
     pub exclude_services: Vec<String>,
     /// Swarm only: where each named volume lives, keyed by volume name.
     pub volumes: std::collections::BTreeMap<String, VolumeBinding>,
+    /// Docker only: the env spec's networks this deployment joins.
+    pub networks: std::collections::BTreeMap<String, NetworkMembers>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkMembers {
+    All,
+    Services(Vec<String>),
+}
+
+impl NetworkMembers {
+    pub fn includes(&self, service: &str) -> bool {
+        match self {
+            NetworkMembers::All => true,
+            NetworkMembers::Services(services) => services.iter().any(|s| s == service),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

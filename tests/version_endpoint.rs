@@ -60,7 +60,8 @@ fn the_swarm_gateway_stack_runs_the_controller_and_no_deployment_ships_a_sidecar
             .collect()
     };
     assert_eq!(networks("controller"), vec!["simpled_control"]);
-    assert_eq!(networks("gateway"), vec!["default", "simpled_control"]);
+    assert_eq!(networks("gateway"), vec!["default", "simpled-prod", "simpled_control"]);
+    assert_eq!(ingress["networks"]["default"]["name"].as_str(), Some("common_network"));
     assert_eq!(
         ingress["networks"]["simpled_control"]["driver"].as_str(),
         Some("overlay")

@@ -199,7 +199,7 @@ mod tests {
             jobs: vec![PlanJob {
                 name: "migrate".to_string(),
                 service: "prod_migrate".to_string(),
-                args: vec!["--network".to_string(), "common_network".to_string()],
+                args: vec!["--network".to_string(), "simpled-prod".to_string()],
                 timeout_seconds: 600,
             }],
             tls: vec![PlanTls {

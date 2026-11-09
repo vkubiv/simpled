@@ -16,6 +16,7 @@ mod env_loader;
 mod gateway_tls;
 mod k8s_generator;
 mod local_ingress;
+mod networks;
 mod ports;
 mod resolved_spec;
 mod resolver;

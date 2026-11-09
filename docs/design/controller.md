@@ -261,14 +261,15 @@ version.
 
 ```
             :80/:443 (host mode, every node with global: true)
- client ──► gateway ──── common_network ────► app services
+ client ──► gateway ──── simpled-<deployment>, one per deployment ────► app services
               │
               └──── simpled_control (overlay, attachable: false) ──► controller :8080 (API + public)
                                                                      controller :8081 (ACME challenges)
 ```
 
 - `simpled_control` contains only the gateway and the controller. App containers sit on
-  `common_network` and cannot reach the controller except through gateway routes.
+  their deployment's own network (and any shared `simpled_<name>` the env spec
+  declares) and cannot reach the controller except through gateway routes.
 - The gateway routes `/simpled/` on each domain of `controller.host` (prefix
   stripped) and, from Phase 3, `/.well-known/acme-challenge/` on every domain to the
   controller. Nothing else of the controller is routed on app hosts.

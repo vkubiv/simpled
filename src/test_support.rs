@@ -62,6 +62,7 @@ pub fn resolved_service(name: &str, service_type: ServiceType, depends_on: &[&st
         resources: resources(),
         working_dir: None,
         excluded: false,
+        networks: vec![],
     }
 }
 

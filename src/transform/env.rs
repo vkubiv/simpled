@@ -319,6 +319,8 @@ pub fn convert_env_spec(
         }
     };
 
+    convert_networks(yaml.networks.as_ref(), &deployments, &env_type_yaml)?;
+
     // Last, so a spec that is wrong in other ways is told about those first.
     if ingress.controller.is_none() && matches!(env_type_yaml, DeploymentEnvTypeYaml::Docker) {
         return Err(anyhow!(
@@ -442,6 +444,8 @@ fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> De
         exclude_services: child.exclude_services.clone().or_else(|| base.exclude_services.clone()),
         // Keyed by volume name: a child rebinds one volume and keeps the rest.
         volumes: merge_opt_map(base.volumes.as_ref(), child.volumes.as_ref(), |_, c| c.clone()),
+        // Replaced, like exclude_services: the list is the deployment's reach.
+        networks: child.networks.clone().or_else(|| base.networks.clone()),
     }
 }
 
@@ -1345,6 +1349,8 @@ fn convert_deployment(
         volumes.insert(volume.clone(), convert_volume_binding(binding, &owner)?);
     }
 
+    let networks = convert_deployment_networks(yaml.networks.as_ref(), &name)?;
+
     Ok(DeploymentSpec {
         primary_host,
         name,
@@ -1357,7 +1363,139 @@ fn convert_deployment(
         services,
         exclude_services,
         volumes,
+        networks,
     })
+}
+
+fn convert_deployment_networks(
+    yaml: Option<&DeploymentNetworksYaml>,
+    deployment: &str,
+) -> Result<std::collections::BTreeMap<String, NetworkMembers>> {
+    let mut networks = std::collections::BTreeMap::new();
+    match yaml {
+        None => {}
+        Some(DeploymentNetworksYaml::All(names)) => {
+            for name in names {
+                if networks.insert(name.clone(), NetworkMembers::All).is_some() {
+                    bail!("Deployment '{}' lists network '{}' twice", deployment, name);
+                }
+            }
+        }
+        Some(DeploymentNetworksYaml::Members(members)) => {
+            for (name, services) in members {
+                let members = match services {
+                    None => NetworkMembers::All,
+                    Some(services) if services.is_empty() => bail!(
+                        "Network '{}' in deployment '{}' lists no services: name the ones that join it, \
+                         or leave the value empty for all of them",
+                        name,
+                        deployment
+                    ),
+                    Some(services) => {
+                        if let Some(dup) = services.iter().enumerate().find(|(i, s)| services[..*i].contains(s)) {
+                            bail!(
+                                "Network '{}' in deployment '{}' lists service '{}' twice",
+                                name,
+                                deployment,
+                                dup.1
+                            );
+                        }
+                        NetworkMembers::Services(services.clone())
+                    }
+                };
+                networks.insert(name.clone(), members);
+            }
+        }
+    }
+    Ok(networks)
+}
+
+/// The env spec's `networks:`, checked against the deployments that join them.
+/// Which services exist is only known with the app spec, so the resolver checks
+/// the service names.
+fn convert_networks(
+    declared: Option<&std::collections::BTreeMap<String, Option<NetworkSpecYaml>>>,
+    deployments: &[DeploymentSpec],
+    env_type: &DeploymentEnvTypeYaml,
+) -> Result<()> {
+    let declared: Vec<String> = declared.map(|d| d.keys().cloned().collect()).unwrap_or_default();
+    let mut deployments: Vec<&DeploymentSpec> = deployments.iter().collect();
+    deployments.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if !matches!(env_type, DeploymentEnvTypeYaml::Docker) {
+        let env = match env_type {
+            DeploymentEnvTypeYaml::K8S => "K8S",
+            _ => "Local",
+        };
+        if !declared.is_empty() {
+            bail!(
+                "networks cannot be set for {} environment: it only applies to Docker",
+                env
+            );
+        }
+        if let Some(d) = deployments.iter().find(|d| !d.networks.is_empty()) {
+            bail!(
+                "networks cannot be set for deployment '{}' in {} environment: it only applies to Docker",
+                d.name,
+                env
+            );
+        }
+        return Ok(());
+    }
+
+    for name in &declared {
+        if !crate::networks::is_valid_name(name) {
+            bail!(
+                "Network name '{}' is not valid: use letters, digits, '_', '.' and '-', starting with a letter or digit",
+                name
+            );
+        }
+        if crate::networks::declared(name) == crate::controller::CONTROL_NETWORK {
+            bail!(
+                "Network name '{}' is reserved: simpled's controller network is called that",
+                name
+            );
+        }
+    }
+    for deployment in &deployments {
+        if !crate::networks::is_valid_name(&deployment.name) {
+            bail!(
+                "Deployment name '{}' is not valid on Docker, where it names the deployment's network: \
+                 use letters, digits, '_', '.' and '-', starting with a letter or digit",
+                deployment.name
+            );
+        }
+        if let Some(unknown) = deployment.networks.keys().find(|n| !declared.contains(n)) {
+            bail!(
+                "Deployment '{}' joins network '{}', which the env spec does not declare under networks:{}",
+                deployment.name,
+                unknown,
+                if declared.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (declared: {})", declared.join(", "))
+                }
+            );
+        }
+    }
+    for name in &declared {
+        let members: Vec<&str> = deployments
+            .iter()
+            .filter(|d| d.networks.contains_key(name))
+            .map(|d| d.name.as_str())
+            .collect();
+        if members.len() < 2 {
+            bail!(
+                "Network '{}' connects nothing: {} — a network is shared by the deployments that list it under their networks:",
+                name,
+                match members.first() {
+                    Some(only) => format!("only deployment '{}' joins it", only),
+                    None => "no deployment joins it".to_string(),
+                }
+            );
+        }
+    }
+    Ok(())
 }
 
 /// One volume's binding: exactly one of `node`, `path` (alone or with `node`)

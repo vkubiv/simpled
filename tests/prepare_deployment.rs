@@ -79,16 +79,20 @@ fn standalone_docker_reaches_services_through_traefik() {
     let out = dir.path().join("docker-deploy");
 
     let script = read(&out.join("deploy.sh"));
-    // Traefik dials `<deployment>_<service>`, so the container must answer to it.
-    assert!(script.contains("--network-alias prod_api"), "{}", script);
+    // Traefik dials `<deployment>_<service>`, the container's name.
+    assert!(
+        script.contains("--name prod_api --network simpled-prod --network-alias api "),
+        "{}",
+        script
+    );
     let traefik = read(&out.join("traefik").join("dynamic_conf.yml"));
     assert!(traefik.contains("url: \"http://prod_api:80/\""), "{}", traefik);
 
     // Job phases: the database, then the migration in the foreground, then api.
-    let db = script.find("docker run -d --name primary-db").unwrap();
-    let wait = script.find("wait_healthy primary-db").unwrap();
-    let job = script.find("docker run --name migrate").unwrap();
-    let api = script.find("docker run -d --name api").unwrap();
+    let db = script.find("docker run -d --name prod_primary-db").unwrap();
+    let wait = script.find("wait_healthy prod_primary-db").unwrap();
+    let job = script.find("docker run --name prod_migrate").unwrap();
+    let api = script.find("docker run -d --name prod_api").unwrap();
     assert!(db < wait && wait < job && job < api, "{}", script);
 
     assert_eq!(read(&out.join("secrets").join("shop-db_password")), "s3cr3t");
@@ -192,7 +196,7 @@ fn standalone_docker_limits_containers_by_their_resources() {
 
     let api = script
         .lines()
-        .find(|l| l.starts_with("docker run -d --name api "))
+        .find(|l| l.starts_with("docker run -d --name prod_api "))
         .unwrap();
     assert!(
         api.contains(" --memory 1g --cpus 2 --memory-reservation 256m "),
@@ -201,7 +205,7 @@ fn standalone_docker_limits_containers_by_their_resources() {
     );
     let job = script
         .lines()
-        .find(|l| l.starts_with("docker run --name migrate "))
+        .find(|l| l.starts_with("docker run --name prod_migrate "))
         .unwrap();
     assert!(job.contains(" --memory 512m "), "{}", job);
     assert!(!job.contains("--cpus"), "{}", job);
