@@ -730,6 +730,7 @@ Every request needs `Authorization: Bearer <token>`. A missing or wrong token ge
 | `GET /simpled/api/v1/deployments/{deployment}/services/{service}/tasks` | Swarm: the service's last 20 tasks, newest first, each with its node, state, desired state, since when, exit code and error, which say why a service does not converge. Standalone: its containers with state, status and health. |
 | `GET /simpled/api/v1/deployments/{deployment}/services/{service}/logs` | The service's log as `text/plain`, streamed; on Swarm aggregated across nodes. `tail=200` (default; at most 10000, which `all` stands for; on Swarm Docker applies it to each task), `since=10m` (`30s`, `2h`, `1d`, or Unix seconds), `follow=1` to keep streaming, `timestamps=1`. |
 | `GET /simpled/api/v1/gateway` | The gateway's tasks per node, or its container; with Let's Encrypt on Swarm, each domain's certificate: `issuer` (`acme`, `self-signed` or `none`) and `expires_at` (Unix seconds). |
+| `GET /simpled/api/v1/gateway/logs` | The gateway's log, with the query of a service's `logs`: on Swarm every gateway task's lines, standalone its container's. |
 | `GET /simpled/api/v1/nodes` | Swarm: every node's hostname, role, availability, state, address, labels and whether it leads. A 404 on standalone Docker. |
 
 `{deployment}` and `{service}` are the names from the specs (`prod`, `api`), not Swarm's. A name the controller does not own is a 404 either way, so names cannot be probed.
@@ -1848,10 +1849,13 @@ blog  blog 0.9.0  degraded, updating
 ### `simpled logs`
 
 A service's log, from the controller: on Swarm, the lines of every task, read from the
-manager. Same address and token as `simpled status`.
+manager. Same address and token as `simpled status`. `simpled logs gateway` is the
+gateway's log: Traefik's own lines and, with [access_log](#access_log), one line per
+request. It needs a controller from simpled 2.4 or later.
 
 ```
 simpled logs <DEPLOYMENT> <SERVICE> [-f] [--tail <N|all>] [--since <TIME>] [--timestamps] [--url <API>]
+simpled logs gateway [-f] [--tail <N|all>] [--since <TIME>] [--timestamps] [--url <API>]
 
   -f, --follow    Keep printing new lines until interrupted
   --tail          Lines from the end of each task's log (default 200)

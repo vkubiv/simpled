@@ -206,6 +206,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/v1/deployments/{deployment}/services/{service}/tasks", get(tasks))
         .route("/api/v1/deployments/{deployment}/services/{service}/logs", get(logs))
         .route("/api/v1/gateway", get(gateway))
+        .route("/api/v1/gateway/logs", get(gateway_logs))
         .route("/api/v1/nodes", get(nodes))
 }
 
@@ -242,12 +243,37 @@ async fn logs(
     if let Err(denied) = guard(&app, &headers).await {
         return denied.into_response();
     }
-    let now = i64::try_from(super::unix_now()).unwrap_or(i64::MAX);
-    let query = match super::inspect::log_query(&params, now) {
+    let query = match log_query(&params) {
         Ok(q) => q,
         Err(message) => return error(StatusCode::BAD_REQUEST, &message),
     };
-    match app.source.logs(&deployment, &service, query).await {
+    log_response(app.source.logs(&deployment, &service, query).await)
+}
+
+/// The gateway's log, like a service's: Traefik's own lines and, with
+/// `gateway.access_log`, one per request.
+async fn gateway_logs(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(denied) = guard(&app, &headers).await {
+        return denied.into_response();
+    }
+    let query = match log_query(&params) {
+        Ok(q) => q,
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+    };
+    log_response(app.source.gateway_logs(query).await)
+}
+
+fn log_query(params: &HashMap<String, String>) -> Result<super::inspect::LogQuery, String> {
+    let now = i64::try_from(super::unix_now()).unwrap_or(i64::MAX);
+    super::inspect::log_query(params, now)
+}
+
+fn log_response(found: anyhow::Result<Option<super::source::LogStream>>) -> Response {
+    match found {
         Ok(Some(stream)) => (
             StatusCode::OK,
             [

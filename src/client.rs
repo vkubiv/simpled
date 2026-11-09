@@ -249,9 +249,13 @@ pub fn render_status(body: &Value) -> String {
     out
 }
 
+pub enum LogTarget<'a> {
+    Service { deployment: &'a str, service: &'a str },
+    Gateway,
+}
+
 pub struct LogArgs<'a> {
-    pub deployment: &'a str,
-    pub service: &'a str,
+    pub target: LogTarget<'a>,
     pub follow: bool,
     pub tail: Option<&'a str>,
     pub since: Option<&'a str>,
@@ -273,10 +277,17 @@ pub fn logs(base: &str, token: &Token, args: &LogArgs) -> Result<()> {
     if args.timestamps {
         query.push(("timestamps", "1"));
     }
-    let url = format!(
-        "{}/deployments/{}/services/{}/logs",
-        base, args.deployment, args.service
-    );
+    let (url, what) = match args.target {
+        LogTarget::Service { deployment, service } => (
+            format!("{}/deployments/{}/services/{}/logs", base, deployment, service),
+            format!("Service '{}' of deployment '{}'", service, deployment),
+        ),
+        // Before 2.4 the controller had no such route and answered 404 too.
+        LogTarget::Gateway => (
+            format!("{}/gateway/logs", base),
+            "The gateway's log (a controller older than simpled 2.4 does not serve it)".to_string(),
+        ),
+    };
     // No timeout: a followed log runs until it is interrupted.
     let mut response = client(None)?
         .get(&url)
@@ -285,7 +296,6 @@ pub fn logs(base: &str, token: &Token, args: &LogArgs) -> Result<()> {
         .send()
         .with_context(|| format!("Cannot reach {}", url))?;
     if !response.status().is_success() {
-        let what = format!("Service '{}' of deployment '{}'", args.service, args.deployment);
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
             let message = response
                 .json::<Value>()

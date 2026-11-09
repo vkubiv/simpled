@@ -43,6 +43,10 @@ pub trait Source: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<LogStream>>> {
         Box::pin(async { Ok(None) })
     }
+    /// The gateway's log, as `logs` streams a service's; `None` without a gateway.
+    fn gateway_logs(&self, _query: LogQuery) -> BoxFuture<'_, Result<Option<LogStream>>> {
+        Box::pin(async { Ok(None) })
+    }
     /// The gateway's tasks, or its container.
     fn gateway(&self) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async { Ok(Value::Null) })
@@ -215,6 +219,12 @@ fn log_container(containers: Vec<bollard::models::ContainerSummary>) -> Option<S
             )
         })
         .and_then(|c| c.id)
+}
+
+fn log_stream(
+    stream: futures_util::stream::BoxStream<'static, Result<bollard::container::LogOutput, bollard::errors::Error>>,
+) -> LogStream {
+    Box::pin(stream.map(|chunk| chunk.map(|o| o.into_bytes()).map_err(std::io::Error::other)))
 }
 
 fn logs_options(query: &LogQuery) -> LogsOptions {
@@ -432,9 +442,45 @@ impl Source for DockerSource {
                     }
                 }
             };
-            let stream: LogStream =
-                Box::pin(stream.map(|chunk| chunk.map(|o| o.into_bytes()).map_err(std::io::Error::other)));
-            Ok(Some(stream))
+            Ok(Some(log_stream(stream)))
+        })
+    }
+
+    fn gateway_logs(&self, query: LogQuery) -> BoxFuture<'_, Result<Option<LogStream>>> {
+        Box::pin(async move {
+            let options = logs_options(&query);
+            let stream = match self.mode {
+                Mode::Swarm => {
+                    let services = self
+                        .docker
+                        .list_services(Some(ListServicesOptions {
+                            filters: Some(HashMap::from([(
+                                "name".to_string(),
+                                vec![GATEWAY_SWARM_SERVICE.to_string()],
+                            )])),
+                            status: None,
+                        }))
+                        .await
+                        .context("Cannot list the swarm's services")?;
+                    // The name filter matches prefixes too.
+                    let id = services
+                        .into_iter()
+                        .find(|s| s.spec.as_ref().and_then(|s| s.name.as_deref()) == Some(GATEWAY_SWARM_SERVICE))
+                        .and_then(|s| s.id);
+                    match id {
+                        Some(id) => self.docker.service_logs(&id, Some(options)).boxed(),
+                        None => return Ok(None),
+                    }
+                }
+                Mode::Standalone => {
+                    let filters = HashMap::from([("name".to_string(), vec![format!("^/{}$", GATEWAY_CONTAINER)])]);
+                    match log_container(self.containers(filters).await?) {
+                        Some(id) => self.docker.logs(&id, Some(options)).boxed(),
+                        None => return Ok(None),
+                    }
+                }
+            };
+            Ok(Some(log_stream(stream)))
         })
     }
 

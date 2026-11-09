@@ -221,6 +221,7 @@ Kubernetes keeps the per-deployment nginx sidecar answering
 | `GET /api/v1/deployments/{d}/services/{s}/tasks` | read | Per task: node, state, since, exit code, error (Swarm). Per container locally and on standalone. |
 | `GET /api/v1/deployments/{d}/services/{s}/logs?tail=200&since=10m&follow=1&timestamps=1` | read | `text/plain` stream. On Swarm this is the service log aggregated across nodes, read from the manager. |
 | `GET /api/v1/gateway` | read | Gateway tasks per node, and certificates with their domains and expiry dates (§7.1). |
+| `GET /api/v1/gateway/logs?tail=200&since=10m&follow=1&timestamps=1` | read | The gateway's log, like a service's. |
 | `GET /api/v1/nodes` | read | Swarm nodes: role, availability, state, labels. |
 | `POST /api/v1/deployments/{d}/services/{s}/restart` | manage | *Phase 4.* `docker service update --force`. |
 | `POST /api/v1/deployments/{d}/services/{s}/scale` | manage | *Phase 4.* |

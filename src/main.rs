@@ -94,10 +94,12 @@ enum Commands {
         json: bool,
     },
 
-    /// A service's log, from the simpled controller. On Swarm, every task's lines
+    /// A service's log, from the simpled controller. On Swarm, every task's lines.
+    /// `simpled logs gateway` is the gateway's
     Logs {
+        /// The deployment, or `gateway` alone for the gateway's log
         deployment: String,
-        service: String,
+        service: Option<String>,
         /// Keep printing new lines
         #[arg(short, long)]
         follow: bool,
@@ -456,13 +458,20 @@ fn main() -> Result<()> {
             timestamps,
             url,
         } => {
+            let target = match service {
+                Some(service) => client::LogTarget::Service { deployment, service },
+                None if deployment == "gateway" => client::LogTarget::Gateway,
+                None => anyhow::bail!(
+                    "Name the service too: simpled logs {} <service>. The gateway's log is simpled logs gateway",
+                    deployment
+                ),
+            };
             let (base, token) = client::api_and_token(url.as_deref())?;
             client::logs(
                 &base,
                 &token,
                 &client::LogArgs {
-                    deployment,
-                    service,
+                    target,
                     follow: *follow,
                     tail: tail.as_deref(),
                     since: since.as_deref(),

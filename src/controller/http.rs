@@ -629,6 +629,17 @@ mod tests {
                 Ok(Some(stream))
             })
         }
+        fn gateway_logs(
+            &self,
+            query: super::super::inspect::LogQuery,
+        ) -> BoxFuture<'_, Result<Option<super::super::source::LogStream>>> {
+            Box::pin(async move {
+                let line = format!("gateway tail={} follow={}\n", query.tail, query.follow);
+                let stream: super::super::source::LogStream =
+                    Box::pin(futures_util::stream::iter(vec![Ok(axum::body::Bytes::from(line))]));
+                Ok(Some(stream))
+            })
+        }
     }
 
     #[test]
@@ -675,5 +686,11 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(call("/api/v1/nodes").0, StatusCode::NOT_FOUND);
+
+        let (status, kind, body) = call("/api/v1/gateway/logs?tail=7&follow=1");
+        assert_eq!(status, StatusCode::OK);
+        assert!(kind.starts_with("text/plain"), "{}", kind);
+        assert_eq!(body, "gateway tail=7 follow=true\n");
+        assert_eq!(call("/api/v1/gateway/logs?since=soon").0, StatusCode::BAD_REQUEST);
     }
 }

@@ -84,6 +84,26 @@ fn status_finds_the_api_under_simpled_on_the_controller_host() {
 }
 
 #[test]
+fn logs_of_the_gateway_take_no_service() {
+    let dir = project(true);
+    let (ok, stderr) = run(&dir, &["logs", "gateway", "--tail", "50"], &[("SIMPLED_TOKEN", TOKEN)]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("Cannot reach http://shop.simpled-test.invalid/simpled/api/v1/gateway/logs"),
+        "{}",
+        stderr
+    );
+
+    let (ok, stderr) = run(&dir, &["logs", "prod"], &[("SIMPLED_TOKEN", TOKEN)]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("Name the service too: simpled logs prod <service>"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
 fn wait_polls_the_deployments_health_on_the_controller_host_until_the_time_is_up() {
     let dir = project(false);
     let (ok, stderr) = run(
