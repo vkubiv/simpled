@@ -71,6 +71,10 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         ));
     }
 
+    for warning in ignored_environment_values(deployment, app_spec, &env_spec.env_type) {
+        eprintln!("Warning: {}", warning);
+    }
+
     // Check secrets
     let provided_secrets: HashSet<&String> = deployment.secrets.iter().map(|c| &c.secret_name).collect();
     for secret in &app_spec.secrets {
@@ -191,6 +195,51 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     validate_service_env_references(app_spec)?;
 
     Ok(())
+}
+
+/// Deployment `environment:` values no service receives: `relative` and
+/// `internal` variables are computed from the app spec, and an undeclared name
+/// is read by nothing. Locally an undeclared name can still feed a testspec
+/// suite, so it is only reported elsewhere.
+fn ignored_environment_values(
+    deployment: &DeploymentSpec,
+    app_spec: &AppSpec,
+    env_type: &DeploymentEnvType,
+) -> Vec<String> {
+    let env = &app_spec.environment;
+    let mut seen = HashSet::new();
+    let mut warnings = Vec::new();
+    for var in &deployment.environment {
+        let name = &var.name;
+        if !seen.insert(name) {
+            continue;
+        }
+        let computed = if env.relative.iter().any(|r| &r.name == name) {
+            Some("relative")
+        } else if env.internal.iter().any(|i| &i.name == name) {
+            Some("internal")
+        } else {
+            None
+        };
+        if let Some(kind) = computed {
+            warnings.push(format!(
+                "deployment '{}' sets {}, but the app spec declares it as {} and computes its value, \
+                 so the env spec value is ignored. Declare {} as external or optional in the app spec \
+                 to set it from the env spec.",
+                deployment.name, name, kind, name
+            ));
+        } else if *env_type != DeploymentEnvType::Local
+            && !env.external.iter().any(|e| &e.name == name)
+            && !env.optional.iter().any(|o| &o.name == name)
+        {
+            warnings.push(format!(
+                "deployment '{}' sets {}, which the app spec does not declare, so the value is ignored. \
+                 Declare {} as external or optional in the app spec, or remove it from the env spec.",
+                deployment.name, name, name
+            ));
+        }
+    }
+    warnings
 }
 
 /// Every variable a service names must be declared in the app's `environment`.
@@ -573,6 +622,96 @@ deployments:
             let env = env_spec(&env_with_api_depends_on("[worker]"), root.path());
             let err = validate(&env, &app_spec(&app), "prod").unwrap_err().to_string();
             assert!(err.contains("Dependency cycle in depends_on"), "{err}");
+        }
+
+        const APP_WITH_EVERY_KIND: &str = r#"
+name: shop
+version: 1.2.3
+environment:
+  external:
+    - LOG_LEVEL=info
+  optional:
+    - SENTRY_DSN
+  relative:
+    - GLITCHTIP_DOMAIN=/
+  internal:
+    - PORT=8080
+app_services:
+  api:
+    type: public
+    image: myorg/api
+    environment: [all]
+    ports:
+      - "80:8080"
+"#;
+
+        fn ignored(env_yaml: &str) -> Vec<String> {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(env_yaml, root.path());
+            let deployment = env.deployment("prod").unwrap();
+            ignored_environment_values(deployment, &app_spec(APP_WITH_EVERY_KIND), &env.env_type)
+        }
+
+        #[test]
+        fn a_relative_variable_set_by_the_env_spec_is_reported() {
+            let warnings = ignored(&k8s_env(
+                "    environment:\n      - GLITCHTIP_DOMAIN=https://monitor.example.com",
+            ));
+            assert_eq!(
+                warnings,
+                ["deployment 'prod' sets GLITCHTIP_DOMAIN, but the app spec declares it as relative and computes its \
+                  value, so the env spec value is ignored. Declare GLITCHTIP_DOMAIN as external or optional in \
+                  the app spec to set it from the env spec."]
+            );
+        }
+
+        #[test]
+        fn an_internal_variable_set_by_the_env_spec_is_reported() {
+            let warnings = ignored(&k8s_env("    environment:\n      - PORT=9090"));
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("sets PORT, but the app spec declares it as internal"));
+        }
+
+        #[test]
+        fn an_undeclared_variable_set_by_the_env_spec_is_reported() {
+            let warnings = ignored(&k8s_env("    environment:\n      - FEATURE_X=on"));
+            assert_eq!(
+                warnings,
+                [
+                    "deployment 'prod' sets FEATURE_X, which the app spec does not declare, so the value is ignored. \
+                  Declare FEATURE_X as external or optional in the app spec, or remove it from the env spec."
+                ]
+            );
+        }
+
+        #[test]
+        fn external_and_optional_variables_are_not_reported() {
+            let warnings = ignored(&k8s_env(
+                "    environment:\n      - LOG_LEVEL=debug\n      - SENTRY_DSN=https://key@sentry",
+            ));
+            assert!(warnings.is_empty(), "{:?}", warnings);
+        }
+
+        #[test]
+        fn a_local_deployment_may_set_undeclared_variables_for_test_suites() {
+            let warnings = ignored(
+                r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    environment:
+      - E2E_ADMIN_TOKEN=t
+      - PORT=9090
+"#,
+            );
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("sets PORT"));
         }
 
         #[test]
