@@ -747,12 +747,13 @@ fn generate_swarm(resolved_spec: &EnvironmentResolvedSpec, output_dir: &Path) ->
     // release currently serving traffic is running, so `prune -a` cannot remove
     // its image, and nothing prunes after the new release is pulled. The node
     // therefore always keeps the previous release next to the current one, and a
-    // rollback never has to wait on the registry. Pruning is housekeeping, so a
-    // failure here is reported but does not stop the deploy.
-    writeln!(deploy_sh, "echo 'Pruning images no container uses...'")?;
+    // rollback never has to wait on the registry. It runs on every node; if that
+    // job fails, this node is still pruned. Pruning is housekeeping, so a failure
+    // here is reported but does not stop the deploy.
     writeln!(
         deploy_sh,
-        "docker image prune -af || echo 'Warning: image prune failed, continuing.' >&2"
+        "./simpled step prune-images || {{ echo 'Warning: pruning every node failed, pruning this one.' >&2; \
+         docker image prune -af || echo 'Warning: image prune failed, continuing.' >&2; }}"
     )?;
 
     // Bind-mounted volume directories are not created automatically on the node
@@ -2218,9 +2219,10 @@ mkdir -p \"/var/"
         let spec = spec(vec![service("api", ServiceType::Public, &[])]);
         let (_dir, script) = generate_swarm_to_temp(&spec);
 
-        let prune = script.find("docker image prune -af").unwrap();
+        let prune = script.find("./simpled step prune-images ||").unwrap();
         let first_deploy = script.find("docker stack deploy").unwrap();
         assert!(prune < first_deploy, "{}", script);
+        assert_eq!(script.matches("prune-images").count(), 1, "{}", script);
         assert_eq!(script.matches("docker image prune").count(), 1, "{}", script);
     }
 

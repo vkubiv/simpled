@@ -1941,7 +1941,7 @@ Output directory: `docker-deploy/`
 
 | File | Description |
 |------|-------------|
-| `deploy.sh` | Deploy script: image prune, Swarm configs and secrets, ingress, then the job phases, then the stack, then pruning of old configs and secrets. The steps marked `./simpled step` are run by the binary next to it. Images no container uses are pruned *before* the rollout, so the release that is running at that point stays on the node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
+| `deploy.sh` | Deploy script: image prune, Swarm configs and secrets, ingress, then the job phases, then the stack, then pruning of old configs and secrets. The steps marked `./simpled step` are run by the binary next to it. Images no container uses are pruned *before* the rollout, on every node (`./simpled step prune-images`), so the release that is running at that point stays on each node as the rollback image. The full stack file is deployed with `--prune`, so services removed from the spec are removed from the swarm on the next deploy, and with `--detach=false`, so the script only returns once every task is running (and healthy, where a `healthcheck` is declared) |
 | `simpled` | The simpled binary that runs the deploy steps, the version that prepared the deployment |
 | `gateway/plan.json`, `<deployment>/plan.json` | What the deploy steps act on: the gateway's and the deployment's objects, and the deployment's jobs |
 | `<deployment>/docker-compose.yaml` | Stack file with all long-running services (jobs are not part of it) |
@@ -1965,6 +1965,7 @@ calls to the simpled binary shipped next to it:
 | `./simpled step check-nodes` | With `multi_node: false` only: stops unless exactly one node accepts tasks, and exports its ID for the `node.id` constraint. See [multi_node](#multi_node). |
 | `./simpled step sync-objects <plan>` | Creates the plan's configs and secrets that do not exist yet and exports their names. See [Configs and secrets on Docker Swarm](#configs-and-secrets-on-docker-swarm). |
 | `./simpled step run-job <plan> <job>` | Runs a job as a `replicated-job` service, waits until it completes or fails, prints its logs and removes the service. `JOB_TIMEOUT` (seconds, default 600) limits the wait. |
+| `./simpled step prune-images` | Removes the images no container uses on every node: a `global-job` service of the controller image (`SIMPLED_CONTROLLER_IMAGE` overrides it) with the Docker socket mounted, waited for up to 5 minutes and then removed. If it fails, `deploy.sh` prunes only its own node and carries on. Images of stopped containers stay until Swarm drops those tasks, so the swarm's task history limit (`docker swarm update --task-history-limit 2`) bounds how many old releases each node keeps. |
 | `./simpled step check-gateway <plan>` | Before the gateway is redeployed: refuses to replace a newer simpled's gateway, and prints how its routing changes. |
 | `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy. |
 

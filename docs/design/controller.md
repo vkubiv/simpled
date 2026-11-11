@@ -418,8 +418,6 @@ These all need the controller on every node (`mode: global`, an "agent" role), b
 the Docker API of a manager does not reach containers on other nodes:
 
 - Per-container CPU and memory stats from workers.
-- `docker image prune`, which today runs only on the node that ran `deploy.sh`, so
-  worker disks fill up.
 - Free disk space per node, and per `node`-bound volume (§8.3).
 
 And with the manage token: restart, scale, rollback, re-running a failed job, and
@@ -736,7 +734,7 @@ and the release notes are `docs/releases/2.0.0.md`.
 4. **ACME.** Challenges, certificates as secrets, the rolling gateway update, renewal,
    `simpled tls import`, and lifting the `global` + `letsencrypt` rejection.
 5. **Manage.** Restart, scale and rollback with the manage token.
-6. **Agent mode.** A global per-node controller for stats, prune and disk space.
+6. **Agent mode.** A global per-node controller for stats and disk space (images are pruned on every node by `simpled step prune-images`).
 
 ---
 

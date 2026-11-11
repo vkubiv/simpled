@@ -156,6 +156,11 @@ enum Commands {
         listen: String,
     },
 
+    /// Removes the images no container uses on this node. Run on every node by
+    /// `simpled step prune-images`, not by hand
+    #[command(hide = true)]
+    PruneNodeImages,
+
     /// Used for local development and tests
     Local {
         #[command(subcommand)]
@@ -270,6 +275,9 @@ enum StepCommands {
     PruneObjects { plan: std::path::PathBuf },
     /// Runs one job of the plan to completion
     RunJob { plan: std::path::PathBuf, job: String },
+    /// Removes the images no container uses on every node, as a global job of
+    /// the controller image
+    PruneImages,
     /// Takes the swarm's deploy lock for a deployment, waiting while another
     /// deploy holds it, and prints `export SIMPLED_LOCK_TOKEN=...`
     Lock { deployment: String },
@@ -512,6 +520,9 @@ fn main() -> Result<()> {
         Commands::Controller { config, listen } => {
             controller::run(config, listen)?;
         }
+        Commands::PruneNodeImages => {
+            deploy_steps::prune_node_images()?;
+        }
         Commands::Local { command } => {
             local(command)?;
         }
@@ -638,6 +649,15 @@ fn step_command(command: &StepCommands) -> Result<()> {
         }
         StepCommands::PruneObjects { plan } => {
             deploy_steps::prune_objects(&docker, &read_plan(plan)?)?;
+        }
+        StepCommands::PruneImages => {
+            let image = std::env::var(controller::IMAGE_VAR).unwrap_or_else(|_| controller::image());
+            deploy_steps::prune_images(
+                &docker,
+                &image,
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(2),
+            )?;
         }
         StepCommands::RunJob { plan, job } => {
             let plan = read_plan(plan)?;

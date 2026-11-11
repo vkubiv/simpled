@@ -588,10 +588,7 @@ pub fn run_job(
         .next()
         .unwrap_or_default()
         .to_string();
-        let terminal = ["Complete", "Failed", "Rejected", "Orphaned", "Shutdown"]
-            .iter()
-            .any(|t| state.starts_with(t));
-        if terminal || started.elapsed() >= timeout {
+        if is_terminal(&state) || started.elapsed() >= timeout {
             break state;
         }
         std::thread::sleep(poll);
@@ -620,6 +617,107 @@ pub fn run_job(
             String::new()
         }
     ))
+}
+
+fn is_terminal(state: &str) -> bool {
+    ["Complete", "Failed", "Rejected", "Orphaned", "Shutdown"]
+        .iter()
+        .any(|t| state.starts_with(t))
+}
+
+// ---------------------------------------------------------------- prune-images
+
+pub const PRUNE_IMAGES_SERVICE: &str = "simpled_prune_images";
+
+/// Removes the images no container uses on every node, not only the one running
+/// deploy.sh: a `global-job` of the controller image, whose task on each node runs
+/// `simpled prune-node-images` against that node's Docker socket.
+pub fn prune_images(docker: &dyn Docker, image: &str, timeout: Duration, poll: Duration) -> Result<()> {
+    eprintln!("Pruning images no container uses, on every node...");
+    docker.run(&["service", "rm", PRUNE_IMAGES_SERVICE])?;
+    let created = docker.run(&[
+        "service",
+        "create",
+        "--name",
+        PRUNE_IMAGES_SERVICE,
+        "--mode",
+        "global-job",
+        "--restart-condition",
+        "none",
+        "--detach",
+        "--quiet",
+        "--user",
+        "0:0",
+        "--hostname",
+        "{{.Node.Hostname}}",
+        "--mount",
+        "type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock",
+        "--entrypoint",
+        "/simpled",
+        image,
+        "prune-node-images",
+    ])?;
+    if !created.success {
+        bail!(
+            "{} could not be created: {}",
+            PRUNE_IMAGES_SERVICE,
+            created.stderr.trim()
+        );
+    }
+
+    let started = Instant::now();
+    let states = loop {
+        let states: Vec<String> = checked(
+            docker,
+            &["service", "ps", PRUNE_IMAGES_SERVICE, "--format", "{{.CurrentState}}"],
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+        let done = !states.is_empty() && states.iter().all(|s| is_terminal(s));
+        if done || started.elapsed() >= timeout {
+            break states;
+        }
+        std::thread::sleep(poll);
+    };
+
+    let logs = docker.run(&["service", "logs", "--raw", PRUNE_IMAGES_SERVICE])?;
+    eprint!("{}{}", logs.stdout, logs.stderr);
+    docker.run(&["service", "rm", PRUNE_IMAGES_SERVICE])?;
+    let unfinished = states.iter().filter(|s| !s.starts_with("Complete")).count();
+    if unfinished > 0 {
+        bail!(
+            "Image prune did not complete on {} of {} nodes ({})",
+            unfinished,
+            states.len(),
+            states.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// One node's half of `prune_images`: removes every image no container uses.
+pub fn prune_node_images() -> Result<()> {
+    use bollard::query_parameters::PruneImagesOptionsBuilder;
+    let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "this node".to_string());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let pruned = runtime.block_on(async {
+        let docker = crate::controller::source::connect_docker()?;
+        let filters = std::collections::HashMap::from([("dangling", vec!["false"])]);
+        docker
+            .prune_images(Some(PruneImagesOptionsBuilder::new().filters(&filters).build()))
+            .await
+            .context("Image prune failed")
+    })?;
+    println!(
+        "{}: removed {} images, reclaimed {} MB",
+        node,
+        pruned.images_deleted.map_or(0, |d| d.len()),
+        pruned.space_reclaimed.unwrap_or(0) / 1_000_000
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------- lock
@@ -1178,6 +1276,36 @@ mod tests {
             .iter()
             .any(|c| c == "service logs --tail 200 prod_migrate"));
         assert_eq!(docker.calls().last().unwrap(), "service rm prod_migrate");
+    }
+
+    #[test]
+    fn images_are_pruned_on_every_node_by_a_global_job() {
+        let docker = FakeDocker::new(&[("service ps", true, "Complete 1 second ago\nComplete 2 seconds ago\n")]);
+        prune_images(
+            &docker,
+            "ghcr.io/vkubiv/simpled:2.5.0",
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let calls = docker.calls();
+        let create = calls.iter().find(|c| c.starts_with("service create")).unwrap();
+        assert!(create.contains("--mode global-job"), "{}", create);
+        assert!(create.contains("source=/var/run/docker.sock"), "{}", create);
+        assert!(
+            create.ends_with("--entrypoint /simpled ghcr.io/vkubiv/simpled:2.5.0 prune-node-images"),
+            "{}",
+            create
+        );
+        assert_eq!(calls.last().unwrap(), "service rm simpled_prune_images");
+    }
+
+    #[test]
+    fn a_node_that_did_not_prune_fails_the_step_after_the_job_is_removed() {
+        let docker = FakeDocker::new(&[("service ps", true, "Complete 1 second ago\nRejected 2 seconds ago\n")]);
+        let err = prune_images(&docker, "simpled", Duration::from_secs(5), Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("on 1 of 2 nodes"), "{}", err);
+        assert_eq!(docker.calls().last().unwrap(), "service rm simpled_prune_images");
     }
 
     #[test]
