@@ -42,8 +42,10 @@ environment:
 |---------|-------------|
 | `external` | Required variables. Deployment fails if not provided and no default set. |
 | `optional` | Optional variables. No defaults allowed. Deployment succeeds even if missing; a service that references one just does not get the variable. |
-| `relative` | URL variables. Value is prepended with the deployment's primary host domain at deploy time. Can be overridden by the environment. |
-| `internal` | Fixed variables set by the app author. Identical across all environments. |
+| `relative` | URL variables. Value is prepended with the deployment's primary host domain at deploy time. An environment cannot override it: a value set in the env spec is ignored with a warning. |
+| `internal` | Fixed variables set by the app author. Identical across all environments; an env spec value for one is ignored with a warning. |
+
+A deployment that sets a variable the app spec does not declare at all gets a warning too, except on a `local` environment, where `simpled test` suites can read it.
 
 All sections accept entries in two forms:
 - `VAR_NAME` — no default; must be supplied by the environment (for `external`) or left unset (for `optional`)
