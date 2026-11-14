@@ -87,6 +87,10 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
         }
     }
 
+    for warning in unused_deployment_secrets(deployment, app_spec, &env_spec.env_type) {
+        eprintln!("Warning: {}", warning);
+    }
+
     // Check configs
     for config in &app_spec.configs {
         let deployment_config = deployment
@@ -238,6 +242,63 @@ fn ignored_environment_values(
                 deployment.name, name, name
             ));
         }
+    }
+    warnings
+}
+
+/// Deployment `secrets:` nothing reads: not declared by the app spec (so no
+/// service mounts it) and not named by a `$secret(...)` reference. Usually a
+/// misspelling, and since an optional secret may be left out, one that would
+/// otherwise deploy with the feature silently off. Locally such a secret can
+/// still feed a testspec suite, so it is only reported elsewhere.
+fn unused_deployment_secrets(
+    deployment: &DeploymentSpec,
+    app_spec: &AppSpec,
+    env_type: &DeploymentEnvType,
+) -> Vec<String> {
+    if *env_type == DeploymentEnvType::Local {
+        return Vec::new();
+    }
+    let provided: HashSet<&String> = deployment.secrets.iter().map(|s| &s.secret_name).collect();
+    let mut omitted: Vec<&str> = app_spec
+        .secrets
+        .iter()
+        .filter(|s| s.optional && !provided.contains(&s.secret_name))
+        .map(|s| s.secret_name.as_str())
+        .collect();
+    omitted.sort();
+    omitted.dedup();
+
+    let mut seen = HashSet::new();
+    let mut warnings = Vec::new();
+    for secret in &deployment.secrets {
+        let name = &secret.secret_name;
+        if !seen.insert(name) {
+            continue;
+        }
+        let reference = format!("$secret({})", name);
+        let used = app_spec.secrets.iter().any(|s| &s.secret_name == name)
+            || deployment
+                .environment
+                .iter()
+                .chain(&deployment.undockerized_environment)
+                .any(|var| var.value.contains(&reference));
+        if used {
+            continue;
+        }
+        let mut warning = format!(
+            "deployment '{}' provides secret {}, which the app spec does not declare, so nothing reads it. \
+             Declare {} under secrets in the app spec, or remove it from the env spec.",
+            deployment.name, name, name
+        );
+        if !omitted.is_empty() {
+            warning.push_str(&format!(
+                " If the name is misspelled: the deployment leaves out the app's optional secret{} {}.",
+                if omitted.len() == 1 { "" } else { "s" },
+                omitted.join(", ")
+            ));
+        }
+        warnings.push(warning);
     }
     warnings
 }
@@ -728,6 +789,78 @@ deployments:
             );
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("sets PORT"));
+        }
+
+        const APP_WITH_SECRETS: &str = "secrets:\n  db_password:\n  sendgrid_apikey:\n    optional: true\n";
+
+        fn unused_secrets(app: &str, env_yaml: &str) -> Vec<String> {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(env_yaml, root.path());
+            let deployment = env.deployment("prod").unwrap();
+            unused_deployment_secrets(deployment, &app_spec(app), &env.env_type)
+        }
+
+        #[test]
+        fn a_misspelled_optional_secret_is_reported() {
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_api_key: key"),
+            );
+            assert_eq!(
+                warnings,
+                [
+                    "deployment 'prod' provides secret sendgrid_api_key, which the app spec does not declare, so \
+                     nothing reads it. Declare sendgrid_api_key under secrets in the app spec, or remove it from the \
+                     env spec. If the name is misspelled: the deployment leaves out the app's optional secret \
+                     sendgrid_apikey."
+                ]
+            );
+        }
+
+        #[test]
+        fn an_undeclared_secret_gets_no_hint_when_no_optional_secret_is_left_out() {
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey: key\n      stray: x"),
+            );
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("provides secret stray"), "{:?}", warnings);
+            assert!(!warnings[0].contains("misspelled"), "{:?}", warnings);
+        }
+
+        #[test]
+        fn declared_and_referenced_secrets_are_not_reported() {
+            // `pg_password` only feeds a `$secret(...)` reference.
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                &k8s_env(
+                    "    environment:\n      - DB_URL=postgres://u:$secret(pg_password)@db\n    secrets:\n      \
+                     db_password: pw\n      pg_password: pg",
+                ),
+            );
+            assert!(warnings.is_empty(), "{:?}", warnings);
+        }
+
+        #[test]
+        fn a_local_deployment_may_provide_undeclared_secrets_for_test_suites() {
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    secrets:
+      db_password: pw
+      e2e_admin_token: t
+"#,
+            );
+            assert!(warnings.is_empty(), "{:?}", warnings);
         }
 
         #[test]

@@ -698,16 +698,24 @@ impl ServiceResolver<'_> {
         for sec in &app_service.secrets {
             let secret_name = format!("{}-{}", app_spec.name, sec.name);
             if !self.secrets.iter().any(|s| s.name == secret_name) {
-                // An optional secret the deployment leaves out is simply not
+                // The deployment leaves the secret out. The app spec only lets
+                // a service mount a declared secret and the validator insists on
+                // every required one, so this one is optional and is simply not
                 // mounted: the service gets neither the file nor the variable.
-                if app_spec.secrets.iter().any(|s| s.secret_name == sec.name && s.optional) {
-                    continue;
+                // The error is for a caller that skipped the validator.
+                if app_spec
+                    .secrets
+                    .iter()
+                    .any(|s| s.secret_name == sec.name && !s.optional)
+                {
+                    return Err(anyhow!(
+                        "Service {} mounts secret {}, which deployment {} does not provide",
+                        app_service.name,
+                        sec.name,
+                        deployment.name
+                    ));
                 }
-                return Err(anyhow!(
-                    "Service {} references undefined secret {}",
-                    app_service.name,
-                    secret_name
-                ));
+                continue;
             }
             service_secrets.push(ServiceSecret {
                 name: secret_name,

@@ -107,7 +107,7 @@ extra_services:
 | `export` | object | no | Default `host` and `prefix` for this service. |
 | `environment` | list | no | Variables to inject. Use `$all` to pass everything. Individual entries can override with `NAME=value`. |
 | `configs` | list | no | Config groups to mount. Format: `- config-name: /mount/path`. |
-| `secrets` | list | no | Secrets to provide. See below. |
+| `secrets` | list | no | Secrets to mount, each declared in the top-level [`secrets`](#secrets). See below. |
 | `ports` | list | no | Ports to expose. On Kubernetes they become the Service's ports; a service without ports gets no Service object. |
 | `volumes` | list | no | Volume mounts. Named volumes must be declared in the top-level `volumes:` list. |
 | `depends_on` | list | no | Services that must be running before this one starts. Drives the ordering of the generated Docker deploy scripts and the local compose file; ignored for Kubernetes. Cycles are rejected. For a `job`, leaving it out means every long-running service, and an explicit `[]` means nothing in the stack (its dependencies are external). A deployment may replace the list in `envspec.yaml`. |
@@ -246,6 +246,8 @@ secrets:
 
 Values are never stored in `appspec.yaml`. They are provided by the deployment environment in `envspec.yaml`.
 
+A service can mount only a secret declared here; a mount of any other name is rejected when the app spec is read. A plain list of names (`secrets: [db_password, api_key]`) is accepted too, but only the map form can mark a secret optional.
+
 A deployment must provide every declared secret, unless the secret is marked optional:
 
 ```yaml
@@ -256,6 +258,8 @@ secrets:
 ```
 
 A deployment that leaves an optional secret out deploys without it: every service that mounts it gets neither the file nor the variable, so the app should treat a missing `/secrets/sendgrid_apikey` (or an unset variable) as "feature off". A deployment that does list an optional secret must resolve it like any other: an unset `env:` variable, a missing file or a missing AWS secret is still an error. `optional` is the only option a secret takes; an unknown key is rejected.
+
+Optional is about services only. A deployment `environment` value that names a left-out secret with `$secret(...)` still fails, so drop that variable too, and a [test suite](#testspecyaml) that uses the secret still needs the deployment to provide it.
 
 ---
 
@@ -1109,7 +1113,7 @@ deployments:
 
 #### secrets
 
-Each secret must match a name declared in `appspec.yaml`. Exactly one source must be provided:
+Each secret should match a name declared in `appspec.yaml`. Outside `local` environments, a secret that the app spec does not declare and no `$secret(...)` reference names is reported as a warning: nothing reads it, and it is usually a misspelling of an optional secret, which would otherwise deploy with the feature off. Exactly one source must be provided:
 
 | Form | Description |
 |------|-------------|

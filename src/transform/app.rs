@@ -97,6 +97,17 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
                 }
             }
         }
+        // Whether a secret may be left out is decided by its declaration, so a
+        // mount of an undeclared one has no answer; reject it here, once.
+        for secret in &svc.secrets {
+            if !secrets.iter().any(|s| s.secret_name == secret.name) {
+                return Err(anyhow!(
+                    "Service '{}' mounts secret '{}' which is not declared in app secrets",
+                    svc.name,
+                    secret.name
+                ));
+            }
+        }
     }
 
     Ok(AppSpec {
@@ -237,12 +248,21 @@ fn secret_is_optional(name: &str, options: Option<serde_yaml::Value>) -> Result<
         match (key.as_str(), value) {
             (Some("optional"), serde_yaml::Value::Bool(b)) => optional = b,
             (Some("optional"), _) => return Err(anyhow!("Secret {}: optional must be true or false", name)),
-            (key, _) => {
+            (Some(unknown), _) => {
                 return Err(anyhow!(
                     "Secret {}: unknown option {}; the only option is optional",
                     name,
-                    key.map(str::to_string).unwrap_or_else(|| format!("{:?}", key))
+                    unknown
                 ))
+            }
+            // A key that is not a string (`1:`, `true:`), shown as it was written.
+            (None, _) => {
+                let written = serde_yaml::to_string(&key).unwrap_or_else(|_| format!("{:?}", key));
+                return Err(anyhow!(
+                    "Secret {}: unknown option {}; the only option is optional",
+                    name,
+                    written.trim()
+                ));
             }
         }
     }
@@ -548,6 +568,21 @@ environment:
 
         let scalar = "name: app\nversion: 1.0.0\nsecrets:\n  a: true\n";
         assert!(convert_err(scalar).contains("options must be a map"));
+
+        let not_a_string = "name: app\nversion: 1.0.0\nsecrets:\n  a:\n    1: true\n";
+        assert!(convert_err(not_a_string).contains("Secret a: unknown option 1;"));
+    }
+
+    #[test]
+    fn a_service_can_only_mount_a_declared_secret() {
+        let raw = "name: app\nversion: 1.0.0\nsecrets:\n  - a\napp_services:\n  api:\n    image: a\n    secrets:\n      - a\n      - b\n";
+        assert_eq!(
+            convert_err(raw),
+            "Service 'api' mounts secret 'b' which is not declared in app secrets"
+        );
+
+        let extra = "name: app\nversion: 1.0.0\nextra_services:\n  cache:\n    image: redis:7\n    secrets:\n      - cache_password\n";
+        assert!(convert_err(extra).contains("Service 'cache' mounts secret 'cache_password'"));
     }
 
     #[test]
