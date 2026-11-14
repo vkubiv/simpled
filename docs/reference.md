@@ -1113,7 +1113,7 @@ deployments:
 
 #### secrets
 
-Each secret should match a name declared in `appspec.yaml`. Outside `local` environments, a secret that the app spec does not declare and no `$secret(...)` reference names is reported as a warning: nothing reads it, and it is usually a misspelling of an optional secret, which would otherwise deploy with the feature off. Exactly one source must be provided:
+Each secret should match a name declared in `appspec.yaml`. Outside `local` environments, a secret that nothing reads is reported as a warning: one the app spec does not declare, or an optional one that none of the deployment's services mounts, unless a `$secret(...)` reference names it. It is usually a misspelling of an optional secret, which would otherwise deploy with the feature off. Exactly one source must be provided:
 
 | Form | Description |
 |------|-------------|
@@ -1984,7 +1984,7 @@ calls to the simpled binary shipped next to it:
 | `./simpled step run-job <plan> <job>` | Runs a job as a `replicated-job` service, waits until it completes or fails, prints its logs and removes the service. `JOB_TIMEOUT` (seconds, default 600) limits the wait. |
 | `./simpled step prune-images` | Removes the images no container uses on every node: a `global-job` service of the controller image (`SIMPLED_CONTROLLER_IMAGE` overrides it) with the Docker socket mounted, waited for up to 5 minutes and then removed. If it fails, `deploy.sh` prunes only its own node and carries on. Images of stopped containers stay until Swarm drops those tasks, so the swarm's task history limit (`docker swarm update --task-history-limit 2`) bounds how many old releases each node keeps. |
 | `./simpled step check-gateway <plan>` | Before the gateway is redeployed: refuses to replace a newer simpled's gateway, and prints how its routing changes. |
-| `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy. |
+| `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy and, under the deploy lock, those the deployment no longer uses. |
 
 A step that sets variables for the rest of the script prints `export` lines, which
 `deploy.sh` captures and then evaluates, so a failing step stops the script.
@@ -2093,7 +2093,12 @@ Swarm objects cannot be changed, so each one is named after its content:
    service still uses, so that one stays too. A config or secret the deployment no
    longer uses at all (its base name left the plan) is removed entirely, except one
    a service's previous spec still mounts, for `docker service rollback`; that one
-   goes on the next deploy. Pruning only touches objects labelled with the
+   goes on the next deploy. This removal needs the swarm's deploy lock, which
+   `deploy.sh` holds: an object another deploy has just created and not yet
+   mounted looks the same, and the lock is what rules that deploy out. Run by
+   hand without the lock, `./simpled step prune-objects` leaves those objects
+   alone, and so does a deploy that cannot read the services' previous specs;
+   neither fails, and the next deploy removes them. Pruning only touches objects labelled with the
    deployment being deployed (`simpled.deployment=<name>`), or, for the gateway's
    files, `simpled.scope=environment`. The gateway's certificate secrets carry that
    owner label but no `simpled.object` label, so pruning leaves them to the

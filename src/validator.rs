@@ -246,9 +246,9 @@ fn ignored_environment_values(
     warnings
 }
 
-/// Deployment `secrets:` nothing reads: not declared by the app spec (so no
-/// service mounts it) and not named by a `$secret(...)` reference. Usually a
-/// misspelling, and since an optional secret may be left out, one that would
+/// Deployment `secrets:` nothing reads: not named by a `$secret(...)`
+/// reference, and either not declared by the app spec or an optional secret no
+/// service of the deployment mounts. Usually a misspelling, and since an optional secret may be left out, one that would
 /// otherwise deploy with the feature silently off. Locally such a secret can
 /// still feed a testspec suite, so it is only reported elsewhere.
 fn unused_deployment_secrets(
@@ -277,20 +277,38 @@ fn unused_deployment_secrets(
             continue;
         }
         let reference = format!("$secret({})", name);
-        let used = app_spec.secrets.iter().any(|s| &s.secret_name == name)
-            || deployment
-                .environment
-                .iter()
-                .chain(&deployment.undockerized_environment)
-                .any(|var| var.value.contains(&reference));
-        if used {
+        if deployment
+            .environment
+            .iter()
+            .chain(&deployment.undockerized_environment)
+            .any(|var| var.value.contains(&reference))
+        {
             continue;
         }
-        let mut warning = format!(
-            "deployment '{}' provides secret {}, which the app spec does not declare, so nothing reads it. \
-             Declare {} under secrets in the app spec, or remove it from the env spec.",
-            deployment.name, name, name
-        );
+        let mut warning = match app_spec.secrets.iter().find(|s| &s.secret_name == name) {
+            None => format!(
+                "deployment '{}' provides secret {}, which the app spec does not declare, so nothing reads it. \
+                 Declare {} under secrets in the app spec, or remove it from the env spec.",
+                deployment.name, name, name
+            ),
+            // A required secret has to be listed whether or not a service
+            // mounts it, so there is nothing the env spec could change.
+            Some(declared) if !declared.optional => continue,
+            Some(_) => {
+                let mounted = app_spec
+                    .all_services()
+                    .filter(|svc| !deployment.exclude_services.contains(&svc.name))
+                    .any(|svc| svc.secrets.iter().any(|s| &s.name == name));
+                if mounted {
+                    continue;
+                }
+                format!(
+                    "deployment '{}' provides the optional secret {}, but none of its services mounts it, so \
+                     nothing reads it. Mount {} on a service in the app spec, or remove it from the env spec.",
+                    deployment.name, name, name
+                )
+            }
+        };
         if !omitted.is_empty() {
             warning.push_str(&format!(
                 " If the name is misspelled: the deployment leaves out the app's optional secret{} {}.",
@@ -820,7 +838,7 @@ deployments:
         #[test]
         fn an_undeclared_secret_gets_no_hint_when_no_optional_secret_is_left_out() {
             let warnings = unused_secrets(
-                &format!("{APP}{APP_WITH_SECRETS}"),
+                &format!("{APP}    secrets:\n      - sendgrid_apikey\n{APP_WITH_SECRETS}"),
                 &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey: key\n      stray: x"),
             );
             assert_eq!(warnings.len(), 1);
@@ -837,6 +855,36 @@ deployments:
                     "    environment:\n      - DB_URL=postgres://u:$secret(pg_password)@db\n    secrets:\n      \
                      db_password: pw\n      pg_password: pg",
                 ),
+            );
+            assert!(warnings.is_empty(), "{:?}", warnings);
+        }
+
+        #[test]
+        fn an_optional_secret_no_service_mounts_is_reported() {
+            // Two optional secrets, and the deployment lists the one `api` does
+            // not mount: the wrong name is a declared one.
+            let app = format!(
+                "{APP}    secrets:\n      - sendgrid_apikey\nsecrets:\n  db_password:\n  sendgrid_apikey:\n    \
+                 optional: true\n  sendgrid_apikey_v2:\n    optional: true\n"
+            );
+            let warnings = unused_secrets(
+                &app,
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey_v2: key"),
+            );
+            assert_eq!(
+                warnings,
+                [
+                    "deployment 'prod' provides the optional secret sendgrid_apikey_v2, but none of its services \
+                     mounts it, so nothing reads it. Mount sendgrid_apikey_v2 on a service in the app spec, or \
+                     remove it from the env spec. If the name is misspelled: the deployment leaves out the app's \
+                     optional secret sendgrid_apikey."
+                ]
+            );
+
+            // The one `api` mounts is fine, and so is the required one nobody mounts.
+            let warnings = unused_secrets(
+                &app,
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey: key"),
             );
             assert!(warnings.is_empty(), "{:?}", warnings);
         }

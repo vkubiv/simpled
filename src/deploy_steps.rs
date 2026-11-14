@@ -495,7 +495,10 @@ pub fn stack_images(compose: &str, lookup: &dyn Fn(&str) -> Option<String>) -> V
 /// one and the previous one, which a `docker service rollback` still mounts.
 /// Docker refuses to remove an object a service still uses, so an older one in
 /// use stays too. Only objects carrying the plan's owner label are touched.
-pub fn prune_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
+///
+/// `lock_token` is the deploy lock this deploy took, if any: objects that left
+/// the plan are only removed under it, see [`prune_orphaned_objects`].
+pub fn prune_objects(docker: &dyn Docker, plan: &Plan, lock_token: Option<&str>) -> Result<()> {
     for object in &plan.objects {
         let kind = kind_command(object.kind);
         let ids = checked(
@@ -532,7 +535,7 @@ pub fn prune_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
             }
         }
     }
-    prune_orphaned_objects(docker, plan)
+    prune_orphaned_objects(docker, plan, lock_token)
 }
 
 /// Removes the owner's objects whose base name is no longer in the plan: a
@@ -541,7 +544,14 @@ pub fn prune_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
 /// The one exception is an object a service's previous spec still mounts, which
 /// `docker service rollback` needs, the same guarantee [`prune_objects`] gives
 /// for bases still in use; it goes on the next deploy.
-fn prune_orphaned_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
+///
+/// "Not in the plan and not mounted" is also what an object looks like between
+/// another deploy's `sync-objects` and its `docker stack deploy`, and the
+/// gateway's objects are shared by every deployment. So this only runs for the
+/// deploy that holds the swarm's deploy lock, when no other deploy can be at
+/// that point. Without the lock nothing is removed, and nothing fails either:
+/// the objects go on the next deploy.
+fn prune_orphaned_objects(docker: &dyn Docker, plan: &Plan, lock_token: Option<&str>) -> Result<()> {
     let mut rollback: Option<Vec<String>> = None;
     for kind in [ObjectKind::Secret, ObjectKind::Config] {
         let kind = kind_command(kind);
@@ -564,7 +574,18 @@ fn prune_orphaned_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
                 continue;
             }
             if rollback.is_none() {
-                rollback = Some(previous_spec_objects(docker)?);
+                // The first orphan: only now is there anything to decide.
+                if !holds_lock(docker, lock_token)? {
+                    eprintln!(
+                        "Not removing the objects the deployment no longer uses: that needs the swarm's deploy \
+                         lock, which deploy.sh holds while it runs. They are removed by the next deploy."
+                    );
+                    return Ok(());
+                }
+                let Some(names) = previous_spec_objects(docker)? else {
+                    return Ok(());
+                };
+                rollback = Some(names);
             }
             if rollback.as_ref().is_some_and(|names| names.iter().any(|n| n == name)) {
                 continue;
@@ -579,22 +600,47 @@ fn prune_orphaned_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
 
 /// The names of the secrets and configs mounted by the previous spec of any
 /// service on the swarm, the spec `docker service rollback` returns to.
-fn previous_spec_objects(docker: &dyn Docker) -> Result<Vec<String>> {
+///
+/// `None` when they cannot all be read, for one a service that was removed
+/// between the listing and the inspect, which makes `docker service inspect`
+/// fail as a whole. Nothing may be removed without knowing what a rollback
+/// needs, but a deploy that got this far has succeeded, so this is reported and
+/// left to the next deploy rather than failing the step.
+fn previous_spec_objects(docker: &dyn Docker) -> Result<Option<Vec<String>>> {
     let ids = checked(docker, &["service", "ls", "-q"])?;
     let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if ids.is_empty() {
-        return Ok(vec![]);
+        return Ok(Some(vec![]));
     }
+    // `with` rather than a plain path: a service of a plugin or a network
+    // attachment has no ContainerSpec, and a path through nil fails the template.
     let mut args = vec![
         "service",
         "inspect",
         "--format",
-        "{{if .PreviousSpec}}{{range .PreviousSpec.TaskTemplate.ContainerSpec.Secrets}}{{.SecretName}} {{end}}\
-         {{range .PreviousSpec.TaskTemplate.ContainerSpec.Configs}}{{.ConfigName}} {{end}}{{end}}",
+        "{{with .PreviousSpec}}{{with .TaskTemplate.ContainerSpec}}\
+         {{range .Secrets}}{{.SecretName}} {{end}}{{range .Configs}}{{.ConfigName}} {{end}}\
+         {{end}}{{end}}",
     ];
     args.extend(ids);
-    let listing = checked(docker, &args)?;
-    Ok(listing.split_whitespace().map(str::to_string).collect())
+    let output = docker.run(&args)?;
+    if !output.success {
+        eprintln!(
+            "Not removing the objects the deployment no longer uses: cannot read what a rollback still needs \
+             ({}). They are removed by the next deploy.",
+            output.stderr.trim()
+        );
+        return Ok(None);
+    }
+    Ok(Some(output.stdout.split_whitespace().map(str::to_string).collect()))
+}
+
+/// Whether the swarm's deploy lock is held, and with `token`.
+fn holds_lock(docker: &dyn Docker, token: Option<&str>) -> Result<bool> {
+    let Some(token) = token else {
+        return Ok(false);
+    };
+    Ok(lock_holder(docker)?.is_some_and(|holder| holder.token == token))
 }
 
 // ---------------------------------------------------------------- run-job
@@ -1264,7 +1310,7 @@ mod tests {
             ),
             ("config rm prod_cfg_a", false, ""),
         ]);
-        prune_objects(&docker, &plan).unwrap();
+        prune_objects(&docker, &plan, None).unwrap();
         let removed: Vec<String> = docker
             .calls()
             .into_iter()
@@ -1291,10 +1337,11 @@ mod tests {
                 true,
                 "prod_oldcfg_eee prod_oldcfg\n",
             ),
+            ("config inspect simpled_deploy_lock", true, HELD_BY_ABC),
             ("service ls -q", true, "s1\ns2\n"),
             ("service inspect", true, "prod_gone_ccc prod_key_aaa \n\n"),
         ]);
-        prune_objects(&docker, &plan).unwrap();
+        prune_objects(&docker, &plan, Some("abc")).unwrap();
         let removed: Vec<String> = docker.calls().into_iter().filter(|c| c.contains(" rm ")).collect();
         assert_eq!(removed, vec!["secret rm prod_gone_bbb", "config rm prod_oldcfg_eee"]);
         // The previous specs are read once, for both kinds.
@@ -1308,6 +1355,58 @@ mod tests {
         );
     }
 
+    const HELD_BY_ABC: &str = r#"{"simpled.lock.deployment":"prod","simpled.lock.host":"ci-3","simpled.lock.since":"100","simpled.lock.token":"abc"}"#;
+
+    /// The answers for a swarm holding `prod_key` and the orphan `prod_gone_bbb`.
+    fn with_an_orphan<'a>(more: &[(&'a str, bool, &'a str, &'a str)]) -> Vec<(&'a str, bool, &'a str, &'a str)> {
+        let mut answers = vec![(
+            "secret ls --filter label=simpled.deployment=prod --format",
+            true,
+            "prod_key_aaa prod_key\nprod_gone_bbb prod_gone\n",
+            "",
+        )];
+        answers.extend_from_slice(more);
+        answers
+    }
+
+    #[test]
+    fn orphans_are_only_removed_under_this_deploys_lock() {
+        let plan = plan(vec![object(ObjectKind::Secret, "prod_key", "f", "V")]);
+        let held = ("config inspect simpled_deploy_lock", true, HELD_BY_ABC, "");
+        let no_lock = ("config inspect simpled_deploy_lock", false, "", "no such config");
+
+        // Run by hand without a token, under another deploy's lock, with no lock at all.
+        for (token, lock) in [(None, held), (Some("other"), held), (Some("abc"), no_lock)] {
+            let docker = FakeDocker::with_stderr(&with_an_orphan(&[lock]));
+            prune_objects(&docker, &plan, token).unwrap();
+            let calls = docker.calls();
+            assert!(!calls.iter().any(|c| c.contains(" rm ")), "{:?}", calls);
+            assert!(!calls.iter().any(|c| c.starts_with("service")), "{:?}", calls);
+        }
+
+        let docker = FakeDocker::with_stderr(&with_an_orphan(&[held]));
+        prune_objects(&docker, &plan, Some("abc")).unwrap();
+        assert!(docker.calls().iter().any(|c| c == "secret rm prod_gone_bbb"));
+    }
+
+    #[test]
+    fn unreadable_previous_specs_leave_the_orphans_and_do_not_fail_the_deploy() {
+        let plan = plan(vec![object(ObjectKind::Secret, "prod_key", "f", "V")]);
+        let docker = FakeDocker::with_stderr(&with_an_orphan(&[
+            ("config inspect simpled_deploy_lock", true, HELD_BY_ABC, ""),
+            ("service ls -q", true, "s1\ns2\n", ""),
+            // s2 was removed after the listing: docker prints s1 and still fails.
+            (
+                "service inspect",
+                false,
+                "prod_key_aaa \n",
+                "Error: No such service: s2",
+            ),
+        ]));
+        prune_objects(&docker, &plan, Some("abc")).unwrap();
+        assert!(!docker.calls().iter().any(|c| c.contains(" rm ")));
+    }
+
     #[test]
     fn nothing_orphaned_means_no_service_lookup() {
         let plan = plan(vec![object(ObjectKind::Secret, "prod_key", "f", "V")]);
@@ -1316,7 +1415,7 @@ mod tests {
             true,
             "prod_key_aaa prod_key\n",
         )]);
-        prune_objects(&docker, &plan).unwrap();
+        prune_objects(&docker, &plan, None).unwrap();
         assert!(!docker.calls().iter().any(|c| c.starts_with("service")));
     }
 
