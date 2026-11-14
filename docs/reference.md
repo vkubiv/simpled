@@ -2086,9 +2086,14 @@ Swarm objects cannot be changed, so each one is named after its content:
 5. After every stack has deployed, `deploy.sh` removes older objects: of each base
    name it keeps the two newest, the current one and the previous one, which
    `docker service rollback` still needs. Docker refuses to remove an object a
-   service still uses, so that one stays too. Pruning only touches objects labelled
-   with the deployment being deployed (`simpled.deployment=<name>`), or, for the
-   gateway's files, `simpled.scope=environment`.
+   service still uses, so that one stays too. A config or secret the deployment no
+   longer uses at all (its base name left the plan) is removed entirely, except one
+   a service's previous spec still mounts, for `docker service rollback`; that one
+   goes on the next deploy. Pruning only touches objects labelled with the
+   deployment being deployed (`simpled.deployment=<name>`), or, for the gateway's
+   files, `simpled.scope=environment`. The gateway's certificate secrets carry that
+   owner label but no `simpled.object` label, so pruning leaves them to the
+   controller.
 
 A config file or secret larger than 500 KB, Swarm's limit for one object, fails
 `prepare-deployment`.

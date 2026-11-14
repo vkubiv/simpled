@@ -532,7 +532,69 @@ pub fn prune_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
             }
         }
     }
+    prune_orphaned_objects(docker, plan)
+}
+
+/// Removes the owner's objects whose base name is no longer in the plan: a
+/// secret or config the deployment stopped using. Pruning by base alone never
+/// looks at those, so they would stay forever, a secret still holding its value.
+/// The one exception is an object a service's previous spec still mounts, which
+/// `docker service rollback` needs, the same guarantee [`prune_objects`] gives
+/// for bases still in use; it goes on the next deploy.
+fn prune_orphaned_objects(docker: &dyn Docker, plan: &Plan) -> Result<()> {
+    let mut rollback: Option<Vec<String>> = None;
+    for kind in [ObjectKind::Secret, ObjectKind::Config] {
+        let kind = kind_command(kind);
+        let listing = checked(
+            docker,
+            &[
+                kind,
+                "ls",
+                "--filter",
+                &format!("label={}", plan.owner_label),
+                "--format",
+                "{{.Name}} {{.Label \"simpled.object\"}}",
+            ],
+        )?;
+        for line in listing.lines() {
+            let Some((name, base)) = line.trim().split_once(' ') else {
+                continue;
+            };
+            if base.is_empty() || plan.objects.iter().any(|o| o.base == base) {
+                continue;
+            }
+            if rollback.is_none() {
+                rollback = Some(previous_spec_objects(docker)?);
+            }
+            if rollback.as_ref().is_some_and(|names| names.iter().any(|n| n == name)) {
+                continue;
+            }
+            if docker.run(&[kind, "rm", name])?.success {
+                eprintln!("Removed {} {}, which the deployment no longer uses", kind, name);
+            }
+        }
+    }
     Ok(())
+}
+
+/// The names of the secrets and configs mounted by the previous spec of any
+/// service on the swarm, the spec `docker service rollback` returns to.
+fn previous_spec_objects(docker: &dyn Docker) -> Result<Vec<String>> {
+    let ids = checked(docker, &["service", "ls", "-q"])?;
+    let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut args = vec![
+        "service",
+        "inspect",
+        "--format",
+        "{{if .PreviousSpec}}{{range .PreviousSpec.TaskTemplate.ContainerSpec.Secrets}}{{.SecretName}} {{end}}\
+         {{range .PreviousSpec.TaskTemplate.ContainerSpec.Configs}}{{.ConfigName}} {{end}}{{end}}",
+    ];
+    args.extend(ids);
+    let listing = checked(docker, &args)?;
+    Ok(listing.split_whitespace().map(str::to_string).collect())
 }
 
 // ---------------------------------------------------------------- run-job
@@ -1212,6 +1274,50 @@ mod tests {
         assert!(
             docker.calls()[0].contains("--filter label=simpled.deployment=prod --filter label=simpled.object=prod_cfg")
         );
+    }
+
+    #[test]
+    fn pruning_removes_objects_whose_base_left_the_plan_unless_a_rollback_needs_them() {
+        let plan = plan(vec![object(ObjectKind::Secret, "prod_key", "f", "V")]);
+        let docker = FakeDocker::new(&[
+            ("secret ls -q", true, "k1\n"),
+            (
+                "secret ls --filter label=simpled.deployment=prod --format",
+                true,
+                "prod_key_aaa prod_key\nprod_gone_bbb prod_gone\nprod_gone_ccc prod_gone\nunlabelled_ddd \n",
+            ),
+            (
+                "config ls --filter label=simpled.deployment=prod --format",
+                true,
+                "prod_oldcfg_eee prod_oldcfg\n",
+            ),
+            ("service ls -q", true, "s1\ns2\n"),
+            ("service inspect", true, "prod_gone_ccc prod_key_aaa \n\n"),
+        ]);
+        prune_objects(&docker, &plan).unwrap();
+        let removed: Vec<String> = docker.calls().into_iter().filter(|c| c.contains(" rm ")).collect();
+        assert_eq!(removed, vec!["secret rm prod_gone_bbb", "config rm prod_oldcfg_eee"]);
+        // The previous specs are read once, for both kinds.
+        assert_eq!(
+            docker
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("service inspect"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nothing_orphaned_means_no_service_lookup() {
+        let plan = plan(vec![object(ObjectKind::Secret, "prod_key", "f", "V")]);
+        let docker = FakeDocker::new(&[(
+            "secret ls --filter label=simpled.deployment=prod --format",
+            true,
+            "prod_key_aaa prod_key\n",
+        )]);
+        prune_objects(&docker, &plan).unwrap();
+        assert!(!docker.calls().iter().any(|c| c.starts_with("service")));
     }
 
     fn job() -> PlanJob {
