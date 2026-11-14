@@ -107,7 +107,7 @@ extra_services:
 | `export` | object | no | Default `host` and `prefix` for this service. |
 | `environment` | list | no | Variables to inject. Use `$all` to pass everything. Individual entries can override with `NAME=value`. |
 | `configs` | list | no | Config groups to mount. Format: `- config-name: /mount/path`. |
-| `secrets` | list | no | Secrets to provide. See below. |
+| `secrets` | list | no | Secrets to mount, each declared in the top-level [`secrets`](#secrets). See below. |
 | `ports` | list | no | Ports to expose. On Kubernetes they become the Service's ports; a service without ports gets no Service object. |
 | `volumes` | list | no | Volume mounts. Named volumes must be declared in the top-level `volumes:` list. |
 | `depends_on` | list | no | Services that must be running before this one starts. Drives the ordering of the generated Docker deploy scripts and the local compose file; ignored for Kubernetes. Cycles are rejected. For a `job`, leaving it out means every long-running service, and an explicit `[]` means nothing in the stack (its dependencies are external). A deployment may replace the list in `envspec.yaml`. |
@@ -245,6 +245,21 @@ secrets:
 ```
 
 Values are never stored in `appspec.yaml`. They are provided by the deployment environment in `envspec.yaml`.
+
+A service can mount only a secret declared here; a mount of any other name is rejected when the app spec is read. A plain list of names (`secrets: [db_password, api_key]`) is accepted too, but only the map form can mark a secret optional.
+
+A deployment must provide every declared secret, unless the secret is marked optional:
+
+```yaml
+secrets:
+  db_password:
+  sendgrid_apikey:
+    optional: true   # a deployment may leave it out
+```
+
+A deployment that leaves an optional secret out deploys without it: every service that mounts it gets neither the file nor the variable, so the app should treat a missing `/secrets/sendgrid_apikey` (or an unset variable) as "feature off". A deployment that does list an optional secret must resolve it like any other: an unset `env:` variable, a missing file or a missing AWS secret is still an error. `optional` is the only option a secret takes; an unknown key is rejected.
+
+Optional is about services only. A deployment `environment` value that names a left-out secret with `$secret(...)` still fails, so drop that variable too, and a [test suite](#testspecyaml) that uses the secret still needs the deployment to provide it.
 
 ---
 
@@ -1098,7 +1113,7 @@ deployments:
 
 #### secrets
 
-Each secret must match a name declared in `appspec.yaml`. Exactly one source must be provided:
+Each secret should match a name declared in `appspec.yaml`. Outside `local` environments, a secret that nothing reads is reported as a warning: one the app spec does not declare, or an optional one that none of the deployment's services mounts, unless a `$secret(...)` reference names it. It is usually a misspelling of an optional secret, which would otherwise deploy with the feature off. Exactly one source must be provided:
 
 | Form | Description |
 |------|-------------|
@@ -1969,7 +1984,7 @@ calls to the simpled binary shipped next to it:
 | `./simpled step run-job <plan> <job>` | Runs a job as a `replicated-job` service, waits until it completes or fails, prints its logs and removes the service. `JOB_TIMEOUT` (seconds, default 600) limits the wait. |
 | `./simpled step prune-images` | Removes the images no container uses on every node: a `global-job` service of the controller image (`SIMPLED_CONTROLLER_IMAGE` overrides it) with the Docker socket mounted, waited for up to 5 minutes and then removed. If it fails, `deploy.sh` prunes only its own node and carries on. Images of stopped containers stay until Swarm drops those tasks, so the swarm's task history limit (`docker swarm update --task-history-limit 2`) bounds how many old releases each node keeps. |
 | `./simpled step check-gateway <plan>` | Before the gateway is redeployed: refuses to replace a newer simpled's gateway, and prints how its routing changes. |
-| `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy. |
+| `./simpled step prune-objects <plan>` | Removes configs and secrets older than the previous deploy and, under the deploy lock, those the deployment no longer uses. |
 
 A step that sets variables for the rest of the script prints `export` lines, which
 `deploy.sh` captures and then evaluates, so a failing step stops the script.
@@ -2075,9 +2090,19 @@ Swarm objects cannot be changed, so each one is named after its content:
 5. After every stack has deployed, `deploy.sh` removes older objects: of each base
    name it keeps the two newest, the current one and the previous one, which
    `docker service rollback` still needs. Docker refuses to remove an object a
-   service still uses, so that one stays too. Pruning only touches objects labelled
-   with the deployment being deployed (`simpled.deployment=<name>`), or, for the
-   gateway's files, `simpled.scope=environment`.
+   service still uses, so that one stays too. A config or secret the deployment no
+   longer uses at all (its base name left the plan) is removed entirely, except one
+   a service's previous spec still mounts, for `docker service rollback`; that one
+   goes on the next deploy. This removal needs the swarm's deploy lock, which
+   `deploy.sh` holds: an object another deploy has just created and not yet
+   mounted looks the same, and the lock is what rules that deploy out. Run by
+   hand without the lock, `./simpled step prune-objects` leaves those objects
+   alone, and so does a deploy that cannot read the services' previous specs;
+   neither fails, and the next deploy removes them. Pruning only touches objects labelled with the
+   deployment being deployed (`simpled.deployment=<name>`), or, for the gateway's
+   files, `simpled.scope=environment`. The gateway's certificate secrets carry that
+   owner label but no `simpled.object` label, so pruning leaves them to the
+   controller.
 
 A config file or secret larger than 500 KB, Swarm's limit for one object, fails
 `prepare-deployment`.

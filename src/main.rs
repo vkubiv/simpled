@@ -271,7 +271,8 @@ enum StepCommands {
     /// Creates the plan's configs and secrets under their content-addressed names,
     /// and prints an `export` line naming each one
     SyncObjects { plan: std::path::PathBuf },
-    /// Removes the plan's configs and secrets older than the previous deploy
+    /// Removes the plan's configs and secrets older than the previous deploy,
+    /// and under the deploy lock (SIMPLED_LOCK_TOKEN) those that left the plan
     PruneObjects { plan: std::path::PathBuf },
     /// Runs one job of the plan to completion
     RunJob { plan: std::path::PathBuf, job: String },
@@ -648,7 +649,8 @@ fn step_command(command: &StepCommands) -> Result<()> {
             }
         }
         StepCommands::PruneObjects { plan } => {
-            deploy_steps::prune_objects(&docker, &read_plan(plan)?)?;
+            let token = std::env::var("SIMPLED_LOCK_TOKEN").ok();
+            deploy_steps::prune_objects(&docker, &read_plan(plan)?, token.as_deref())?;
         }
         StepCommands::PruneImages => {
             let image = std::env::var(controller::IMAGE_VAR).unwrap_or_else(|_| controller::image());

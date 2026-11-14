@@ -69,6 +69,9 @@ pub struct AppEnvironment {
 #[derive(Debug, Clone)]
 pub struct AppSecretOption {
     pub secret_name: String,
+    /// A deployment may leave an optional secret out; services that mount it
+    /// then get neither the file nor the variable.
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone)]

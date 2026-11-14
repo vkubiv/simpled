@@ -78,13 +78,17 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     // Check secrets
     let provided_secrets: HashSet<&String> = deployment.secrets.iter().map(|c| &c.secret_name).collect();
     for secret in &app_spec.secrets {
-        if !provided_secrets.contains(&secret.secret_name) {
+        if !secret.optional && !provided_secrets.contains(&secret.secret_name) {
             return Err(anyhow!(
                 "Secret {} required by application is not provided by deployment {}",
                 secret.secret_name,
                 env_name
             ));
         }
+    }
+
+    for warning in unused_deployment_secrets(deployment, app_spec, &env_spec.env_type) {
+        eprintln!("Warning: {}", warning);
     }
 
     // Check configs
@@ -238,6 +242,81 @@ fn ignored_environment_values(
                 deployment.name, name, name
             ));
         }
+    }
+    warnings
+}
+
+/// Deployment `secrets:` nothing reads: not named by a `$secret(...)`
+/// reference, and either not declared by the app spec or an optional secret no
+/// service of the deployment mounts. Usually a misspelling, and since an optional secret may be left out, one that would
+/// otherwise deploy with the feature silently off. Locally such a secret can
+/// still feed a testspec suite, so it is only reported elsewhere.
+fn unused_deployment_secrets(
+    deployment: &DeploymentSpec,
+    app_spec: &AppSpec,
+    env_type: &DeploymentEnvType,
+) -> Vec<String> {
+    if *env_type == DeploymentEnvType::Local {
+        return Vec::new();
+    }
+    let provided: HashSet<&String> = deployment.secrets.iter().map(|s| &s.secret_name).collect();
+    let mut omitted: Vec<&str> = app_spec
+        .secrets
+        .iter()
+        .filter(|s| s.optional && !provided.contains(&s.secret_name))
+        .map(|s| s.secret_name.as_str())
+        .collect();
+    omitted.sort();
+    omitted.dedup();
+
+    let mut seen = HashSet::new();
+    let mut warnings = Vec::new();
+    for secret in &deployment.secrets {
+        let name = &secret.secret_name;
+        if !seen.insert(name) {
+            continue;
+        }
+        let reference = format!("$secret({})", name);
+        if deployment
+            .environment
+            .iter()
+            .chain(&deployment.undockerized_environment)
+            .any(|var| var.value.contains(&reference))
+        {
+            continue;
+        }
+        let mut warning = match app_spec.secrets.iter().find(|s| &s.secret_name == name) {
+            None => format!(
+                "deployment '{}' provides secret {}, which the app spec does not declare, so nothing reads it. \
+                 Declare {} under secrets in the app spec, or remove it from the env spec.",
+                deployment.name, name, name
+            ),
+            // A required secret has to be listed whether or not a service
+            // mounts it, so there is nothing the env spec could change.
+            Some(declared) if !declared.optional => continue,
+            Some(_) => {
+                let mounted = app_spec
+                    .all_services()
+                    .filter(|svc| !deployment.exclude_services.contains(&svc.name))
+                    .any(|svc| svc.secrets.iter().any(|s| &s.name == name));
+                if mounted {
+                    continue;
+                }
+                format!(
+                    "deployment '{}' provides the optional secret {}, but none of its services mounts it, so \
+                     nothing reads it. Mount {} on a service in the app spec, or remove it from the env spec.",
+                    deployment.name, name, name
+                )
+            }
+        };
+        if !omitted.is_empty() {
+            warning.push_str(&format!(
+                " If the name is misspelled: the deployment leaves out the app's optional secret{} {}.",
+                if omitted.len() == 1 { "" } else { "s" },
+                omitted.join(", ")
+            ));
+        }
+        warnings.push(warning);
     }
     warnings
 }
@@ -549,6 +628,22 @@ deployments:
         }
 
         #[test]
+        fn an_optional_secret_may_be_left_out() {
+            let app = format!("{APP}secrets:\n  sendgrid_apikey:\n    optional: true\n  db_password:\n");
+            check(&app, "    secrets:\n      db_password: literal").unwrap();
+            check(
+                &app,
+                "    secrets:\n      db_password: literal\n      sendgrid_apikey: key",
+            )
+            .unwrap();
+
+            let err = check(&app, "    secrets:\n      sendgrid_apikey: key")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Secret db_password required by application"), "{err}");
+        }
+
+        #[test]
         fn a_config_group_and_each_of_its_files_must_be_provided() {
             let app = format!("{APP}configs:\n  data:\n    - settings.json\n");
             let err = check(&app, "").unwrap_err().to_string();
@@ -712,6 +807,108 @@ deployments:
             );
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("sets PORT"));
+        }
+
+        const APP_WITH_SECRETS: &str = "secrets:\n  db_password:\n  sendgrid_apikey:\n    optional: true\n";
+
+        fn unused_secrets(app: &str, env_yaml: &str) -> Vec<String> {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(env_yaml, root.path());
+            let deployment = env.deployment("prod").unwrap();
+            unused_deployment_secrets(deployment, &app_spec(app), &env.env_type)
+        }
+
+        #[test]
+        fn a_misspelled_optional_secret_is_reported() {
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_api_key: key"),
+            );
+            assert_eq!(
+                warnings,
+                [
+                    "deployment 'prod' provides secret sendgrid_api_key, which the app spec does not declare, so \
+                     nothing reads it. Declare sendgrid_api_key under secrets in the app spec, or remove it from the \
+                     env spec. If the name is misspelled: the deployment leaves out the app's optional secret \
+                     sendgrid_apikey."
+                ]
+            );
+        }
+
+        #[test]
+        fn an_undeclared_secret_gets_no_hint_when_no_optional_secret_is_left_out() {
+            let warnings = unused_secrets(
+                &format!("{APP}    secrets:\n      - sendgrid_apikey\n{APP_WITH_SECRETS}"),
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey: key\n      stray: x"),
+            );
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("provides secret stray"), "{:?}", warnings);
+            assert!(!warnings[0].contains("misspelled"), "{:?}", warnings);
+        }
+
+        #[test]
+        fn declared_and_referenced_secrets_are_not_reported() {
+            // `pg_password` only feeds a `$secret(...)` reference.
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                &k8s_env(
+                    "    environment:\n      - DB_URL=postgres://u:$secret(pg_password)@db\n    secrets:\n      \
+                     db_password: pw\n      pg_password: pg",
+                ),
+            );
+            assert!(warnings.is_empty(), "{:?}", warnings);
+        }
+
+        #[test]
+        fn an_optional_secret_no_service_mounts_is_reported() {
+            // Two optional secrets, and the deployment lists the one `api` does
+            // not mount: the wrong name is a declared one.
+            let app = format!(
+                "{APP}    secrets:\n      - sendgrid_apikey\nsecrets:\n  db_password:\n  sendgrid_apikey:\n    \
+                 optional: true\n  sendgrid_apikey_v2:\n    optional: true\n"
+            );
+            let warnings = unused_secrets(
+                &app,
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey_v2: key"),
+            );
+            assert_eq!(
+                warnings,
+                [
+                    "deployment 'prod' provides the optional secret sendgrid_apikey_v2, but none of its services \
+                     mounts it, so nothing reads it. Mount sendgrid_apikey_v2 on a service in the app spec, or \
+                     remove it from the env spec. If the name is misspelled: the deployment leaves out the app's \
+                     optional secret sendgrid_apikey."
+                ]
+            );
+
+            // The one `api` mounts is fine, and so is the required one nobody mounts.
+            let warnings = unused_secrets(
+                &app,
+                &k8s_env("    secrets:\n      db_password: pw\n      sendgrid_apikey: key"),
+            );
+            assert!(warnings.is_empty(), "{:?}", warnings);
+        }
+
+        #[test]
+        fn a_local_deployment_may_provide_undeclared_secrets_for_test_suites() {
+            let warnings = unused_secrets(
+                &format!("{APP}{APP_WITH_SECRETS}"),
+                r#"
+type: local
+gateway:
+  hosts:
+    web: localhost:8080
+deployments:
+  prod:
+    primary_host: web
+    application:
+      name: shop
+    secrets:
+      db_password: pw
+      e2e_admin_token: t
+"#,
+            );
+            assert!(warnings.is_empty(), "{:?}", warnings);
         }
 
         #[test]

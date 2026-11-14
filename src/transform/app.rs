@@ -97,6 +97,17 @@ pub fn convert_app_spec(yaml: AppSpecYaml, env_spec: Option<&spec::DeploymentEnv
                 }
             }
         }
+        // Whether a secret may be left out is decided by its declaration, so a
+        // mount of an undeclared one has no answer; reject it here, once.
+        for secret in &svc.secrets {
+            if !secrets.iter().any(|s| s.secret_name == secret.name) {
+                return Err(anyhow!(
+                    "Service '{}' mounts secret '{}' which is not declared in app secrets",
+                    svc.name,
+                    secret.name
+                ));
+            }
+        }
     }
 
     Ok(AppSpec {
@@ -198,9 +209,64 @@ fn convert_environment(yaml: AppEnvironmentYaml) -> Result<AppEnvironment> {
 
 fn convert_secrets(yaml: AppSecretsYaml) -> Result<Vec<AppSecretOption>> {
     match yaml {
-        AppSecretsYaml::Simple(list) => Ok(list.into_iter().map(|s| AppSecretOption { secret_name: s }).collect()),
-        AppSecretsYaml::Detailed(map) => Ok(map.into_keys().map(|k| AppSecretOption { secret_name: k }).collect()),
+        AppSecretsYaml::Simple(list) => Ok(list
+            .into_iter()
+            .map(|s| AppSecretOption {
+                secret_name: s,
+                optional: false,
+            })
+            .collect()),
+        AppSecretsYaml::Detailed(map) => map
+            .into_iter()
+            .map(|(name, options)| {
+                let optional = secret_is_optional(&name, options)?;
+                Ok(AppSecretOption {
+                    secret_name: name,
+                    optional,
+                })
+            })
+            .collect(),
     }
+}
+
+/// Reads the options of one secret in the map form of `secrets:`. Only
+/// `optional` is known; anything else is rejected rather than ignored, so a
+/// typo cannot silently make a secret required.
+fn secret_is_optional(name: &str, options: Option<serde_yaml::Value>) -> Result<bool> {
+    let map = match options {
+        None => return Ok(false),
+        Some(serde_yaml::Value::Mapping(map)) => map,
+        Some(_) => {
+            return Err(anyhow!(
+                "Secret {}: options must be a map such as `optional: true`",
+                name
+            ))
+        }
+    };
+    let mut optional = false;
+    for (key, value) in map {
+        match (key.as_str(), value) {
+            (Some("optional"), serde_yaml::Value::Bool(b)) => optional = b,
+            (Some("optional"), _) => return Err(anyhow!("Secret {}: optional must be true or false", name)),
+            (Some(unknown), _) => {
+                return Err(anyhow!(
+                    "Secret {}: unknown option {}; the only option is optional",
+                    name,
+                    unknown
+                ))
+            }
+            // A key that is not a string (`1:`, `true:`), shown as it was written.
+            (None, _) => {
+                let written = serde_yaml::to_string(&key).unwrap_or_else(|_| format!("{:?}", key));
+                return Err(anyhow!(
+                    "Secret {}: unknown option {}; the only option is optional",
+                    name,
+                    written.trim()
+                ));
+            }
+        }
+    }
+    Ok(optional)
 }
 
 fn convert_services(yaml: HashMap<String, ServiceSpecYaml>, is_app_service: bool) -> Result<Vec<ServiceSpec>> {
@@ -478,6 +544,45 @@ environment:
         let secrets = &spec.app_services[0].secrets;
         assert!(matches!(&secrets[0].mount, SecretMount::FilePath(p) if p == "/secrets/a"));
         assert!(matches!(&secrets[1].mount, SecretMount::EnvVariable(v) if v == "B"));
+    }
+
+    #[test]
+    fn a_secret_in_the_map_form_may_be_optional() {
+        let raw = "name: app\nversion: 1.0.0\nsecrets:\n  a:\n  b:\n    optional: true\n  c:\n    optional: false\n";
+        let mut secrets = convert(raw).unwrap().secrets;
+        secrets.sort_by(|x, y| x.secret_name.cmp(&y.secret_name));
+        let flags: Vec<_> = secrets.iter().map(|s| (s.secret_name.as_str(), s.optional)).collect();
+        assert_eq!(flags, [("a", false), ("b", true), ("c", false)]);
+
+        let list = "name: app\nversion: 1.0.0\nsecrets:\n  - a\n";
+        assert!(!convert(list).unwrap().secrets[0].optional);
+    }
+
+    #[test]
+    fn unknown_secret_options_are_rejected() {
+        let typo = "name: app\nversion: 1.0.0\nsecrets:\n  a:\n    optinal: true\n";
+        assert!(convert_err(typo).contains("Secret a: unknown option optinal"));
+
+        let not_bool = "name: app\nversion: 1.0.0\nsecrets:\n  a:\n    optional: yes please\n";
+        assert!(convert_err(not_bool).contains("optional must be true or false"));
+
+        let scalar = "name: app\nversion: 1.0.0\nsecrets:\n  a: true\n";
+        assert!(convert_err(scalar).contains("options must be a map"));
+
+        let not_a_string = "name: app\nversion: 1.0.0\nsecrets:\n  a:\n    1: true\n";
+        assert!(convert_err(not_a_string).contains("Secret a: unknown option 1;"));
+    }
+
+    #[test]
+    fn a_service_can_only_mount_a_declared_secret() {
+        let raw = "name: app\nversion: 1.0.0\nsecrets:\n  - a\napp_services:\n  api:\n    image: a\n    secrets:\n      - a\n      - b\n";
+        assert_eq!(
+            convert_err(raw),
+            "Service 'api' mounts secret 'b' which is not declared in app secrets"
+        );
+
+        let extra = "name: app\nversion: 1.0.0\nextra_services:\n  cache:\n    image: redis:7\n    secrets:\n      - cache_password\n";
+        assert!(convert_err(extra).contains("Service 'cache' mounts secret 'cache_password'"));
     }
 
     #[test]

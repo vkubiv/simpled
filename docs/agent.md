@@ -35,7 +35,10 @@ Get these right and most specs validate on the first try.
    `environment`. Use `optional:` for genuinely optional ones — `optional` entries may
    not have defaults.
 4. **Every secret a service uses must be declared** in `appspec.yaml` `secrets:` (name
-   only, never a value) **and** given a source in the deployment's `secrets:`.
+   only, never a value) **and** given a source in the deployment's `secrets:`. A secret
+   declared with `optional: true` may be left out of a deployment; services then get
+   neither its file nor its variable. `optional` needs the map form
+   of `secrets:` (a `name:` key with `optional: true` under it), not the list form.
 5. **Every `public` service needs `host` + `prefix`** in the deployment's `services:`,
    or an `export:` block in `appspec.yaml` as the default. `host` is a *gateway host
    alias*, not a domain — the alias is mapped to a real domain under `gateway.hosts`.
@@ -220,7 +223,11 @@ one inline with `extends:`.
 | `Deployment configures service S which is not defined in application` | Typo in the deployment's `services:` key, or the service is missing from `appspec.yaml`. |
 | `Deployment D excludes service S which is not defined in application` | Typo in `exclude_services`. |
 | `Suite X forwards V, which deployment D does not define` | Add `V` to the deployment's `environment` (or the suite's inline block), or set it with `V=value`. |
-| `Suite X uses secret S, which deployment D does not provide` | Add `S` under the deployment's `secrets:`. |
+| `Suite X uses secret S, which deployment D does not provide` | Add `S` under the deployment's `secrets:`. A suite needs it even when the app declares `S` optional. |
+| `Service S mounts secret X which is not declared in app secrets` | Declare `X` in `appspec.yaml` top-level `secrets:`, or fix the name in the service's `secrets:`. |
+| `Secret S: unknown option O; the only option is optional` | In the map form of `secrets:` a secret takes nothing, or `optional: true`. |
+| `Warning: deployment D provides secret S, which the app spec does not declare` | Usually a misspelled name: match the one in `appspec.yaml`, or remove it. An optional secret spelled wrong deploys with the feature off. |
+| `Undefined secret reference: $secret(S)` | The deployment does not list `S`. If `S` is optional and left out on purpose, remove the variable that references it. |
 | `Suite X declares its own deployment, but the env spec already has a deployment named X` | Rename the suite, or use `deployment: X` to reference the existing one. |
 | `Service S references undefined environment variable V` | Declare `V` in `appspec.yaml` `environment:`, or use `$all`. |
 | `Dependency cycle in depends_on: ...` | Break the cycle named in the message. |
