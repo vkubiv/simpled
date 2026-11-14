@@ -698,6 +698,11 @@ impl ServiceResolver<'_> {
         for sec in &app_service.secrets {
             let secret_name = format!("{}-{}", app_spec.name, sec.name);
             if !self.secrets.iter().any(|s| s.name == secret_name) {
+                // An optional secret the deployment leaves out is simply not
+                // mounted: the service gets neither the file nor the variable.
+                if app_spec.secrets.iter().any(|s| s.secret_name == sec.name && s.optional) {
+                    continue;
+                }
                 return Err(anyhow!(
                     "Service {} references undefined secret {}",
                     app_service.name,
@@ -2309,6 +2314,42 @@ deployments:
             assert_eq!(db_url.value, "postgres://u:s3cr3t@db");
             assert_eq!(spec.current_deployment.secrets[0].name, "shop-db_password");
             assert_eq!(spec.current_deployment.secrets[0].literal(), Some("s3cr3t"));
+        }
+
+        #[test]
+        fn an_optional_secret_the_deployment_leaves_out_is_not_mounted() {
+            let app = APP.replace(
+                "    ports:\n",
+                "    secrets:\n      - sendgrid_apikey\n      - github_token:\n          variable: GITHUB_TOKEN\n      - db_password\n    ports:\n",
+            ) + "secrets:\n  sendgrid_apikey:\n    optional: true\n  github_token:\n    optional: true\n  db_password:\n";
+            let api_secrets = |deployment_secrets: &str| {
+                let services =
+                    format!("      api:\n        host: web\n        prefix: /\n    secrets:\n{deployment_secrets}");
+                let spec = resolve_yaml(&app, &env("k8s", REGISTRY, &services, "")).unwrap();
+                let api = spec
+                    .current_deployment
+                    .services
+                    .iter()
+                    .find(|s| s.full_name == "api")
+                    .unwrap();
+                let mut names: Vec<_> = api.secrets.iter().map(|s| s.name.clone()).collect();
+                names.sort();
+                names
+            };
+
+            assert_eq!(api_secrets("      db_password: p"), ["shop-db_password"]);
+            assert_eq!(
+                api_secrets("      db_password: p\n      github_token: t\n      sendgrid_apikey: k"),
+                ["shop-db_password", "shop-github_token", "shop-sendgrid_apikey"]
+            );
+        }
+
+        #[test]
+        fn a_listed_optional_secret_must_still_resolve() {
+            let app = format!("{APP}secrets:\n  sendgrid_apikey:\n    optional: true\n");
+            let services = "      api:\n        host: web\n        prefix: /\n    secrets:\n      sendgrid_apikey:\n        env: SIMPLED_TEST_UNSET_OPTIONAL_SECRET";
+            let err = error(&app, &env("k8s", REGISTRY, services, ""));
+            assert!(err.contains("SIMPLED_TEST_UNSET_OPTIONAL_SECRET"), "{err}");
         }
 
         const LOCAL_AWS: &str = r#"

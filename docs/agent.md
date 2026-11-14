@@ -35,7 +35,9 @@ Get these right and most specs validate on the first try.
    `environment`. Use `optional:` for genuinely optional ones — `optional` entries may
    not have defaults.
 4. **Every secret a service uses must be declared** in `appspec.yaml` `secrets:` (name
-   only, never a value) **and** given a source in the deployment's `secrets:`.
+   only, never a value) **and** given a source in the deployment's `secrets:`. A secret
+   declared with `optional: true` may be left out of a deployment; services then get
+   neither its file nor its variable.
 5. **Every `public` service needs `host` + `prefix`** in the deployment's `services:`,
    or an `export:` block in `appspec.yaml` as the default. `host` is a *gateway host
    alias*, not a domain — the alias is mapped to a real domain under `gateway.hosts`.

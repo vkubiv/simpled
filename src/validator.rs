@@ -78,7 +78,7 @@ pub fn validate(env_spec: &DeploymentEnvironmentSpec, app_spec: &AppSpec, env_na
     // Check secrets
     let provided_secrets: HashSet<&String> = deployment.secrets.iter().map(|c| &c.secret_name).collect();
     for secret in &app_spec.secrets {
-        if !provided_secrets.contains(&secret.secret_name) {
+        if !secret.optional && !provided_secrets.contains(&secret.secret_name) {
             return Err(anyhow!(
                 "Secret {} required by application is not provided by deployment {}",
                 secret.secret_name,
@@ -546,6 +546,22 @@ deployments:
             assert!(err.contains("Secret db_password required by application"), "{err}");
 
             check(&app, "    secrets:\n      db_password: literal").unwrap();
+        }
+
+        #[test]
+        fn an_optional_secret_may_be_left_out() {
+            let app = format!("{APP}secrets:\n  sendgrid_apikey:\n    optional: true\n  db_password:\n");
+            check(&app, "    secrets:\n      db_password: literal").unwrap();
+            check(
+                &app,
+                "    secrets:\n      db_password: literal\n      sendgrid_apikey: key",
+            )
+            .unwrap();
+
+            let err = check(&app, "    secrets:\n      sendgrid_apikey: key")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Secret db_password required by application"), "{err}");
         }
 
         #[test]

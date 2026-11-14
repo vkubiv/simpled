@@ -246,6 +246,17 @@ secrets:
 
 Values are never stored in `appspec.yaml`. They are provided by the deployment environment in `envspec.yaml`.
 
+A deployment must provide every declared secret, unless the secret is marked optional:
+
+```yaml
+secrets:
+  db_password:
+  sendgrid_apikey:
+    optional: true   # a deployment may leave it out
+```
+
+A deployment that leaves an optional secret out deploys without it: every service that mounts it gets neither the file nor the variable, so the app should treat a missing `/secrets/sendgrid_apikey` (or an unset variable) as "feature off". A deployment that does list an optional secret must resolve it like any other: an unset `env:` variable, a missing file or a missing AWS secret is still an error. `optional` is the only option a secret takes; an unknown key is rejected.
+
 ---
 
 ### Volumes
