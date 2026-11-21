@@ -715,7 +715,27 @@ fn a_deployment_in_its_own_file_prepares_the_same_deployment() {
             "{env_type}"
         );
         for (name, content) in &expected {
-            assert!(actual[name] == *content, "{env_type}: {name} differs");
+            assert!(
+                without_deploy_date(&actual[name]) == without_deploy_date(content),
+                "{env_type}: {name} differs"
+            );
         }
     }
+}
+
+/// The k8s workloads carry the time they were prepared, in seconds, which two
+/// runs need not share: every run of exactly ten digits becomes `<date>`.
+fn without_deploy_date(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len());
+    let mut i = 0;
+    while i < content.len() {
+        let run = content[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if run == 10 && (i == 0 || !content[i - 1].is_ascii_digit()) {
+            out.extend_from_slice(b"<date>");
+        } else {
+            out.extend_from_slice(&content[i..i + run.max(1)]);
+        }
+        i += run.max(1);
+    }
+    out
 }
