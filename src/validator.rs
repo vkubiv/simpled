@@ -207,6 +207,20 @@ fn ignored_environment_values(
     env_type: &DeploymentEnvType,
 ) -> Vec<String> {
     let env = &app_spec.environment;
+    // Where the deployment's values are written: its own place, and those of the
+    // deployments it extends, as the merged list does not say which.
+    let mut places: Vec<&str> = Vec::new();
+    for file in std::iter::once(&deployment.file).chain(&deployment.base_files) {
+        let place = file.as_deref().unwrap_or("the env spec");
+        if !places.contains(&place) {
+            places.push(place);
+        }
+    }
+    let source = places.join(" or ");
+    let its_value = match places.as_slice() {
+        ["the env spec"] => "env spec value".to_string(),
+        _ => format!("value in {}", source),
+    };
     let mut seen = HashSet::new();
     let mut warnings = Vec::new();
     for var in &deployment.environment {
@@ -224,9 +238,9 @@ fn ignored_environment_values(
         if let Some(kind) = computed {
             warnings.push(format!(
                 "deployment '{}' sets {}, but the app spec declares it as {} and computes its value, \
-                 so the env spec value is ignored. Declare {} as external or optional in the app spec \
-                 to set it from the env spec.",
-                deployment.name, name, kind, name
+                 so the {} is ignored. Declare {} as external or optional in the app spec \
+                 to set it from {}.",
+                deployment.name, name, kind, its_value, name, source
             ));
         } else if *env_type != DeploymentEnvType::Local
             && !env.external.iter().any(|e| &e.name == name)
@@ -234,8 +248,8 @@ fn ignored_environment_values(
         {
             warnings.push(format!(
                 "deployment '{}' sets {}, which the app spec does not declare, so the value is ignored. \
-                 Declare {} as external or optional in the app spec, or remove it from the env spec.",
-                deployment.name, name, name
+                 Declare {} as external or optional in the app spec, or remove it from {}.",
+                deployment.name, name, name, source
             ));
         }
     }
@@ -650,6 +664,38 @@ app_services:
             let env = env_spec(env_yaml, root.path());
             let deployment = env.deployment("prod").unwrap();
             ignored_environment_values(deployment, &app_spec(APP_WITH_EVERY_KIND), &env.env_type)
+        }
+
+        #[test]
+        fn a_deployment_in_its_own_file_is_told_about_that_file() {
+            let root = tempfile::tempdir().unwrap();
+            let env = env_spec(
+                &k8s_env("    environment:\n      - PORT=9090\n      - FEATURE_X=on"),
+                root.path(),
+            );
+            let mut deployment = env.deployment("prod").unwrap().clone();
+            deployment.file = Some("prod.yaml".to_string());
+            let warnings = ignored_environment_values(&deployment, &app_spec(APP_WITH_EVERY_KIND), &env.env_type);
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(
+                warnings[0].contains("so the value in prod.yaml is ignored")
+                    && warnings[0].ends_with("to set it from prod.yaml."),
+                "{warnings:?}"
+            );
+            assert!(warnings[1].ends_with("or remove it from prod.yaml."), "{warnings:?}");
+            assert!(warnings.iter().all(|w| !w.contains("env spec")), "{warnings:?}");
+
+            // A value may be the one of a deployment it extends, written elsewhere.
+            deployment.base_files = vec![None, Some("base.yaml".to_string()), None];
+            let warnings = ignored_environment_values(&deployment, &app_spec(APP_WITH_EVERY_KIND), &env.env_type);
+            assert!(
+                warnings[0].contains("so the value in prod.yaml or the env spec or base.yaml is ignored"),
+                "{warnings:?}"
+            );
+            assert!(
+                warnings[1].ends_with("or remove it from prod.yaml or the env spec or base.yaml."),
+                "{warnings:?}"
+            );
         }
 
         #[test]

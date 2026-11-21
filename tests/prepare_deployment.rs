@@ -669,3 +669,53 @@ fn update_and_placement_mistakes_fail_validation() {
         assert!(stderr.contains(expected), "expected '{}' in: {}", expected, stderr);
     }
 }
+
+/// Every generated file under `dir`, by relative path, apart from the specs.
+fn generated_files(dir: &Path, root: &Path, into: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            generated_files(&path, root, into);
+        } else if !["envspec.yaml", "prod.yaml"].contains(&path.file_name().unwrap().to_str().unwrap()) {
+            let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            into.insert(name, fs::read(&path).unwrap());
+        }
+    }
+}
+
+#[test]
+fn a_deployment_in_its_own_file_prepares_the_same_deployment() {
+    for env_type in ["docker", "k8s"] {
+        let inline = envspec(env_type, "", "");
+        let (head, body) = inline.split_once("  prod:\n").unwrap();
+        let split = format!("{head}  prod:\n    file: prod.yaml\n");
+        let body: String = body
+            .lines()
+            .map(|l| format!("{}\n", l.strip_prefix("    ").unwrap_or(l)))
+            .collect();
+
+        let expected_dir = prepare(&inline);
+        let dir = tempfile::tempdir().unwrap();
+        common::write_project(dir.path(), &split);
+        fs::write(dir.path().join("prod.yaml"), body).unwrap();
+        let output = common::simpled(
+            dir.path(),
+            &["prepare-deployment", "prod", "--bundle", "bundle"],
+            &[("SHOP_DB_PASSWORD", "s3cr3t")],
+        );
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+        let (mut expected, mut actual) = Default::default();
+        generated_files(expected_dir.path(), expected_dir.path(), &mut expected);
+        generated_files(dir.path(), dir.path(), &mut actual);
+        assert!(expected.len() > 5, "{env_type}: {:?}", expected.keys());
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            actual.keys().collect::<Vec<_>>(),
+            "{env_type}"
+        );
+        for (name, content) in &expected {
+            assert!(actual[name] == *content, "{env_type}: {name} differs");
+        }
+    }
+}

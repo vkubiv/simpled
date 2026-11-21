@@ -94,6 +94,73 @@ fn constraints(service: &serde_yaml::Value) -> Vec<String> {
 }
 
 #[test]
+fn an_unbound_volume_of_a_deployment_in_its_own_file_names_that_file() {
+    let inline = swarm_env("", "");
+    let (head, body) = inline.split_once("  prod:\n").unwrap();
+    let body: String = body
+        .lines()
+        .map(|l| format!("{}\n", l.strip_prefix("    ").unwrap_or(l)))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path(), &format!("{head}  prod:\n    file: prod.yaml\n"));
+    fs::write(dir.path().join("prod.yaml"), body).unwrap();
+    fs::write(dir.path().join("bundle").join("appspec.yaml"), appspec()).unwrap();
+    let output = simpled(
+        dir.path(),
+        &["prepare-deployment", "prod", "--bundle", "bundle"],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    assert!(!output.status.success(), "expected a failure");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // The block as it goes into the file, not under `deployments:` in the env
+    // spec, where nothing may stand beside `file`.
+    let lines: Vec<&str> = stderr.lines().map(|l| l.strip_prefix("    ").unwrap_or(l)).collect();
+    let snippet = [
+        "# prod.yaml",
+        "volumes:",
+        "  pg-data:",
+        "    node: <node hostname>",
+        "  uploads:",
+        "    node: <node hostname>",
+    ];
+    assert!(lines.windows(snippet.len()).any(|w| w == snippet), "{}", stderr);
+    assert!(!stderr.contains("deployments:"), "{}", stderr);
+}
+
+#[test]
+fn a_relative_path_of_a_deployment_in_its_own_file_names_that_file() {
+    let inline = swarm_env("", BOUND);
+    let (head, body) = inline.split_once("  prod:\n").unwrap();
+    let body: String = body
+        .lines()
+        .map(|l| format!("{}\n", l.strip_prefix("    ").unwrap_or(l)))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path(), &format!("{head}  prod:\n    file: prod.yaml\n"));
+    fs::write(dir.path().join("prod.yaml"), body).unwrap();
+    let app = appspec().replace(
+        "      - uploads:/uploads\n",
+        "      - uploads:/uploads\n      - ./data:/seed\n",
+    );
+    fs::write(dir.path().join("bundle").join("appspec.yaml"), app).unwrap();
+    let output = simpled(
+        dir.path(),
+        &["prepare-deployment", "prod", "--bundle", "bundle"],
+        &[("SHOP_DB_PASSWORD", "s3cr3t")],
+    );
+    assert!(!output.status.success(), "expected a failure");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("mounts the relative path './data'"), "{}", stderr);
+    assert!(
+        stderr.contains("a named volume bound under `volumes` in prod.yaml"),
+        "{}",
+        stderr
+    );
+    assert!(!stderr.contains("deployments.prod.volumes"), "{}", stderr);
+}
+
+#[test]
 fn an_unbound_volume_fails_with_a_block_to_paste() {
     let stderr = fails(&swarm_env("", ""));
     assert!(

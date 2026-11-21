@@ -289,6 +289,8 @@ pub struct DeploymentResolvedSpec {
     pub secrets: Vec<SecretResolvedSpec>,
     pub services: Vec<ServiceResolvedSpec>,
     pub volumes: Vec<String>,
+    /// Where the deployment's volume bindings are written, for a message.
+    pub volumes_place: String,
     /// Swarm only: where each bound volume lives. A volume missing here is the
     /// 1.x bind directory under `<deployment>/volumes/`.
     pub volume_bindings: std::collections::BTreeMap<String, crate::spec::VolumeBinding>,

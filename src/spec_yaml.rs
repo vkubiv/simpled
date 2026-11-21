@@ -272,6 +272,10 @@ pub enum HostSpecYaml {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeploymentSpecYaml {
+    // The deployment is written in this file, next to the env spec, instead of
+    // here: `prod: { file: prod.yaml }`. Nothing else is set beside it. The loader
+    // replaces this entry with the file's contents and keeps the file's name here.
+    pub file: Option<String>,
     // Name of another deployment in this env spec to inherit from. Scalar fields
     // (primary_host, application, ...) fall back to the base when not set here;
     // map fields (configs, secrets, services) and environment lists are merged

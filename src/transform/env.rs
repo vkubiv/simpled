@@ -102,6 +102,7 @@ pub fn convert_env_spec(
                 .expand(&var.value)
                 .with_context(|| format!("Variable {} in deployment '{}'", var.name, name))?;
         }
+        deployment.base_files = base_files(&yaml.deployments, name);
         deployments.push(deployment);
     }
     let swarm_only = swarm_only_setting(&ingress, &deployments);
@@ -363,6 +364,21 @@ fn expand_ports(
     Ok((expanded, ports))
 }
 
+/// The `file` of every deployment `name` extends, nearest first.
+fn base_files(raw: &HashMap<String, DeploymentSpecYaml>, name: &str) -> Vec<Option<String>> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::from([name]);
+    let mut current = raw.get(name).and_then(|d| d.extends.as_deref());
+    while let Some(base) = current {
+        let Some(deployment) = raw.get(base).filter(|_| seen.insert(base)) else {
+            break;
+        };
+        files.push(deployment.file.clone());
+        current = deployment.extends.as_deref();
+    }
+    files
+}
+
 /// Resolves `extends` inheritance for every deployment, returning a map of fully
 /// merged specs keyed by the original names. Chains of `extends` are followed and
 /// cycles are reported as errors.
@@ -418,6 +434,8 @@ fn resolve_deployment(
 /// lists are unioned with the child's entries winning on key conflicts.
 fn merge_deployment(base: &DeploymentSpecYaml, child: &DeploymentSpecYaml) -> DeploymentSpecYaml {
     DeploymentSpecYaml {
+        // Where the child is written, whatever its base adds.
+        file: child.file.clone(),
         extends: child.extends.clone(),
         // Abstractness is a property of the deployment itself, never inherited.
         is_abstract: child.is_abstract,
@@ -1354,6 +1372,8 @@ fn convert_deployment(
     Ok(DeploymentSpec {
         primary_host,
         name,
+        file: yaml.file.clone(),
+        base_files: Vec::new(),
         application,
         environment,
         undockerized_environment,

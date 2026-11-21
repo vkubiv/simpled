@@ -75,6 +75,7 @@ pub fn resolved_deployment(services: Vec<ServiceResolvedSpec>) -> DeploymentReso
         secrets: vec![],
         services,
         volumes: vec![],
+        volumes_place: String::new(),
         volume_bindings: Default::default(),
         host_environment: vec![],
     }

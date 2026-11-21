@@ -433,6 +433,16 @@ pub struct DeploymentEnvironmentSpec {
     pub root: std::path::PathBuf,
 }
 
+impl DeploymentSpec {
+    /// Where the deployment's volume bindings are written, for a message.
+    pub fn volumes_place(&self) -> String {
+        match &self.file {
+            Some(file) => format!("`volumes` in {}", file),
+            None => format!("deployments.{}.volumes", self.name),
+        }
+    }
+}
+
 impl DeploymentEnvironmentSpec {
     /// The deployment called `name`, or an error naming the ones that exist.
     pub fn deployment(&self, name: &str) -> anyhow::Result<&DeploymentSpec> {
@@ -543,6 +553,12 @@ pub struct EnvVariable {
 #[derive(Debug, Clone)]
 pub struct DeploymentSpec {
     pub name: String,
+    /// The file next to the env spec the deployment is written in, when not in
+    /// the env spec itself.
+    pub file: Option<String>,
+    /// Where each deployment it `extends`, directly or not, is written: a value
+    /// of this one may come from any of them.
+    pub base_files: Vec<Option<String>>,
     pub primary_host: String,
     pub application: DeploymentAppSpec,
     pub environment: Vec<EnvVariable>,
