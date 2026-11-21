@@ -109,9 +109,10 @@ public static class RepositoryOps
 
         var envSpecPaths = paths.Where(SpecFiles.IsEnvSpec).ToList();
         var envSpecs = new Dictionary<string, EnvSpec>();
+        var listedPaths = tree.Value.Truncated ? null : paths.ToHashSet(StringComparer.Ordinal);
         foreach (var path in envSpecPaths)
         {
-            var envSpec = await ReadSpec(github, token, repository, path, SpecFiles.ReadEnvSpec, problems,
+            var envSpec = await ReadEnvSpec(github, token, repository, path, listedPaths, problems,
                 cancellationToken);
             if (envSpec != null)
             {
@@ -125,6 +126,53 @@ public static class RepositoryOps
 
         repository.SyncedRevision = tree.Value.Sha;
         repository.SyncError = problems.Count == 0 ? null : string.Join('\n', problems);
+    }
+
+    /// <summary>The envspec with the deployments it keeps in files of their own; unreadable when one of them is.</summary>
+    /// <param name="listedPaths">Every file of the repository, so a missing one costs no request; null when unknown.</param>
+    private static async Task<EnvSpec?> ReadEnvSpec(IGitHub github, string token, RepositoryEntity repository,
+        string path, HashSet<string>? listedPaths, List<string> problems, CancellationToken cancellationToken)
+    {
+        var yaml = await ReadSpec(github, token, repository, path, y => y, problems, cancellationToken);
+        if (yaml == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            var directory = path[..(path.LastIndexOf('/') + 1)];
+            var deploymentFiles = new Dictionary<string, string>();
+            var names = SpecFiles.DeploymentFiles(yaml);
+            foreach (var name in names)
+            {
+                if (listedPaths != null && !listedPaths.Contains(directory + name))
+                {
+                    // Windows and macOS open it all the same, so there the spec works; a Linux runner does not.
+                    var otherCase = listedPaths.FirstOrDefault(p =>
+                        string.Equals(p, directory + name, StringComparison.OrdinalIgnoreCase));
+                    problems.Add(otherCase == null
+                        ? $"{directory}{name}: It is not in the repository; {path} names it as a deployment's file."
+                        : $"{directory}{name}: The repository has {otherCase}, in another case; {path} names it as a deployment's file.");
+                    continue;
+                }
+
+                var file = await ReadSpec(github, token, repository, directory + name, y => y, problems,
+                    cancellationToken);
+                if (file != null)
+                {
+                    deploymentFiles[name] = file;
+                }
+            }
+
+            // Every file that could not be read is reported above, not only the first.
+            return deploymentFiles.Count == names.Count ? SpecFiles.ReadEnvSpec(yaml, deploymentFiles) : null;
+        }
+        catch (SpecFormatException e)
+        {
+            problems.Add($"{path}: {e.Message}");
+            return null;
+        }
     }
 
     private static async Task<T?> ReadSpec<T>(IGitHub github, string token, RepositoryEntity repository,
