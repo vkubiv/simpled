@@ -98,6 +98,7 @@ pub fn resolve_with(
         secrets: secrets.specs,
         services: resolved_services,
         volumes: app_spec.volumes.clone(),
+        volumes_place: deployment.volumes_place(),
         volume_bindings: deployment.volumes.clone(),
         host_environment: undockerized_values,
     };
@@ -877,9 +878,14 @@ fn check_volumes_are_bound(deployment: &DeploymentSpec, services: &[ServiceResol
         return Ok(());
     }
 
-    let mut snippet = format!("deployments:\n  {}:\n    volumes:\n", deployment.name);
+    // As it is written where the deployment is: under its name in the env spec,
+    // or at the top of its own file.
+    let (mut snippet, indent) = match &deployment.file {
+        Some(file) => (format!("# {}\nvolumes:\n", file), ""),
+        None => (format!("deployments:\n  {}:\n    volumes:\n", deployment.name), "    "),
+    };
     for volume in &unbound {
-        snippet.push_str(&format!("      {}:\n        node: <node hostname>\n", volume));
+        snippet.push_str(&format!("{indent}  {}:\n{indent}    node: <node hostname>\n", volume));
     }
     let names: Vec<&str> = unbound.iter().map(|v| v.as_str()).collect();
     Err(anyhow!(
@@ -909,12 +915,12 @@ fn check_no_relative_bind_paths(deployment: &DeploymentSpec, services: &[Service
                         "Service '{}' mounts the relative path '{}' at {}. On Docker Swarm a relative path is a directory \
                          on whichever node ran deploy.sh, so a task on any other node finds nothing there. \
                          Use a config for files the service only reads, or a named volume bound under \
-                         deployments.{}.volumes for data it writes. To keep everything on a single node as in \
+                         {} for data it writes. To keep everything on a single node as in \
                          simpled 1.x, set multi_node: false.",
                         service.full_name,
                         path,
                         volume.mount_path,
-                        deployment.name
+                        deployment.volumes_place()
                     ));
                 }
             }

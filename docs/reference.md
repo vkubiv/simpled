@@ -1025,6 +1025,7 @@ deployments:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `file` | string | no | A file next to the env spec that holds this deployment. Nothing else is set beside it. See [A deployment in its own file](#a-deployment-in-its-own-file). |
 | `extends` | string | no | Name of another deployment to inherit from. See [extends](#extends). |
 | `abstract` | bool | no | If `true`, this deployment is a template used only as an `extends` base and is not deployed itself. See [extends](#extends). |
 | `primary_host` | string | yes¹ | Gateway host alias used as the base URL for `relative` environment variables. |
@@ -1044,6 +1045,57 @@ deployments:
 | `volumes` | map | no | Swarm only: where each named volume lives (`node`, `path`, `nfs`). Required on Swarm for every mounted volume unless `multi_node: false`. Under `extends`, a child rebinds single volumes. See [Volumes on Docker Swarm](#volumes-on-docker-swarm). |
 
 ¹ Required unless supplied by an `extends` base, or omitted on an `abstract` template.
+
+#### A deployment in its own file
+
+An env spec with many deployments can keep each in a file of its own. The env spec
+then holds what they share (`gateway`, `registry`, `controller`, `networks`) and
+the list of deployments:
+
+```yaml
+# envspec.yaml
+type: docker
+gateway:
+  hosts:
+    web: shop.example.com
+    admin: admin.example.com
+deployments:
+  shop:  { file: shop.yaml }
+  admin: { file: admin.yaml }
+  tools:                      # written here, as before
+    primary_host: admin
+    application: { name: tools }
+```
+
+```yaml
+# shop.yaml: what would be under `shop:`
+primary_host: web
+application:
+  name: shop
+  version: ^1.0.0
+services:
+  api:
+    host: web
+    prefix: /api
+```
+
+- **The file is in the env spec's directory.** `file` is a file name, `shop.yaml`
+  or `./shop.yaml`, ending in `.yaml` or `.yml`. A subdirectory, `..` or an
+  absolute path is an error. Every path written in the file (`extra`, a `.env`
+  file, `configs`, `secrets_folder`, a secret's `file`) therefore resolves from
+  the same directory as it would in the env spec.
+- **`file` stands alone.** A deployment is either written in the env spec or in
+  its file; setting another field beside `file` is an error. The file itself
+  cannot set `file`, and a key in it that is not a deployment field is an error,
+  so a file holding the `deployments:` block or the deployment's name is caught
+  instead of loading empty. A name YAML reads as a number or a boolean is quoted here:
+  `"2024": { file: y2024.yaml }`.
+- **Nothing else changes.** The deployment keeps the name it has in the env spec,
+  refers to gateway hosts and networks by the env spec's names, and may `extends`
+  any other deployment, in a file or not. All files are read on every command, so
+  checks across deployments see all of them.
+
+`localenv.yaml` takes the same form.
 
 #### extends
 

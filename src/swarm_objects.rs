@@ -215,7 +215,9 @@ fn service_mounts(
             .ok_or_else(|| anyhow!("Service {} mounts unknown secret {}", service.full_name, option.name))?;
         let file = secret_file(&deployment.name, &secret.name);
         if let Some(value) = secret.literal() {
-            check_size(value.len(), || format!("Secret '{}'", secret.name))?;
+            check_size(value.len(), &deployment.volumes_place, || {
+                format!("Secret '{}'", secret.name)
+            })?;
             files.insert(file.clone(), value.as_bytes().to_vec());
         }
         let object = objects.add(
@@ -247,7 +249,7 @@ fn service_mounts(
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy() == config.files[0].name);
         for entry in &config.files {
-            check_size(entry.content.len(), || {
+            check_size(entry.content.len(), &deployment.volumes_place, || {
                 format!("File '{}' of config '{}'", entry.name, config.name)
             })?;
             let file = config_file(&deployment.name, &config.name, &entry.name);
@@ -278,13 +280,14 @@ fn mount(object: &SwarmObject, target: &str) -> ObjectMount {
     }
 }
 
-fn check_size(len: usize, what: impl Fn() -> String) -> Result<()> {
+fn check_size(len: usize, volumes_place: &str, what: impl Fn() -> String) -> Result<()> {
     if len > MAX_OBJECT_BYTES {
         return Err(anyhow!(
-            "{} is {} KB, but a Docker Swarm config or secret holds at most {} KB. Keep large files in the image, or in a volume bound under deployments.<name>.volumes",
+            "{} is {} KB, but a Docker Swarm config or secret holds at most {} KB. Keep large files in the image, or in a volume bound under {}",
             what(),
             len.div_ceil(1024),
-            MAX_OBJECT_BYTES / 1024
+            MAX_OBJECT_BYTES / 1024,
+            volumes_place
         ));
     }
     Ok(())
@@ -321,10 +324,17 @@ mod tests {
 
     #[test]
     fn an_object_over_the_swarm_limit_fails() {
-        assert!(check_size(MAX_OBJECT_BYTES, || "x".to_string()).is_ok());
-        let err = check_size(MAX_OBJECT_BYTES + 1, || "File 'big.bin' of config 'data'".to_string())
-            .unwrap_err()
-            .to_string();
+        assert!(check_size(MAX_OBJECT_BYTES, "`volumes` in prod.yaml", || "x".to_string()).is_ok());
+        let err = check_size(MAX_OBJECT_BYTES + 1, "`volumes` in prod.yaml", || {
+            "File 'big.bin' of config 'data'".to_string()
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("File 'big.bin' of config 'data' is 501 KB"), "{}", err);
+        assert!(
+            err.ends_with("in a volume bound under `volumes` in prod.yaml"),
+            "{}",
+            err
+        );
     }
 }

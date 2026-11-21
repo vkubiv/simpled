@@ -178,6 +178,12 @@ fn resolve_suite_deployment(
                 suite.name
             );
         }
+        if dep.file.is_some() {
+            bail!(
+                "Suite '{}' sets `file` on its own deployment: only the env spec's `deployments` are read from files",
+                suite.name
+            );
+        }
         env_yaml.deployments.insert(suite.name.clone(), (**dep).clone());
     }
 
