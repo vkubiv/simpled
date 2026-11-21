@@ -44,6 +44,9 @@ public static class SpecFiles
     public static readonly string[] EnvSpecNames = ["envspec.yaml", "envspec.yml"];
     public static readonly string[] AppSpecNames = ["appspec.yaml", "appspec.yml"];
 
+    /// <summary>What simpled reads as an env spec, which a deployment's file therefore cannot be named.</summary>
+    private static readonly string[] OwnNames = [.. EnvSpecNames, "localenv.yaml", "localenv.yml"];
+
     public static bool IsEnvSpec(string path) => EnvSpecNames.Contains(FileName(path));
 
     public static bool IsAppSpec(string path) => AppSpecNames.Contains(FileName(path));
@@ -64,12 +67,31 @@ public static class SpecFiles
     /// <summary>What every gateway host answers on Kubernetes and locally, and on Docker before simpled 2.1.</summary>
     public const string WellKnownVersionPath = "/.well-known/simpled/version";
 
-    public static EnvSpec ReadEnvSpec(string yaml)
+    /// <summary>
+    /// The files the envspec's deployments are written in (`prod: { file: prod.yaml }`), which simpled reads from
+    /// the envspec's own directory only. The file names are checked as simpled checks them; what else simpled
+    /// refuses about such an entry (other fields beside `file`, a file naming a file) is read leniently.
+    /// </summary>
+    public static IReadOnlyList<string> DeploymentFiles(string yaml)
+    {
+        var deployments = OptionalMap(Map(Parse(yaml), "the file"), "deployments");
+        return deployments == null
+            ? []
+            : deployments.Values.OfType<Dictionary<object, object>>()
+                .Select(d => Scalar(d, "file"))
+                .OfType<string>()
+                .Select(DeploymentFileName)
+                .Distinct()
+                .ToList();
+    }
+
+    /// <param name="deploymentFiles">The contents of <see cref="DeploymentFiles"/>, by name.</param>
+    public static EnvSpec ReadEnvSpec(string yaml, IReadOnlyDictionary<string, string>? deploymentFiles = null)
     {
         var root = Map(Parse(yaml), "the file");
         var gateway = OptionalMap(root, "gateway");
         var tls = gateway == null ? null : OptionalMap(gateway, "tls");
-        var scheme = tls != null && Scalar(tls, "disable") is "true" or "True" ? "http" : "https";
+        var scheme = tls != null && IsTrue(tls, "disable") ? "http" : "https";
         var hosts = gateway == null ? null : OptionalMap(gateway, "hosts");
         // Since 2.1 a Docker env spec names the controller's host, which answers for every deployment under
         // /simpled/; one without the block was prepared by an older simpled, whose hosts answer the well-known path.
@@ -79,10 +101,24 @@ public static class SpecFiles
 
         var deployments = OptionalMap(root, "deployments") ??
                           throw new SpecFormatException("It has no `deployments`.");
+        foreach (var key in deployments.Keys.ToList())
+        {
+            if (deployments[key] is Dictionary<object, object> entry && Scalar(entry, "file") is { } file)
+            {
+                deployments[key] = ReadDeploymentFile(key.ToString()!, DeploymentFileName(file), deploymentFiles);
+            }
+        }
+
         var result = new List<EnvSpecDeployment>();
         var problems = new List<string>();
-        foreach (var (key, _) in deployments)
+        foreach (var (key, value) in deployments)
         {
+            // A template other deployments extend: simpled never deploys it.
+            if (value is Dictionary<object, object> own && IsTrue(own, "abstract"))
+            {
+                continue;
+            }
+
             var name = key.ToString()!;
             var primaryHost = Inherited(deployments, name, d => Scalar(d, "primary_host"));
             var application = Inherited(deployments, name, d => OptionalMap(d, "application"));
@@ -112,6 +148,47 @@ public static class SpecFiles
         return new AppSpec(
             Scalar(root, "name") ?? throw new SpecFormatException("It has no `name`."),
             Scalar(root, "version"));
+    }
+
+    private static string DeploymentFileName(string file)
+    {
+        var name = file.StartsWith("./", StringComparison.Ordinal) ? file[2..] : file;
+        if (name is "" or "." or ".." || name.Contains('/', StringComparison.Ordinal) ||
+            name.Contains('\\', StringComparison.Ordinal))
+        {
+            throw new SpecFormatException($"`file: {file}` must name a file in the envspec's own directory.");
+        }
+
+        if (!name.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase) &&
+            !name.EndsWith(".yml", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SpecFormatException($"`file: {file}` must be a .yaml or .yml file.");
+        }
+
+        if (OwnNames.Contains(name, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new SpecFormatException($"`file: {file}` is an env spec's own name.");
+        }
+
+        return name;
+    }
+
+    private static Dictionary<object, object> ReadDeploymentFile(string deployment, string fileName,
+        IReadOnlyDictionary<string, string>? deploymentFiles)
+    {
+        if (deploymentFiles == null || !deploymentFiles.TryGetValue(fileName, out var yaml))
+        {
+            throw new SpecFormatException($"Deployment `{deployment}` is written in {fileName}, which was not read.");
+        }
+
+        try
+        {
+            return Map(Parse(yaml), "the file");
+        }
+        catch (SpecFormatException e)
+        {
+            throw new SpecFormatException($"{fileName}: {e.Message}", e);
+        }
     }
 
     private static object? Parse(string yaml)
@@ -187,6 +264,10 @@ public static class SpecFiles
 
     private static string? Scalar(Dictionary<object, object> map, string key) =>
         map.TryGetValue(key, out var value) && value is string s && s.Length > 0 ? s : null;
+
+    /// <summary>`true` in any of the spellings simpled's YAML reads as one.</summary>
+    private static bool IsTrue(Dictionary<object, object> map, string key) =>
+        Scalar(map, key) is "true" or "True" or "TRUE";
 
     private static string FileName(string path) => path[(path.LastIndexOf('/') + 1)..];
 }

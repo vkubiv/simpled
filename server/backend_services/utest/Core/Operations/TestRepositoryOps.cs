@@ -103,6 +103,52 @@ public class TestRepositoryOps
     }
 
     [Fact]
+    public async Task TestSync_DeploymentsInFilesNextToTheEnvSpec()
+    {
+        var (db, github, files, repository) = await Linked();
+
+        files.Files["deployment/prod/envspec.yaml"] = """
+            type: docker
+            gateway:
+              hosts:
+                web: shop.example.com
+            controller: { host: web }
+            deployments:
+              prod: { file: prod.yaml }
+              canary: { file: ./canary.yaml }
+            """;
+        files.Files["deployment/prod/prod.yaml"] = "primary_host: web\napplication: { name: shop }";
+        files.Files["deployment/prod/canary.yaml"] = "extends: prod";
+        await Sync(db, repository, github);
+
+        Assert.Null(repository.SyncError);
+        Assert.Equal(["canary", "prod"], db.Deployments.Select(d => d.Name).Order());
+        Assert.Equal("https://shop.example.com/simpled/health/canary",
+            MonitorSupport.Deployment(db, "canary").HealthUrl);
+
+        // A deployment file that cannot be read leaves the environment as it was, like the envspec itself.
+        files.Unreadable.Add("deployment/prod/canary.yaml");
+        await Sync(db, repository, github);
+        Assert.Equal(2, db.Deployments.Count());
+        Assert.Contains("deployment/prod/canary.yaml", repository.SyncError, StringComparison.Ordinal);
+
+        // Every file in the way is named, not only the first.
+        files.Unreadable.Clear();
+        files.Files.Remove("deployment/prod/canary.yaml");
+        files.Files.Remove("deployment/prod/prod.yaml");
+        await Sync(db, repository, github);
+        Assert.Equal(2, db.Deployments.Count());
+        Assert.Contains("deployment/prod/canary.yaml", repository.SyncError, StringComparison.Ordinal);
+        Assert.Contains("deployment/prod/prod.yaml", repository.SyncError, StringComparison.Ordinal);
+
+        files.Files["deployment/prod/prod.yaml"] = "primary_host: web\napplication: { name: shop }";
+        files.Files["deployment/prod/Canary.yaml"] = "extends: prod";
+        await Sync(db, repository, github);
+        Assert.Contains("The repository has deployment/prod/Canary.yaml, in another case", repository.SyncError,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TestSync_UnreadableEnvSpecKeepsItsEnvironment()
     {
         var (db, github, files, repository) = await Linked();

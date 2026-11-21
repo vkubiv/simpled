@@ -115,7 +115,8 @@ Monitoring:
 A sync (`RepositoryOps.Sync`) lists the default branch's tree, reads every `envspec.yaml` (an environment, named
 after its directory) and `appspec.yaml` (application name → version), and makes the rows match: a deployment's URL
 is the first domain of its `primary_host` (`http` when `gateway.tls.disable`), `extends` is followed, templated
-hosts (`$port(...)`) give none. Where the monitor asks follows simpled 2.1: a `type: docker` envspec with a
+hosts (`$port(...)`) give none. A deployment written in a file of its own (`prod: { file: prod.yaml }`) is read
+from that file, in the envspec's directory; an envspec is unreadable while one of its files is. Where the monitor asks follows simpled 2.1: a `type: docker` envspec with a
 `controller` block is asked on the first domain of `controller.host`, at `/simpled/version/<deployment>` and
 `/simpled/health/<deployment>`, so route-less deployments are followed too; Kubernetes, local and Docker envspecs
 from before 2.1 (no `controller`) answer `/.well-known/simpled/version` on the primary host and have no health.
